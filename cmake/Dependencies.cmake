@@ -1,11 +1,28 @@
-find_package(CUDAToolkit REQUIRED)
 find_package(Threads REQUIRED)
 
-# Windows links the static CUDA runtime so shipped binaries do not depend on a cudart DLL.
-if(WIN32)
-  set(NINFER_CUDART_TARGET CUDA::cudart_static)
+# Device runtime seams. Every consumer links ${NINFER_CUDART_TARGET} for the device runtime and
+# ${NINFER_BLAS_TARGET} for the single dense-GEMM call site; the two backends resolve them to
+# their own packages. NINFER_NVTX_TARGET and NINFER_DRIVER_TARGET exist only on CUDA today:
+# ROCm has no NVTX package, and the HIP driver API is part of the HIP runtime library.
+if(NINFER_BACKEND STREQUAL "hip")
+  find_package(hip REQUIRED CONFIG)
+  find_package(hipblas REQUIRED CONFIG)
+  set(NINFER_CUDART_TARGET hip::host)
+  set(NINFER_BLAS_TARGET roc::hipblas)
+  add_library(ninfer_nvtx_stub INTERFACE)
+  set(NINFER_NVTX_TARGET ninfer_nvtx_stub)
+  set(NINFER_DRIVER_TARGET hip::host)
 else()
-  set(NINFER_CUDART_TARGET CUDA::cudart)
+  find_package(CUDAToolkit REQUIRED)
+  # Windows links the static CUDA runtime so shipped binaries do not depend on a cudart DLL.
+  if(WIN32)
+    set(NINFER_CUDART_TARGET CUDA::cudart_static)
+  else()
+    set(NINFER_CUDART_TARGET CUDA::cudart)
+  endif()
+  set(NINFER_BLAS_TARGET CUDA::cublas)
+  set(NINFER_NVTX_TARGET CUDA::nvtx3)
+  set(NINFER_DRIVER_TARGET CUDA::cuda_driver)
 endif()
 
 # vcpkg (the Windows build) exposes FFmpeg and libcurl through CMake packages; Linux uses

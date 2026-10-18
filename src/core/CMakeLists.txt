@@ -39,4 +39,5 @@ else()
 endif()
 ninfer_internal_includes(ninfer_core)
 ninfer_cuda_archive(ninfer_core)
-target_link_libraries(ninfer_core PUBLIC ${NINFER_CUDART_TARGET} CUDA::nvtx3 Threads::Threads CUDA::cuda_driver)
+target_link_libraries(ninfer_core PUBLIC
+  ${NINFER_CUDART_TARGET} ${NINFER_NVTX_TARGET} Threads::Threads ${NINFER_DRIVER_TARGET})

@@ -29,7 +29,7 @@ endif()
 # A language whose launcher the caller already set keeps it; ccache still serves the others.
 set(_ninfer_ccache_languages "")
 set(_ninfer_ccache_kept "")
-foreach(_ninfer_lang C CXX CUDA)
+foreach(_ninfer_lang C CXX CUDA HIP)
   if(CMAKE_${_ninfer_lang}_COMPILER_LAUNCHER)
     list(APPEND _ninfer_ccache_kept ${_ninfer_lang})
   else()

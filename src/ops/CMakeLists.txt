@@ -5,7 +5,7 @@ ninfer_cuda_archive(ninfer_ops)
 target_link_libraries(ninfer_ops PUBLIC ninfer_core)
 # The opt-in cuBLAS prefill route hands its GEMM to cuBLAS; see
 # ops/linear_swiglu/q4cublas/w4_cublas_prefill.h for why that route exists.
-target_link_libraries(ninfer_ops PRIVATE CUDA::cublas)
+target_link_libraries(ninfer_ops PRIVATE ${NINFER_BLAS_TARGET})
 
 # Warp-specialized SM120 NVFP4 kernels use setmaxnreg to transfer registers from
 # producer to consumer warpgroups. RDC makes ptxas discard that contract. These
@@ -44,11 +44,12 @@ include("${CMAKE_CURRENT_LIST_DIR}/rows/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/softmax_attention/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/sparse_moe/sources.cmake")
 
-if(CMAKE_CUDA_ARCHITECTURES MATCHES "^(80|86|89)$")
+if(NINFER_BACKEND STREQUAL "hip" OR CMAKE_CUDA_ARCHITECTURES MATCHES "^(80|86|89)$")
   get_target_property(ninfer_ops_sources ninfer_ops SOURCES)
   # NVFP4 W4A4 uses mma.sync...kind::mxf4nvf4.block_scale; FP8 A8 uses
   # mma.sync...kind::f8f6f4. Both qualifiers are Blackwell-only, and sm_80/86/89 have no FP8 or FP4
   # tensor-core path to fall back to, so the owning translation units cannot be compiled here.
+  # The HIP/RDNA3 backend is in the same position (no MFMA FP8/FP4), so it excludes them too.
   # The A16 dequantizing routes for both formats are kept and remain fully functional.
   list(FILTER ninfer_ops_sources EXCLUDE REGEX "nvfp4/.+_a4\\.cu$")
   list(FILTER ninfer_ops_sources EXCLUDE REGEX "fp8/.+_a8\\.cu$")

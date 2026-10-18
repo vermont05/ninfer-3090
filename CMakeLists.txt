@@ -1,20 +1,41 @@
 cmake_minimum_required(VERSION 3.28)
 
+# --- Accelerator backend ------------------------------------------------------
+# The engine builds against one accelerator backend. `cuda` is the original and reference
+# backend (RTX 3090, sm_86). `hip` compiles the same tree with ROCm/hipcc; it reuses the
+# sm_8x compatibility routing because RDNA3 has no tensor-core (MFMA), FP8 or FP4 paths,
+# and the sources tagged as CUDA are compiled as HIP by ninfer_cuda_archive().
+set(NINFER_BACKEND "cuda" CACHE STRING "Accelerator backend: cuda or hip")
+set_property(CACHE NINFER_BACKEND PROPERTY STRINGS cuda hip)
+if(NOT NINFER_BACKEND MATCHES "^(cuda|hip)$")
+  message(FATAL_ERROR "NINFER_BACKEND must be 'cuda' or 'hip'; got '${NINFER_BACKEND}'")
+endif()
+
 # The current implementation supports Ampere sm_86 and early Ada sm_89, plus sm_80 (GA100, e.g.
 # CMP 170HX) as an unmeasured compatibility target: it shares the sm_86 instruction set the
 # kernels use, but none of its route tables have been swept. Set and validate the
-# architecture before CUDA compiler detection so CMake never injects a generic
+# architecture before the device compiler detection so CMake never injects a generic
 # host-toolchain default or accepts an unsupported target.
-if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-  set(CMAKE_CUDA_ARCHITECTURES 86 CACHE STRING "CUDA architectures to build")
-endif()
-if(NOT CMAKE_CUDA_ARCHITECTURES MATCHES "^(80|86|89)$")
-  message(FATAL_ERROR
-    "NInfer supports CMAKE_CUDA_ARCHITECTURES=80, 86 or 89; got "
-    "'${CMAKE_CUDA_ARCHITECTURES}'")
+if(NINFER_BACKEND STREQUAL "hip")
+  if(NOT DEFINED CMAKE_HIP_ARCHITECTURES)
+    set(CMAKE_HIP_ARCHITECTURES gfx1102 CACHE STRING "AMD GPU architectures to build")
+  endif()
+else()
+  if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES 86 CACHE STRING "CUDA architectures to build")
+  endif()
+  if(NOT CMAKE_CUDA_ARCHITECTURES MATCHES "^(80|86|89)$")
+    message(FATAL_ERROR
+      "NInfer supports CMAKE_CUDA_ARCHITECTURES=80, 86 or 89; got "
+      "'${CMAKE_CUDA_ARCHITECTURES}'")
+  endif()
 endif()
 
-project(ninfer LANGUAGES C CXX CUDA)
+if(NINFER_BACKEND STREQUAL "hip")
+  project(ninfer LANGUAGES C CXX HIP)
+else()
+  project(ninfer LANGUAGES C CXX CUDA)
+endif()
 
 # Before any target exists, so every target picks up the compiler launcher.
 include(cmake/CompilerCache.cmake)
@@ -22,8 +43,10 @@ include(cmake/CompilerCache.cmake)
 # NINFER_SM8X_COMPAT gates every Ampere/early-Ada compatibility path. ninfer_ops also sets it
 # PUBLIC for its own consumers, but that link is PRIVATE through ninfer_engine, so apps and tests
 # would not otherwise see it. Defining it globally keeps a single consistent answer for every
-# target, including apps/ninfer-perplexity, whose upstream default KV profile is FP8.
-if(CMAKE_CUDA_ARCHITECTURES MATCHES "^(80|86|89)$")
+# target, including apps/ninfer-perplexity, whose upstream default KV profile is FP8. The HIP
+# backend takes the same route: RDNA3 has neither the FP8 nor the FP4 tensor-core path the
+# excluded kernels need.
+if(NINFER_BACKEND STREQUAL "hip" OR CMAKE_CUDA_ARCHITECTURES MATCHES "^(80|86|89)$")
   add_compile_definitions(NINFER_SM8X_COMPAT=1)
 endif()
 
@@ -39,8 +62,13 @@ option(NINFER_CUDA_RDC "Build ninfer_core and ninfer_ops with relocatable device
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CUDA_STANDARD 20)
-set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+if(NOT NINFER_BACKEND STREQUAL "hip")
+  set(CMAKE_CUDA_STANDARD 20)
+  set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+else()
+  set(CMAKE_HIP_STANDARD 20)
+  set(CMAKE_HIP_STANDARD_REQUIRED ON)
+endif()
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)        # clangd / IDE tooling
 if(MSVC)
   add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)
@@ -98,7 +126,8 @@ else()
   # nvcc's own frontend and has no documented remapping flag, so it is not covered here.
   add_compile_options(
     $<$<COMPILE_LANGUAGE:C,CXX>:-ffile-prefix-map=${PROJECT_SOURCE_DIR}=.>
-    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-ffile-prefix-map=${PROJECT_SOURCE_DIR}=.>)
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-ffile-prefix-map=${PROJECT_SOURCE_DIR}=.>
+    $<$<COMPILE_LANGUAGE:HIP>:-ffile-prefix-map=${PROJECT_SOURCE_DIR}=.>)
 endif()
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
@@ -109,7 +138,7 @@ if(CMAKE_GENERATOR MATCHES "Ninja")
   set(CMAKE_JOB_POOL_LINK ninfer_link)
 endif()
 
-if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 12.8)
+if(NOT NINFER_BACKEND STREQUAL "hip" AND CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 12.8)
   message(FATAL_ERROR
     "NInfer requires CUDA 12.8 or newer; found CUDA compiler "
     "${CMAKE_CUDA_COMPILER_VERSION}")
