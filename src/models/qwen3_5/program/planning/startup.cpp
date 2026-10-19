@@ -966,11 +966,18 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
             throw std::invalid_argument("n-gram copy window must be in [draft_tokens,15]");
         }
     }
+#ifdef NINFER_BACKEND_HIP
+    // The HIP build targets gfx1102, which the runtime enumerates at capability 110.
+    if (device.compute_capability() != 110) {
+        throw std::invalid_argument("HIP runtime requires gfx1102 (compute capability 110)");
+    }
+#else
     if (device.compute_capability() != 80 && device.compute_capability() != 86 &&
         device.compute_capability() != 89) {
         throw std::invalid_argument(
             "Qwen3.5 family runtime requires compute capability 8.0, 8.6 or 8.9");
     }
+#endif
 }
 
 std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlanningInputs& inputs,

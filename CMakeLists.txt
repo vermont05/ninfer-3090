@@ -49,6 +49,13 @@ include(cmake/CompilerCache.cmake)
 if(NINFER_BACKEND STREQUAL "hip" OR CMAKE_CUDA_ARCHITECTURES MATCHES "^(80|86|89)$")
   add_compile_definitions(NINFER_SM8X_COMPAT=1)
 endif()
+# The one backend discriminator host (non-.cu) code reads: the CUDA build never sees it, and
+# the HIP build defines it for every target, so a host file can branch on which backend it was
+# configured for without including a compiler-specific header. Host code has no other signal --
+# __HIPCC__ only appears in hipcc-compiled translation units.
+if(NINFER_BACKEND STREQUAL "hip")
+  add_compile_definitions(NINFER_BACKEND_HIP=1)
+endif()
 
 # --- Global settings ---------------------------------------------------------
 option(NINFER_BUILD_APPS "Build the NInfer CLI, server and perplexity evaluator" ON)
