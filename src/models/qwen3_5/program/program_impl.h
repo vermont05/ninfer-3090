@@ -210,7 +210,28 @@ struct CaptureReservation {
     ~CaptureReservation();
 };
 
+// Declared outside RequestControl on purpose: clang 20 (ROCm 7.1) caches a wrong
+// `__is_constructible` result for a nested class that has default member initializers when
+// the enclosing class declares a `std::optional` of it, so `std::optional<Prefill>::emplace`
+// silently stops matching in every translation unit that includes this header.
+struct RequestPrefill {
+    PreparedPromptData prompt;
+    std::optional<VisionPrefillPlan> vision_plan;
+    std::unique_ptr<execution::VisionPrefillSession> vision;
+    std::uint32_t base               = 0;
+    std::uint32_t cursor             = 0;
+    std::uint32_t prompt_tokens      = 0;
+    std::uint32_t initial_mtp_extent = 0;
+    double elapsed_seconds           = 0.0;
+    double retired_vision_seconds    = 0.0;
+    bool prepare_mtp                 = false;
+    PrefixReusePath reuse            = PrefixReusePath::Root;
+    MtpBridgeMode mtp_bridge           = MtpBridgeMode::None;
+};
+
 struct RequestControl {
+    using Prefill = RequestPrefill;
+
     Lifecycle lifecycle = Lifecycle::Empty;
     PendingCandidate pending;
     ops::SamplingConfig sampling_host;
@@ -234,21 +255,6 @@ struct RequestControl {
     NgramCopyBackoff ngram_backoff;
     // How much more two-lane copy-round widening by its partner this request can absorb.
     NgramPartnerBalance ngram_partner;
-
-    struct Prefill {
-        PreparedPromptData prompt;
-        std::optional<VisionPrefillPlan> vision_plan;
-        std::unique_ptr<execution::VisionPrefillSession> vision;
-        std::uint32_t base               = 0;
-        std::uint32_t cursor             = 0;
-        std::uint32_t prompt_tokens      = 0;
-        std::uint32_t initial_mtp_extent = 0;
-        double elapsed_seconds           = 0.0;
-        double retired_vision_seconds    = 0.0;
-        bool prepare_mtp                 = false;
-        PrefixReusePath reuse            = PrefixReusePath::Root;
-        MtpBridgeMode mtp_bridge         = MtpBridgeMode::None;
-    };
 
     std::optional<Prefill> prefill;
     std::optional<Prefill> replay;
@@ -282,6 +288,109 @@ struct ResumeStateImpl {
     RequestControl control;
     std::uint32_t frontier = 0;
     ~ResumeStateImpl();
+};
+
+// Declared outside ProgramImpl for the same reason as RequestPrefill: clang 20 (ROCm 7.1)
+// caches a wrong `__is_constructible` result for a nested class that has default member
+// initializers when the enclosing class declares a `std::optional` of it.
+struct PendingTransaction {
+    std::uint64_t id = 0;
+    std::array<std::uint32_t, kMaximumConcurrency> lanes{};
+    std::array<std::uint64_t, kMaximumConcurrency> epochs{};
+    std::size_t size = 0;
+};
+
+struct KVTransfer {
+    LogicalKVPageStore* pages              = nullptr;
+    runtime::ContextResourceClass resource = runtime::ContextResourceClass::MainKV;
+    std::vector<LogicalKVPageHandle> logical;
+    std::vector<DeviceKVPageHandle> physical;
+    std::optional<HostKVExtentReservation> host_destination;
+    std::optional<DeviceKVPageReservation> device_reservation;
+    bool restore     = false;
+    bool drop_device = false;
+};
+
+struct ContextTransaction {
+    ContextOperationKind kind = ContextOperationKind::Bind;
+    std::uint32_t lane        = 0;
+    std::uint64_t epoch       = 0;
+    std::optional<CheckpointHandle> source;
+    std::vector<std::pair<CheckpointHandle, runtime::CheckpointRole>> capture_points;
+    std::vector<CheckpointHandle> carried_points;
+    std::vector<CheckpointHandle> carried_pins;
+    std::vector<std::pair<CheckpointHandle, CheckpointHandle>> carried_clones;
+    std::vector<CheckpointHandle> retired_points;
+    std::shared_ptr<const RequestBasePlanImpl> base;
+    ResumeState* resume  = nullptr;
+    bool resume_snapshot = false;
+    std::optional<ResumeState> paused;
+    std::optional<StateImageTransfer> state_transfer;
+    std::vector<KVTransfer> kv_transfers;
+    std::optional<KVPrefixForkReservation> text_fork;
+    std::optional<KVPrefixForkReservation> backend_fork;
+    std::optional<KVActivationReservation> text_activation;
+    std::optional<KVActivationReservation> backend_activation;
+    std::optional<KVActivePrefixViewReservation> text_view;
+    std::optional<KVActivePrefixViewReservation> backend_view;
+    std::optional<StateImageHandle> reserved_state;
+    std::optional<DeviceKVPageReservation> main_growth;
+    std::optional<DeviceKVPageReservation> backend_growth;
+    bool binding_prepared          = false;
+    std::uint32_t reuse_frontier   = 0;
+    std::uint32_t backend_frontier = 0;
+    UnitDemand first_unit;
+    UnitDemand reservation_demand;
+    std::optional<RecoveryPermit> recovery;
+    std::optional<SequenceKVBundle> reserved_kv;
+    std::shared_ptr<KVHistory> binding_history;
+    std::shared_ptr<KVHistory> source_history;
+    std::vector<runtime::ContextTransferRequirement> transfers;
+    std::vector<runtime::ContextTransferObservation> observations;
+    runtime::ContextOperationCounts operations;
+    bool submitted             = false;
+    bool preserve_state_device = true;
+    bool consume_source        = false;
+    bool take_private          = false;
+    bool split_state           = false;
+    bool backup_state          = false;
+    bool adopted               = false;
+    bool borrow_text           = false;
+    bool borrow_backend        = false;
+    bool borrow_state          = false;
+    bool source_tail_hidden    = false;
+    // A Main KV restore planned at reservation and copied per layer after the prelude
+    // (enqueue_layered_restore), with a private partial tail copied per layer behind it.
+    bool layered_restore = false;
+    struct LayeredRun {
+        LogicalKVPageStore* pages = nullptr;
+        HostKVAllocationConstView host;
+        std::vector<DeviceKVPageHandle> destination;
+    };
+    std::vector<LayeredRun> layered_runs;
+    std::uint32_t layered_pages = 0;
+    std::optional<std::pair<DeviceKVPageHandle, DeviceKVPageHandle>> layered_tail;
+};
+
+// A Bind's Main KV restore that lands after its binding completed, one event per full-attention
+// layer on rank 0's transfer stream. The lane's first prefill pass waits for each layer just
+// before it (`take_restore_layers`); any other compute work is ordered behind the last layer
+// first (`order_after_restores`). A released lane and CPU writes into Host memory wait for the
+// copies to land.
+struct LandingRestore {
+    std::uint32_t lane = 0;
+    std::vector<cudaEvent_t> events;
+    CudaEventTimer timer;
+    TransferWork work;
+    TransferWork tail_work;
+    std::uint32_t page_count = 0;
+    bool ordered             = false;
+    // The layers' gather descriptors, read by the kernels until the restore has landed.
+    std::optional<PinnedHostBuffer> descriptors;
+    // The history a consuming Bind restored from. Its Host pages are the gather kernels'
+    // source, so it outlives the binding transaction and is released only after the landing
+    // has landed (the binding then never waits for the restore to reclaim it).
+    std::vector<std::shared_ptr<KVHistory>> sources;
 };
 
 class ProgramImpl {
@@ -517,109 +626,10 @@ public:
     std::size_t workspace_logical_peak_bytes = 0;
     std::size_t vision_handoff_peak_bytes    = 0;
 
-    struct PendingTransaction {
-        std::uint64_t id = 0;
-        std::array<std::uint32_t, kMaximumConcurrency> lanes{};
-        std::array<std::uint64_t, kMaximumConcurrency> epochs{};
-        std::size_t size = 0;
-    };
-
     std::optional<PendingTransaction> pending_transaction_;
     std::uint64_t next_transaction_id_ = 1;
 
-    struct KVTransfer {
-        LogicalKVPageStore* pages              = nullptr;
-        runtime::ContextResourceClass resource = runtime::ContextResourceClass::MainKV;
-        std::vector<LogicalKVPageHandle> logical;
-        std::vector<DeviceKVPageHandle> physical;
-        std::optional<HostKVExtentReservation> host_destination;
-        std::optional<DeviceKVPageReservation> device_reservation;
-        bool restore     = false;
-        bool drop_device = false;
-    };
-
-    struct ContextTransaction {
-        ContextOperationKind kind = ContextOperationKind::Bind;
-        std::uint32_t lane        = 0;
-        std::uint64_t epoch       = 0;
-        std::optional<CheckpointHandle> source;
-        std::vector<std::pair<CheckpointHandle, runtime::CheckpointRole>> capture_points;
-        std::vector<CheckpointHandle> carried_points;
-        std::vector<CheckpointHandle> carried_pins;
-        std::vector<std::pair<CheckpointHandle, CheckpointHandle>> carried_clones;
-        std::vector<CheckpointHandle> retired_points;
-        std::shared_ptr<const RequestBasePlanImpl> base;
-        ResumeState* resume  = nullptr;
-        bool resume_snapshot = false;
-        std::optional<ResumeState> paused;
-        std::optional<StateImageTransfer> state_transfer;
-        std::vector<KVTransfer> kv_transfers;
-        std::optional<KVPrefixForkReservation> text_fork;
-        std::optional<KVPrefixForkReservation> backend_fork;
-        std::optional<KVActivationReservation> text_activation;
-        std::optional<KVActivationReservation> backend_activation;
-        std::optional<KVActivePrefixViewReservation> text_view;
-        std::optional<KVActivePrefixViewReservation> backend_view;
-        std::optional<StateImageHandle> reserved_state;
-        std::optional<DeviceKVPageReservation> main_growth;
-        std::optional<DeviceKVPageReservation> backend_growth;
-        bool binding_prepared          = false;
-        std::uint32_t reuse_frontier   = 0;
-        std::uint32_t backend_frontier = 0;
-        UnitDemand first_unit;
-        UnitDemand reservation_demand;
-        std::optional<RecoveryPermit> recovery;
-        std::optional<SequenceKVBundle> reserved_kv;
-        std::shared_ptr<KVHistory> binding_history;
-        std::shared_ptr<KVHistory> source_history;
-        std::vector<runtime::ContextTransferRequirement> transfers;
-        std::vector<runtime::ContextTransferObservation> observations;
-        runtime::ContextOperationCounts operations;
-        bool submitted             = false;
-        bool preserve_state_device = true;
-        bool consume_source        = false;
-        bool take_private          = false;
-        bool split_state           = false;
-        bool backup_state          = false;
-        bool adopted               = false;
-        bool borrow_text           = false;
-        bool borrow_backend        = false;
-        bool borrow_state          = false;
-        bool source_tail_hidden    = false;
-        // A Main KV restore planned at reservation and copied per layer after the prelude
-        // (enqueue_layered_restore), with a private partial tail copied per layer behind it.
-        bool layered_restore = false;
-        struct LayeredRun {
-            LogicalKVPageStore* pages = nullptr;
-            HostKVAllocationConstView host;
-            std::vector<DeviceKVPageHandle> destination;
-        };
-        std::vector<LayeredRun> layered_runs;
-        std::uint32_t layered_pages = 0;
-        std::optional<std::pair<DeviceKVPageHandle, DeviceKVPageHandle>> layered_tail;
-    };
-
     std::optional<ContextTransaction> context_transaction_;
-    // A Bind's Main KV restore that lands after its binding completed, one event per full-attention
-    // layer on rank 0's transfer stream. The lane's first prefill pass waits for each layer just
-    // before it (`take_restore_layers`); any other compute work is ordered behind the last layer
-    // first (`order_after_restores`). A released lane and CPU writes into Host memory wait for the
-    // copies to land.
-    struct LandingRestore {
-        std::uint32_t lane = 0;
-        std::vector<cudaEvent_t> events;
-        CudaEventTimer timer;
-        TransferWork work;
-        TransferWork tail_work;
-        std::uint32_t page_count = 0;
-        bool ordered             = false;
-        // The layers' gather descriptors, read by the kernels until the restore has landed.
-        std::optional<PinnedHostBuffer> descriptors;
-        // The history a consuming Bind restored from. Its Host pages are the gather kernels'
-        // source, so it outlives the binding transaction and is released only after the landing
-        // has landed (the binding then never waits for the restore to reclaim it).
-        std::vector<std::shared_ptr<KVHistory>> sources;
-    };
     std::vector<LandingRestore> landing_restores_;
     std::vector<cudaEvent_t> spare_restore_events_;
     std::vector<PinnedHostBuffer> spare_descriptor_buffers_;
