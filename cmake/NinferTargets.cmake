@@ -1,9 +1,19 @@
 # Internal headers are private to each compile owner. External headers come from
 # the dependency targets (or a component-local include for bundled C sources).
 function(ninfer_internal_includes target)
-  target_include_directories(${target} PRIVATE
-    ${PROJECT_SOURCE_DIR}/include
-    ${PROJECT_SOURCE_DIR}/src)
+  if(NINFER_BACKEND STREQUAL "hip")
+    # The shadow headers go first: they are the <cuda*.h>, <cublas_v2.h> and <cub/...> the
+    # sources include (src/hipshim/README.md). The CUDA build never looks at that directory.
+    target_include_directories(${target} PRIVATE
+      ${PROJECT_SOURCE_DIR}/src/hipshim
+      ${PROJECT_SOURCE_DIR}/include
+      ${PROJECT_SOURCE_DIR}/src
+      ${NINFER_HIPCUB_INCLUDE_DIR})
+  else()
+    target_include_directories(${target} PRIVATE
+      ${PROJECT_SOURCE_DIR}/include
+      ${PROJECT_SOURCE_DIR}/src)
+  endif()
 endfunction()
 
 # Under the HIP backend the .cu sources are compiled by hipcc instead of nvcc. CMake only maps

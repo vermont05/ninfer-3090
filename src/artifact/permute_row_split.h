@@ -2,10 +2,9 @@
 
 #include "core/weight_view.h"
 
-#include <cstddef>
+#include <cuda_runtime.h>
 
-struct CUstream_st;
-using cudaStream_t = CUstream_st*;
+#include <cstddef>
 
 namespace ninfer::artifact {
 

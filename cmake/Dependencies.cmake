@@ -7,6 +7,11 @@ find_package(Threads REQUIRED)
 if(NINFER_BACKEND STREQUAL "hip")
   find_package(hip REQUIRED CONFIG)
   find_package(hipblas REQUIRED CONFIG)
+  # hipCUB for the cub/ shadow headers. Not in the system search paths (unlike the ROCm
+  # packages, which Debian installs under /usr/lib/*/cmake), so the build passes its location
+  # through CMAKE_PREFIX_PATH.
+  find_package(hipcub REQUIRED CONFIG)
+  get_target_property(NINFER_HIPCUB_INCLUDE_DIR hip::hipcub INTERFACE_INCLUDE_DIRECTORIES)
   set(NINFER_CUDART_TARGET hip::host)
   set(NINFER_BLAS_TARGET roc::hipblas)
   add_library(ninfer_nvtx_stub INTERFACE)
