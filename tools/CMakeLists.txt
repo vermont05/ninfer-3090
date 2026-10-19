@@ -1,3 +1,8 @@
+# The two multi-GPU/NCCL probes below are CUDA-only: they enumerate peer-capable devices and
+# probe tensor-parallel all-reduce transports. The HIP backend is a single-eGPU target where
+# neither exists, and their .cu sources configure to no link language there, so it skips them.
+if(NOT NINFER_BACKEND STREQUAL "hip")
+
 # Standalone CUDA enumeration probe, plus a real DeviceContext construction check.
 #
 # It deliberately does not link ninfer_core. The enumeration half needs to answer "which CUDA
@@ -25,6 +30,7 @@ add_executable(ninfer-tp-probe tp_probe.cu)
 set_target_properties(ninfer-tp-probe PROPERTIES
   CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools")
+endif()
 
 # Measures what the dequantise-to-int8 prefill route would cost on the weight side: the group-scale
 # spread within a row, and the relative L2 of reconstructing a weight as int8 with one scale per
