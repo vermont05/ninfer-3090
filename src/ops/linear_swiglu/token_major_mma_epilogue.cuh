@@ -46,7 +46,9 @@ struct SwiGluTokenMajorMmaEpilogue {
         }();
         constexpr int threads = S::kThreads - producers;
         const int tid = static_cast<int>(threadIdx.x) - producers, warp = tid >> 5, lane = tid & 31;
-        const auto synchronize = [] {
+        // clang's HIP path refuses to read the locals above through a capture-less
+        // lambda; nvcc only tolerated it because they are constexpr. Capture explicitly.
+        const auto synchronize = [&] {
             if constexpr (producers)
                 asm volatile("bar.sync 1, %0;" ::"r"(threads) : "memory");
             else

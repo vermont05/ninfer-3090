@@ -38,6 +38,9 @@
 // Nothing in the prefetch path waits on a synchronous global read.
 
 #include "core/tensor.h"
+#if defined(__HIPCC__)
+#include "ops/common/mma.cuh"
+#endif
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -57,37 +60,65 @@ constexpr int kRingBufs   = 2;
 
 __device__ __forceinline__ void mma_s8(int& c0, int& c1, int& c2, int& c3, unsigned a0, unsigned a1,
                                        unsigned a2, unsigned a3, unsigned b0, unsigned b1) {
+#if defined(__HIPCC__)
+    // The shared SIMT reference decodes the same m16n8k32 fragments and sums the same
+    // products; only the partial-sum order differs.
+    ninfer::ops::mma_s8(c0, c1, c2, c3, a0, a1, a2, a3, b0, b1);
+#else
     asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
                  "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
                  : "+r"(c0), "+r"(c1), "+r"(c2), "+r"(c3)
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#endif
 }
 
 __device__ __forceinline__ uint4 lds128(const void* p) {
+#if defined(__HIPCC__)
+    return *reinterpret_cast<const uint4*>(p);
+#else
     uint4 r;
     const unsigned addr = static_cast<unsigned>(__cvta_generic_to_shared(p));
     asm volatile("ld.shared.v4.u32 {%0,%1,%2,%3}, [%4];"
                  : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w)
                  : "r"(addr));
     return r;
+#endif
 }
 
 __device__ __forceinline__ unsigned lds16(const void* p) {
+#if defined(__HIPCC__)
+    return static_cast<unsigned>(*reinterpret_cast<const unsigned short*>(p));
+#else
     unsigned r;
     const unsigned addr = static_cast<unsigned>(__cvta_generic_to_shared(p));
     asm volatile("ld.shared.u16 %0, [%1];" : "=r"(r) : "r"(addr));
     return r;
+#endif
 }
 
 __device__ __forceinline__ unsigned lds8(const void* p) {
+#if defined(__HIPCC__)
+    return static_cast<unsigned>(*reinterpret_cast<const unsigned char*>(p));
+#else
     unsigned r;
     const unsigned addr = static_cast<unsigned>(__cvta_generic_to_shared(p));
     asm volatile("ld.shared.u8 %0, [%1];" : "=r"(r) : "r"(addr));
     return r;
+#endif
 }
 
 template <int kBytes>
 __device__ __forceinline__ void cp_async(void* smem, const void* gmem) {
+#if defined(__HIPCC__)
+    // RDNA3 has no async copy; the synchronous store has the same completion meaning.
+    if constexpr (kBytes == 16) {
+        *reinterpret_cast<uint4*>(smem) = *reinterpret_cast<const uint4*>(gmem);
+    } else {
+        const auto* in = reinterpret_cast<const unsigned char*>(gmem);
+        auto* out = reinterpret_cast<unsigned char*>(smem);
+        for (int i = 0; i < kBytes; ++i) out[i] = in[i];
+    }
+#else
     const unsigned addr = static_cast<unsigned>(__cvta_generic_to_shared(smem));
     if constexpr (kBytes == 16) {
         asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(addr), "l"(gmem));
@@ -95,6 +126,7 @@ __device__ __forceinline__ void cp_async(void* smem, const void* gmem) {
         asm volatile("cp.async.ca.shared.global [%0], [%1], %2;" ::"r"(addr), "l"(gmem),
                      "n"(kBytes));
     }
+#endif
 }
 
 // Two packed bytes hold four consecutive k as (low,high) nibble pairs; this spreads them to one
@@ -366,7 +398,9 @@ __global__ __launch_bounds__(kThreads) void a8_mma_kernel(
                                                   sizeof(__half));
             }
         }
+#if !defined(__HIPCC__)
         asm volatile("cp.async.commit_group;");
+#endif
     };
 
     float acc[MT][NT][4];
@@ -387,10 +421,17 @@ __global__ __launch_bounds__(kThreads) void a8_mma_kernel(
         if (g + kStages - 1 < kGroups) { issue(g + kStages - 1, (g + kStages - 1) % kStages); }
         const int issued  = (g + kStages < kGroups) ? (g + kStages) : kGroups;
         const int allowed = issued - (g + 1);
+#if defined(__HIPCC__)
+        (void)allowed;  // synchronous staging: nothing to wait for
+#endif
         if (allowed >= 1) {
+#if !defined(__HIPCC__)
             asm volatile("cp.async.wait_group 1;");
+#endif
         } else {
+#if !defined(__HIPCC__)
             asm volatile("cp.async.wait_group 0;");
+#endif
         }
         __syncthreads();
 

@@ -18,6 +18,7 @@
 
 #include "core/device.h"
 #include "ops/common/canonical_ggml.h"
+#include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/offloaded_sparse_moe/cuda/expert_decode.cuh"
 
@@ -149,19 +150,17 @@ struct alignas(16) Tiles {
 static_assert(sizeof(float) * kTileColumns * 32 <= sizeof(Tiles::x));
 
 __device__ __forceinline__ void cp_async16(void* dst, const void* src, bool valid) {
-    const auto s = static_cast<unsigned>(__cvta_generic_to_shared(dst));
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(s), "l"(src), "r"(valid ? 16 : 0) : "memory");
+    ninfer::ops::cp_async_zfill<16, ninfer::ops::Cache::cg>(dst, src, valid ? 16 : 0);
 }
 
 __device__ __forceinline__ void cp_async4(void* dst, const void* src, bool valid) {
-    const auto s = static_cast<unsigned>(__cvta_generic_to_shared(dst));
-    asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;\n" ::"r"(s), "l"(src), "r"(valid ? 4 : 0) : "memory");
+    ninfer::ops::cp_async_zfill<4>(dst, src, valid ? 4 : 0);
 }
 
-__device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;\n" ::: "memory"); }
-__device__ __forceinline__ void cp_wait_all() { asm volatile("cp.async.wait_group 0;\n" ::: "memory"); }
+__device__ __forceinline__ void cp_commit() { ninfer::ops::cp_commit(); }
+__device__ __forceinline__ void cp_wait_all() { ninfer::ops::cp_wait<0>(); }
 // Every group but the newest kXStages - 2 has landed.
-__device__ __forceinline__ void cp_wait_ahead() { asm volatile("cp.async.wait_group %0;\n" ::"n"(kXStages - 2) : "memory"); }
+__device__ __forceinline__ void cp_wait_ahead() { ninfer::ops::cp_wait<kXStages - 2>(); }
 
 // A contiguous slice into shared memory, 16 bytes per copy (both ends 16-byte aligned).
 __device__ __forceinline__ void stage_slice(const std::uint8_t* src, std::uint8_t* dst, int bytes) {

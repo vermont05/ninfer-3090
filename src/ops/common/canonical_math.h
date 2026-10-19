@@ -14,7 +14,12 @@
 #include <cstdint>
 #include <cstring>
 
-#if defined(__CUDACC__)
+// __forceinline__ (and, on HIP, the __host__/__device__ spellings this header relies on)
+// are provided by the runtime headers; nvcc injects them, clang's HIP driver leaves them
+// to <hip/hip_runtime.h>, so reach for whichever the build's include path names before
+// using them below.
+#if defined(__CUDACC__) || defined(__HIPCC__)
+#    include <cuda_runtime.h>
 #    define NINFER_CANON_HD __host__ __device__ __forceinline__
 #else
 #    define NINFER_CANON_HD inline
@@ -23,7 +28,7 @@
 namespace ninfer::ops::canon {
 
 NINFER_CANON_HD std::uint32_t f32_bits(float x) {
-#if defined(__CUDA_ARCH__)
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
     return __float_as_uint(x);
 #else
     std::uint32_t u;
@@ -33,7 +38,7 @@ NINFER_CANON_HD std::uint32_t f32_bits(float x) {
 }
 
 NINFER_CANON_HD float f32_from_bits(std::uint32_t u) {
-#if defined(__CUDA_ARCH__)
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
     return __uint_as_float(u);
 #else
     float x;
@@ -42,6 +47,9 @@ NINFER_CANON_HD float f32_from_bits(std::uint32_t u) {
 #endif
 }
 
+// The guards below stay NVIDIA-only on purpose. The FP32 mul/add/div/fma of the
+// #else branch are IEEE round-to-nearest on GCN, so the HIP device pass takes them;
+// the __fX_rn intrinsics exist only for nvcc.
 NINFER_CANON_HD float mul_rn(float a, float b) {
 #if defined(__CUDA_ARCH__)
     return __fmul_rn(a, b);

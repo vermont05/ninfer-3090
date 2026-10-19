@@ -18,6 +18,7 @@
 #include "core/device.h"
 
 #include "ops/common/canonical_ggml.h"
+#include "ops/common/memory.cuh"
 #include "ops/offloaded_sparse_moe/cuda/expert_decode.cuh"
 #include "ops/offloaded_sparse_moe/cuda/wide_expert.h"
 
@@ -99,17 +100,16 @@ Geometry device_geometry(const moe::RecordGeometry& g) {
 // read zero-copy over PCIe.
 __device__ __forceinline__ void stage_async(const std::uint8_t* src, std::uint8_t* dst, int bytes) {
     for (int i = static_cast<int>(threadIdx.x) * 16; i < bytes; i += static_cast<int>(blockDim.x) * 16) {
-        const auto s = static_cast<unsigned>(__cvta_generic_to_shared(dst + i));
-        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(s), "l"(src + i) : "memory");
+        ninfer::ops::cp_async<16, ninfer::ops::Cache::cg>(dst + i, src + i);
     }
-    asm volatile("cp.async.commit_group;\n" ::: "memory");
+    ninfer::ops::cp_commit();
 }
 
-__device__ __forceinline__ void stage_wait() { asm volatile("cp.async.wait_group 0;\n" ::: "memory"); }
+__device__ __forceinline__ void stage_wait() { ninfer::ops::cp_wait<0>(); }
 
 // Waits until at most one issued group is still in flight (the CTA computes the first half of its
 // slice while the second half lands).
-__device__ __forceinline__ void stage_wait_but_one() { asm volatile("cp.async.wait_group 1;\n" ::: "memory"); }
+__device__ __forceinline__ void stage_wait_but_one() { ninfer::ops::cp_wait<1>(); }
 
 // The distance between device frames (MoeExpertSource::frame_stride, record_stride when zero).
 __device__ __forceinline__ std::uint64_t frame_stride(const MoeExpertSource& source) {
@@ -695,9 +695,13 @@ struct CpuCall {
 };
 
 __device__ __forceinline__ std::uint64_t global_ns() {
+#if defined(__HIPCC__)
+    return __clock64();
+#else
     std::uint64_t now;
     asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now));
     return now;
+#endif
 }
 
 // One CTA picks the CPU jobs: of the call's M misses, want = min(max_jobs, M - M / pcie_divisor)
@@ -864,7 +868,13 @@ __global__ void __launch_bounds__(kThreads)
                 seen  = *beat;
                 since = now;
             } else if (now - since > limit) {
-                if (source.error == nullptr) { asm volatile("trap;"); }
+                if (source.error == nullptr) {
+#if defined(__HIPCC__)
+                    __builtin_trap();
+#else
+                    asm volatile("trap;");
+#endif
+                }
                 *reinterpret_cast<volatile std::uint32_t*>(source.error) =
                     (static_cast<std::uint32_t>(source.cpu.layer) << 16U) | moe::kErrorHostSilent;
                 silent = true;

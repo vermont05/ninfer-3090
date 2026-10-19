@@ -16,34 +16,52 @@ __device__ __forceinline__ float sigmoid(float x) { return 1.0f / (1.0f + expf(-
 
 // Fast tanh-based profile; saturation and rounding differ from sigmoid's expf path.
 __device__ __forceinline__ float sigmoid_approx(float x) {
+#if defined(__HIPCC__)
+    return 0.5F * tanhf(0.5F * x) + 0.5F;
+#else
     float y;
     asm("tanh.approx.f32 %0, %1;" : "=f"(y) : "f"(0.5F * x));
     return 0.5F * y + 0.5F;
+#endif
 }
 
 __device__ __forceinline__ float softplus(float x) { return (x > 20.0f) ? x : log1pf(expf(x)); }
 
 __device__ __forceinline__ float exp2_approx(float x) {
+#if defined(__HIPCC__)
+    return exp2f(x);
+#else
     float y;
     asm("ex2.approx.f32 %0, %1;" : "=f"(y) : "f"(x));
     return y;
+#endif
 }
 
 // Keep flush-to-zero explicit so callers of exp2_approx retain their subnormal behavior.
 __device__ __forceinline__ float exp2_approx_ftz(float x) {
+#if defined(__HIPCC__)
+    // No FTZ variant to pick on AMD; the denormal policy is the compiler flag's.
+    return exp2f(x);
+#else
     float y;
     asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
     return y;
+#endif
 }
 
 __device__ __forceinline__ float exp_approx_ftz(float x) { return exp2_approx_ftz(x * kLog2E); }
 
 __device__ __forceinline__ std::uint32_t pack_bf16x2(float lo, float hi) {
+#if defined(__HIPCC__)
+    const __nv_bfloat162 packed = __floats2bfloat162_rn(lo, hi);
+    return load_vec<std::uint32_t>(&packed);
+#else
     std::uint32_t out;
     const std::uint32_t lo_bits = __float_as_uint(lo);
     const std::uint32_t hi_bits = __float_as_uint(hi);
     asm volatile("cvt.rn.bf16x2.f32 %0, %1, %2;\n" : "=r"(out) : "r"(hi_bits), "r"(lo_bits));
     return out;
+#endif
 }
 
 // Exact BF16 expansion for consumers that need FP32 operand bits, including TF32 MMA.
@@ -60,8 +78,11 @@ __device__ __forceinline__ std::uint32_t pack_f16x2(float lo, float hi) {
 
 __device__ __forceinline__ std::uint32_t bf16x2_bits_to_f16x2_bits(std::uint32_t bits) {
     const __nv_bfloat162 source = load_vec<__nv_bfloat162>(&bits);
-    const __half2 converted =
-        __halves2half2(__half(__low2bfloat16(source)), __half(__high2bfloat16(source)));
+    // Explicit float bridge: the direct __half(bf16) constructor is ambiguous on HIP,
+    // where the storage type has converting constructors from both float and double.
+    const __half2 converted = __halves2half2(
+        __float2half(__bfloat162float(__low2bfloat16(source))),
+        __float2half(__bfloat162float(__high2bfloat16(source))));
     return load_vec<std::uint32_t>(&converted);
 }
 

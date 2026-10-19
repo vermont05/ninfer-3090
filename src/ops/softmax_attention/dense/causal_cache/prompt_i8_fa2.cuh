@@ -163,7 +163,7 @@ __host__ __device__ __forceinline__ std::int64_t causal_prompt_fa2_partial_row(i
 // Lloyd-Max key plane. cache_k and cache_v are the raw planes either way.
 template <typename Geometry, typename Metadata, int Warps, bool Split, bool PackedValues,
           bool PackedKeys>
-__global__ __launch_bounds__(CausalPromptFa2Shape<Warps, PackedValues, PackedKeys>::Threads, 1) void
+__global__ __launch_bounds__((CausalPromptFa2Shape<Warps, PackedValues, PackedKeys>::Threads), 1) void
 causal_attention_prompt_i8_fa2_kernel(const __nv_bfloat16* __restrict__ q,
                                       const std::int8_t* __restrict__ cache_k,
                                       const std::int8_t* __restrict__ cache_v,
@@ -277,10 +277,14 @@ causal_attention_prompt_i8_fa2_kernel(const __nv_bfloat16* __restrict__ q,
                 if ((chunk >> 3) < valid) {
                     const auto* src =
                         reinterpret_cast<const std::uint8_t*>(cache_k) + packed_base + chunk * 16;
+#if defined(__HIPCC__)
+                    k_packed[i] = *reinterpret_cast<const uint4*>(src);
+#else
                     asm volatile("ld.global.nc.v4.u32 {%0, %1, %2, %3}, [%4];\n"
                                  : "=r"(k_packed[i].x), "=r"(k_packed[i].y), "=r"(k_packed[i].z),
                                    "=r"(k_packed[i].w)
                                  : "l"(src));
+#endif
                 }
             }
         } else {

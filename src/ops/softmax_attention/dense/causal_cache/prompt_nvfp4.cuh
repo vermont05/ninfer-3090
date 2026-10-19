@@ -232,6 +232,13 @@ __global__ __maxnreg__(120) void causal_attention_prompt_nvfp4_kernel(
     ninfer::ops::cp_wait<0>();
     __syncthreads();
     dequant_k_tile();
+#if defined(__HIPCC__)
+    __shared__ unsigned prompt_bar_slots[4];
+    if (tid == 0) {
+#pragma unroll
+        for (int w = 0; w < 4; ++w) prompt_bar_slots[w] = 0u;
+    }
+#endif
     __syncthreads();
 
     float acc[PVNtPerWarp][4];
@@ -297,7 +304,11 @@ __global__ __maxnreg__(120) void causal_attention_prompt_nvfp4_kernel(
                 partial_m_s[col_half * Br + row0] = bm0;
                 partial_m_s[col_half * Br + row1] = bm1;
             }
+#if defined(__HIPCC__)
+            causal_prompt_subset_barrier(prompt_bar_slots, warp, 2 * kb);
+#else
             asm volatile("bar.sync 1, 128;" ::: "memory");
+#endif
 
             bm0                     = fmaxf(partial_m_s[row0], partial_m_s[Br + row0]);
             bm1                     = fmaxf(partial_m_s[row1], partial_m_s[Br + row1]);
@@ -344,7 +355,11 @@ __global__ __maxnreg__(120) void causal_attention_prompt_nvfp4_kernel(
                 partial_l_s[col_half * Br + row0] = bl0;
                 partial_l_s[col_half * Br + row1] = bl1;
             }
+#if defined(__HIPCC__)
+            causal_prompt_subset_barrier(prompt_bar_slots, warp, 2 * kb + 1);
+#else
             asm volatile("bar.sync 1, 128;" ::: "memory");
+#endif
             if (col_half == 0 && lid == 0) {
                 const float tile_l0 = partial_l_s[row0] + partial_l_s[Br + row0];
                 const float tile_l1 = partial_l_s[row1] + partial_l_s[Br + row1];

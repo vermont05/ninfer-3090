@@ -22,7 +22,7 @@ struct Tile {
 
 template <int Rows, int Columns, int SplitK>
 __global__
-__launch_bounds__(Tile<Rows, Columns>::threads, 1) void dynamic_grouped_conv_prepare_partial_kernel(
+__launch_bounds__((Tile<Rows, Columns>::threads), 1) void dynamic_grouped_conv_prepare_partial_kernel(
     const __nv_bfloat16* __restrict__ input, const __nv_bfloat16* __restrict__ weight,
     float* __restrict__ partial, int tokens) {
     constexpr int threads         = Tile<Rows, Columns>::threads;

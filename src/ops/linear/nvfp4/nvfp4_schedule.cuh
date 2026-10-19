@@ -127,6 +127,10 @@ struct Nvfp4A4MmaSchedule {
     static_assert((kSegmentsPerRow & (kSegmentsPerRow - 1)) == 0);
 };
 
+// The TMA schedule and its L2-promotion template argument name driver tensor-map
+// enumerators, which HIP builds have no counterpart for. No HIP route selects it:
+// the sm_120a NVFP4 TMA kernels live in the non-RDC archive that sm_8x builds skip.
+#if !defined(__HIPCC__)
 template <int BlockTokens, int Stages, int MinBlocksPerSm,
           CUtensorMapL2promotion WeightCodePromotion = CU_TENSOR_MAP_L2_PROMOTION_NONE>
 struct Nvfp4A4TmaMmaSchedule {
@@ -167,7 +171,7 @@ struct Nvfp4A4TmaMmaSchedule {
     static_assert(kScaleWordsPerRow * 4 == kNvfp4ScaleTileGroups);
     static_assert((kBlockK / 16) * 2 == kNvfp4ScaleTileGroups);
 };
-
+#endif  // TMA schedule
 
 enum class Nvfp4MmaFragmentPipeline : std::uint8_t {
     Serial,

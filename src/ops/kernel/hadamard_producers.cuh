@@ -59,7 +59,7 @@ __launch_bounds__(kRmsnormHadamardThreads) __global__
 
     __shared__ float warp_sums[kRmsnormHadamardThreads / kWarpSize];
     __shared__ float inv_shared;
-    __shared__ alignas(16) __nv_bfloat162 staged[kPairs];
+    __shared__ __align__(16) __nv_bfloat162 staged[kPairs];
     __shared__ HadamardQuarterShared transform[kWidth / kHadamardTransformBlock];
     const float block_sum = block_reduce_sum<kBlock>(sum, warp_sums);
     if (threadIdx.x == 0) { inv_shared = rsqrtf(block_sum / static_cast<float>(kWidth) + eps); }
@@ -116,7 +116,7 @@ __launch_bounds__(kGatedRmsnormHadamardRowsPerCta* kWarpSize) __global__
     const std::int64_t first_row   = static_cast<std::int64_t>(blockIdx.x) * kRows;
     const std::int64_t row         = first_row + warp;
 
-    __shared__ alignas(16) __nv_bfloat162 staged[kRows * kPairs];
+    __shared__ __align__(16) __nv_bfloat162 staged[kRows * kPairs];
     if (row < rows) {
         const std::int64_t row_base = row * kPairs;
         __nv_bfloat162 values[kMaxPairsPerLane];

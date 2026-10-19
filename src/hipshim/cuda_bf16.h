@@ -13,10 +13,13 @@ using __nv_bfloat16  = __hip_bfloat16;
 using __nv_bfloat162 = __hip_bfloat162;
 
 // HIP spells the round-to-nearest helpers without the suffix: every conversion is RN.
-__attribute__((always_inline)) inline __hip_bfloat16 __float2bfloat16_rn(float f) {
+// __device__ like CUDA's own: every call site is a kernel body, and a host-inline helper
+// would not be callable from one.
+__attribute__((always_inline)) inline __device__ __hip_bfloat16 __float2bfloat16_rn(float f) {
     return __float2bfloat16(f);
 }
 
-__attribute__((always_inline)) inline __hip_bfloat162 __floats2bfloat162_rn(float a, float b) {
+__attribute__((always_inline)) inline __device__ __hip_bfloat162 __floats2bfloat162_rn(float a,
+                                                                                         float b) {
     return __hip_bfloat162{__float2bfloat16(a), __float2bfloat16(b)};
 }

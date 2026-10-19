@@ -13,7 +13,7 @@
 #include <cstdio>
 #include <cstdlib>
 
-#ifdef __CUDACC__
+#if defined(__CUDACC__) || defined(__HIPCC__)
 #    include "ops/common/math.cuh"
 #    include "ops/common/memory.cuh"
 #    include "ops/common/warp.cuh"
@@ -43,7 +43,7 @@ inline uint3 init_fastdiv_values(std::uint64_t d64) {
     return make_uint3(mp, L, d);
 }
 
-#ifdef __CUDACC__
+#if defined(__CUDACC__) || defined(__HIPCC__)
 
 static __device__ __forceinline__ std::uint32_t fastdiv(std::uint32_t n, uint3 fastdiv_values) {
     const std::uint32_t hi = __umulhi(n, fastdiv_values.x);

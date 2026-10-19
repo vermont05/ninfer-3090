@@ -68,11 +68,15 @@ void check_launch(const char* what) {
 // Read-only global load that does not allocate in L1: weights streamed once per call (Infernix's
 // ops/common/memory.cuh ld_nc_na, 16-byte form; sm_70+).
 __device__ __forceinline__ uint4 ld_nc_na_16(const void* ptr) {
+#if defined(__HIPCC__)
+    return *reinterpret_cast<const uint4*>(ptr);
+#else
     uint4 value;
     asm("ld.global.nc.L1::no_allocate.v4.u32 {%0, %1, %2, %3}, [%4];"
         : "=r"(value.x), "=r"(value.y), "=r"(value.z), "=r"(value.w)
         : "l"(ptr));
     return value;
+#endif
 }
 
 __device__ __forceinline__ float sigmoidf(float x) { return 1.0F / (1.0F + expf(-x)); }

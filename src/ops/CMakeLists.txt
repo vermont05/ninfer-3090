@@ -1,7 +1,6 @@
 # Compile policy is owned here; each semantic family explicitly contributes sources.
 add_library(ninfer_ops STATIC)
 ninfer_internal_includes(ninfer_ops)
-ninfer_cuda_archive(ninfer_ops)
 target_link_libraries(ninfer_ops PUBLIC ninfer_core)
 # The opt-in cuBLAS prefill route hands its GEMM to cuBLAS; see
 # ops/linear_swiglu/q4cublas/w4_cublas_prefill.h for why that route exists.
@@ -59,3 +58,9 @@ if(NINFER_BACKEND STREQUAL "hip" OR CMAKE_CUDA_ARCHITECTURES MATCHES "^(80|86|89
     "${CMAKE_CURRENT_LIST_DIR}/fp8_sm86_stubs.cpp")
   target_compile_definitions(ninfer_ops PUBLIC NINFER_SM8X_COMPAT=1)
 endif()
+
+# Last, after every manifest and the compatibility filter: the HIP backend needs the final
+# source list to mark .cu files LANGUAGE HIP, and the CUDA one reads it to set RDC
+# properties. Called earlier, files added below would be invisible to it and silently
+# dropped from the build (an unknown extension is header material to CMake).
+ninfer_cuda_archive(ninfer_ops)

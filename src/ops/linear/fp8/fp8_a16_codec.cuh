@@ -29,8 +29,11 @@ __device__ __forceinline__ unsigned fp8_e4m3x2_to_bf16x2_bits(unsigned packed) {
         unsigned bits;
     } result;
 
-    result.pair = __halves2bfloat162(__nv_bfloat16(__low2half(half_pair)),
-                                     __nv_bfloat16(__high2half(half_pair)));
+    // Explicit float bridge: __nv_bfloat16(__half) is an ambiguous cast on HIP, and
+    // CUDA's header reaches the same RN value through float.
+    result.pair = __halves2bfloat162(
+        __float2bfloat16(__half2float(__low2half(half_pair))),
+        __float2bfloat16(__half2float(__high2half(half_pair))));
     return result.bits;
 #endif
 }

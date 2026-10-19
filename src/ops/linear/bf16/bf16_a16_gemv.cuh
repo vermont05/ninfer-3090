@@ -46,17 +46,25 @@ load_bf16_weight_pack(const __nv_bfloat16* pointer) {
     if constexpr (Cache == Bf16WeightCache::Default) {
         return load_bf16_pack<Values>(pointer);
     } else if constexpr (Values == 4) {
+#if defined(__HIPCC__)
+        return load_bf16_pack<Values>(pointer);
+#else
         uint2 bits;
         asm volatile("ld.global.cg.v2.u32 {%0, %1}, [%2];\n"
                      : "=r"(bits.x), "=r"(bits.y)
                      : "l"(pointer));
         return load_vec<Bf16GemvPack<Values>>(&bits);
+#endif
     } else if constexpr (Values == 8) {
+#if defined(__HIPCC__)
+        return load_bf16_pack<Values>(pointer);
+#else
         uint4 bits;
         asm volatile("ld.global.cg.v4.u32 {%0, %1, %2, %3}, [%4];\n"
                      : "=r"(bits.x), "=r"(bits.y), "=r"(bits.z), "=r"(bits.w)
                      : "l"(pointer));
         return load_vec<Bf16GemvPack<Values>>(&bits);
+#endif
     } else {
         Bf16GemvPack<Values> result;
         const Bf16GemvPack<8> low  = load_bf16_weight_pack<Cache, 8>(pointer);

@@ -53,6 +53,28 @@ __device__ __forceinline__ void causal_prompt_store_byte_swizzled(Byte* tile, in
     tile[off]     = code;
 }
 
+#if defined(__HIPCC__)
+// CUDA's named-barrier rendezvous (`bar.sync id, 128`) has no AMD spelling: a GCN workgroup
+// joins at one barrier and there is no subset form, so the prompt kernels' 4-wave producer
+// rendezvous is this. Every wave of the group holds a lane-0 store ahead of a wave barrier
+// and a block fence, then every thread spins the four stamps until each carries the call's
+// generation. Callers pass a strictly increasing generation and storage that was zeroed
+// before a block barrier, so the first wait cannot read a stamp before its owner zeroes it.
+__device__ __forceinline__ void causal_prompt_subset_barrier(unsigned* slots, int wid,
+                                                              unsigned gen) {
+    if ((threadIdx.x & 31) == 0)
+        slots[wid] = gen;
+    __syncwarp();
+    volatile unsigned* const stamps = reinterpret_cast<volatile unsigned*>(slots);
+    for (;;) {
+        if (stamps[0] >= gen && stamps[1] >= gen && stamps[2] >= gen && stamps[3] >= gen) {
+            break;
+        }
+    }
+    __syncwarp();
+}
+#endif
+
 template <int Columns>
 __device__ __forceinline__ int causal_prompt_p_swz(int row, int col) {
     if constexpr (Columns == 32) { return (((col >> 3) ^ (row & 3)) << 3) | (col & 7); }

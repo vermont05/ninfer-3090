@@ -31,22 +31,34 @@ __device__ __forceinline__ Nvfp4CodePack<Values> load_nvfp4_codes(const std::uin
     if constexpr (Cache == Nvfp4CodeCache::Default) {
         return load_vec<Nvfp4CodePack<Values>>(pointer);
     } else if constexpr (Values == 8) {
+#if defined(__HIPCC__)
+        return load_vec<Nvfp4CodePack<Values>>(pointer);
+#else
         Nvfp4CodePack<Values> result;
         asm volatile("ld.global.cg.u32 %0, [%1];\n" : "=r"(result.words[0]) : "l"(pointer));
         return result;
+#endif
     } else if constexpr (Values == 16) {
+#if defined(__HIPCC__)
+        return load_vec<Nvfp4CodePack<Values>>(pointer);
+#else
         Nvfp4CodePack<Values> result;
         asm volatile("ld.global.cg.v2.u32 {%0, %1}, [%2];\n"
                      : "=r"(result.words[0]), "=r"(result.words[1])
                      : "l"(pointer));
         return result;
+#endif
     } else {
+#if defined(__HIPCC__)
+        return load_vec<Nvfp4CodePack<Values>>(pointer);
+#else
         Nvfp4CodePack<Values> result;
         asm volatile("ld.global.cg.v4.u32 {%0, %1, %2, %3}, [%4];\n"
                      : "=r"(result.words[0]), "=r"(result.words[1]), "=r"(result.words[2]),
                        "=r"(result.words[3])
                      : "l"(pointer));
         return result;
+#endif
     }
 }
 

@@ -46,6 +46,11 @@ Nvfp4A4Route select_a4(std::int32_t tokens) {
 bool uses_a4(std::int32_t, std::int32_t max_tokens) { return max_tokens >= 17; }
 } // namespace
 
+// The table's members are host launchers, and a const global defined alongside
+// a __global__ kernel is emitted into the HIP device module, where those
+// references leave nothing for amdgcn-link to resolve. Define it host-side.
+#ifndef __HIP_DEVICE_COMPILE__
 const Nvfp4LinearShape kNvfp4N5120K6144{5120, 6144, launch_a16, launch_nvfp4_a4<select_a4>,
                                         uses_a4};
+#endif
 } // namespace ninfer::ops::detail

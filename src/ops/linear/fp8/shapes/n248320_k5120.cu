@@ -100,5 +100,10 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t
 bool uses_a8(std::int32_t, std::int32_t) { return false; }
 } // namespace
 
+// The table's members are host launchers, and a const global defined alongside
+// a __global__ kernel is emitted into the HIP device module, where those
+// references leave nothing for amdgcn-link to resolve. Define it host-side.
+#ifndef __HIP_DEVICE_COMPILE__
 const Fp8LinearShape kFp8N248320K5120{248320, 5120, launch_a16, nullptr, uses_a8};
+#endif
 } // namespace ninfer::ops::detail

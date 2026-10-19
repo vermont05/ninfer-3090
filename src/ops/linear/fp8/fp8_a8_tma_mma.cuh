@@ -16,6 +16,10 @@
 
 namespace ninfer::ops::detail {
 
+// TMA and its tensor-map descriptors are NVIDIA-only; HIP builds compile just the
+// sm_8x stub launch below, and nothing in that route names these.
+#if !defined(__HIPCC__)
+
 struct alignas(128) Fp8TmaDescriptors {
     CUtensorMap activation;
     CUtensorMap weight;
@@ -95,6 +99,8 @@ inline constexpr int fp8_tma_scratch_bytes = [] {
         Schedule::kStorageBytes > epilogue_bytes ? Schedule::kStorageBytes : epilogue_bytes;
     return (bytes + 127) / 128 * 128;
 }();
+
+#endif  // TMA declarations
 
 #if defined(NINFER_SM8X_COMPAT)
 // sm_8x has no FP8 MMA or TMA, so no route selects this schedule there. The kernel is not

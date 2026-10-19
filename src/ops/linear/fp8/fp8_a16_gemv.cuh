@@ -57,18 +57,26 @@ __device__ __forceinline__ Fp8CodePack<Values> load_fp8_codes(const std::uint8_t
         }
         return result;
     } else if constexpr (Values == 8) {
+#if defined(__HIPCC__)
+        return load_fp8_codes<Fp8CodeCache::Default, Values>(pointer);
+#else
         Fp8CodePack<Values> result;
         asm volatile("ld.global.cg.v2.u32 {%0, %1}, [%2];\n"
                      : "=r"(result.words[0]), "=r"(result.words[1])
                      : "l"(pointer));
         return result;
+#endif
     } else {
+#if defined(__HIPCC__)
+        return load_fp8_codes<Fp8CodeCache::Default, Values>(pointer);
+#else
         Fp8CodePack<Values> result;
         asm volatile("ld.global.cg.v4.u32 {%0, %1, %2, %3}, [%4];\n"
                      : "=r"(result.words[0]), "=r"(result.words[1]), "=r"(result.words[2]),
                        "=r"(result.words[3])
                      : "l"(pointer));
         return result;
+#endif
     }
 }
 

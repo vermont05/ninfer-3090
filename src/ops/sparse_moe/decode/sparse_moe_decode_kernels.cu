@@ -91,7 +91,11 @@ __global__ void sparse_moe_d1_kernel(const __nv_bfloat16* __restrict__ x,
         const unsigned long long offset =
             (static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x) * 128ull;
         if (offset < shared_down_bytes) {
+#if defined(__HIPCC__)
+            __builtin_prefetch(shared_down_codes + offset);
+#else
             asm volatile("prefetch.global.L2 [%0];" ::"l"(shared_down_codes + offset));
+#endif
         }
     }
 }
@@ -536,7 +540,11 @@ __global__ void sparse_moe_d4_nine_warp_kernel(
         const unsigned long long offset =
             (static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x) * 128ull;
         if (offset < prefetch_bytes) {
+#if defined(__HIPCC__)
+            __builtin_prefetch(prefetch_data + offset);
+#else
             asm volatile("prefetch.global.L2 [%0];" ::"l"(prefetch_data + offset));
+#endif
         }
     }
     __syncthreads();

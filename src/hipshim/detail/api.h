@@ -18,6 +18,17 @@
 
 #include <hip/hip_runtime.h>
 
+// Drawn in here, not only by the shadow headers that wrap them, so that the warp
+// intrinsics further down are defined after every declaration of their names.
+// hip/hip_bf16.h, hip/hip_fp16.h and hip/hip_cooperative_groups.h each declare some of
+// __shfl_*_sync, __ballot_sync and __ldg outright: a function-like macro of one of those
+// names, live while one of these is parsed, expands the declaration's parameter list
+// and breaks it. Read in now, the guard in each header makes every later include a
+// no-op, and no source ordering can put a macro in front of the declarations.
+#include <hip/hip_bf16.h>
+#include <hip/hip_fp16.h>
+#include <hip/hip_cooperative_groups.h>
+
 #include <cstddef>
 
 // --- types -------------------------------------------------------------------------------
@@ -37,6 +48,10 @@ using cudaGraph_t              = hipGraph_t;
 using cudaGraphExec_t          = hipGraphExec_t;
 using cudaGraphNode_t          = hipGraphNode_t;
 using cudaUUID_t               = hipUUID_t;
+// Extensible-launch plumbing: the HIP structs carry the CUDA layout (id, pad, val/value),
+// and gdn_gating_proj's cooperative launch reads exactly those members.
+using cudaLaunchAttribute      = hipLaunchAttribute;
+using cudaLaunchConfig_t       = hipLaunchConfig_t;
 
 // --- enumerators and constants -----------------------------------------------------------
 // Object-like macros: the right-hand side is an enumerator or a macro in the HIP headers, and
@@ -84,6 +99,16 @@ using cudaUUID_t               = hipUUID_t;
 #define cudaHostAllocMapped hipHostAllocMapped
 
 #define cudaFuncAttributeMaxDynamicSharedMemorySize hipFuncAttributeMaxDynamicSharedMemorySize
+#define cudaFuncAttributePreferredSharedMemoryCarveout \
+    hipFuncAttributePreferredSharedMemoryCarveout
+
+// The carveout sentinel values from CUDA's cuda_runtime.h, kept at their CUDA values;
+// they go behind the PreferredSharedMemoryCarveout attribute call sites above.
+#define cudaSharedmemCarveoutDefault   (-1)
+#define cudaSharedmemCarveoutMaxL1     (-2)
+#define cudaSharedmemCarveoutMaxShared (-3)
+
+#define cudaLaunchAttributeCooperative hipLaunchAttributeCooperative
 
 // CUDA spells the device-attribute enumerators cudaDevAttr*, HIP spells them
 // hipDeviceAttribute*.
@@ -101,6 +126,120 @@ using cudaUUID_t               = hipUUID_t;
 #ifndef CUDART_VERSION
 #define CUDART_VERSION 12080
 #endif
+
+// --- device intrinsics ---------------------------------------------------------------------
+// The warp-synchronous shuffles, votes and reductions are templates in
+// amd_warp_sync_functions.h that static_assert(sizeof(mask) == 8), and every call
+// site in the tree passes an `unsigned` 0xffffffff. The macro widens the mask and
+// calls the HIP function behind the same name — a macro's own name in its body is
+// not re-expanded, so this reaches the function, not the macro. This is why the
+// vendor headers that declare these names are read in at the top of this file.
+#define __shfl_sync(mask, ...)       __shfl_sync((unsigned long long)(unsigned)(mask), __VA_ARGS__)
+#define __shfl_up_sync(mask, ...)    __shfl_up_sync((unsigned long long)(unsigned)(mask), __VA_ARGS__)
+#define __shfl_down_sync(mask, ...)  __shfl_down_sync((unsigned long long)(unsigned)(mask), __VA_ARGS__)
+#define __shfl_xor_sync(mask, ...)   __shfl_xor_sync((unsigned long long)(unsigned)(mask), __VA_ARGS__)
+#define __ballot_sync(mask, ...)     __ballot_sync((unsigned long long)(unsigned)(mask), __VA_ARGS__)
+#define __all_sync(mask, ...)        __all_sync((unsigned long long)(unsigned)(mask), __VA_ARGS__)
+#define __any_sync(mask, ...)        __any_sync((unsigned long long)(unsigned)(mask), __VA_ARGS__)
+#define __reduce_add_sync(mask, ...) __reduce_add_sync((unsigned long long)(unsigned)(mask), __VA_ARGS__)
+#define __reduce_min_sync(mask, ...) __reduce_min_sync((unsigned long long)(unsigned)(mask), __VA_ARGS__)
+#define __reduce_max_sync(mask, ...) __reduce_max_sync((unsigned long long)(unsigned)(mask), __VA_ARGS__)
+#define __reduce_and_sync(mask, ...) __reduce_and_sync((unsigned long long)(unsigned)(mask), __VA_ARGS__)
+#define __reduce_or_sync(mask, ...)  __reduce_or_sync((unsigned long long)(unsigned)(mask), __VA_ARGS__)
+#define __reduce_xor_sync(mask, ...) __reduce_xor_sync((unsigned long long)(unsigned)(mask), __VA_ARGS__)
+
+// Same mask trap in __syncwarp(mask); the no-argument call keeps working because the
+// macro expands to the same call shape.
+#define __syncwarp(...) __syncwarp(__VA_OPT__((unsigned long long)(unsigned)(__VA_ARGS__)))
+
+// __ldg exists only for a fixed list of integer and vector types; the tree loads
+// __nv_bfloat16, packed codes and other pointers through it. HIP's own overloads are
+// plain loads, so one template covers the rest the same way.
+template <class T>
+__attribute__((always_inline)) inline __device__ T __hipshim_ldg(const T* p) {
+    return *p;
+}
+#define __ldg(p) __hipshim_ldg(p)
+
+// The other CUDA cache-hint loads, same story: HIP spells a couple of them for a
+// fixed list of types only (half/half2 in hip_fp16.h), and they are plain loads
+// wherever they exist. The tree reads wider vectors and other pointers through
+// them, so route them to the same template.
+#define __ldcg(p) __hipshim_ldg(p)
+#define __ldcs(p) __hipshim_ldg(p)
+#define __ldcv(p) __hipshim_ldg(p)
+
+// Backpressure pause inside a spin loop; GCN has no instruction HIP spells under this
+// name, and a busy wait is exactly what the loop does without it.
+#define __nanosleep(t) ((void)(t))
+
+// Byte dot-product. The four signed-byte products it folds are a handful of integer
+// multiplies, and it appears only on SIMT-dequant routes.
+__attribute__((always_inline)) inline __device__ int __dp4a(int a, int b, int c) {
+    const unsigned x = static_cast<unsigned>(a);
+    const unsigned y = static_cast<unsigned>(b);
+    int acc = c;
+    for (int i = 0; i < 4; ++i) {
+        const auto lo = static_cast<int>(static_cast<signed char>(static_cast<unsigned char>(x >> (i * 8))));
+        const auto hi = static_cast<int>(static_cast<signed char>(static_cast<unsigned char>(y >> (i * 8))));
+        acc += lo * hi;
+    }
+    return acc;
+}
+
+// CUDA's packed-byte video intrinsics (cuda_video_intrinsics.h), used by the GGML and
+// Q4 dequant helpers. There is no portable AMD instruction, so each is the lane loop the
+// PTX opcode models; callers pass mixed int/unsigned, which the macros fold to unsigned.
+__attribute__((always_inline)) inline __device__ unsigned __hipshim_vadd4(unsigned a,
+                                                                            unsigned b) {
+    unsigned r = 0;
+    for (int i = 0; i < 4; ++i) {
+        const unsigned sum = ((a >> (8 * i)) & 0xFFu) + ((b >> (8 * i)) & 0xFFu);
+        r |= (sum & 0xFFu) << (8 * i);
+    }
+    return r;
+}
+__attribute__((always_inline)) inline __device__ unsigned __hipshim_vsub4(unsigned a,
+                                                                            unsigned b) {
+    unsigned r = 0;
+    for (int i = 0; i < 4; ++i) {
+        const unsigned diff = ((a >> (8 * i)) & 0xFFu) - ((b >> (8 * i)) & 0xFFu);
+        r |= (diff & 0xFFu) << (8 * i);
+    }
+    return r;
+}
+__attribute__((always_inline)) inline __device__ unsigned __hipshim_vsubss4(unsigned a,
+                                                                             unsigned b) {
+    unsigned r = 0;
+    for (int i = 0; i < 4; ++i) {
+        const int d = static_cast<int>(static_cast<signed char>((a >> (8 * i)) & 0xFFu)) -
+                        static_cast<int>(static_cast<signed char>((b >> (8 * i)) & 0xFFu));
+        const int c = d > 127 ? 127 : (d < -128 ? -128 : d);
+        r |= static_cast<unsigned>(static_cast<unsigned char>(c)) << (8 * i);
+    }
+    return r;
+}
+__attribute__((always_inline)) inline __device__ unsigned __hipshim_vcmpne4(unsigned a,
+                                                                             unsigned b) {
+    unsigned r = 0;
+    for (int i = 0; i < 4; ++i) {
+        if (((a >> (8 * i)) & 0xFFu) != ((b >> (8 * i)) & 0xFFu)) {
+            r |= 0xFFu << (8 * i);
+        }
+    }
+    return r;
+}
+#define __vadd4(a, b)   __hipshim_vadd4((unsigned)(a), (unsigned)(b))
+#define __vsub4(a, b)   __hipshim_vsub4((unsigned)(a), (unsigned)(b))
+#define __vsubss4(a, b) __hipshim_vsubss4((unsigned)(a), (unsigned)(b))
+#define __vcmpne4(a, b) __hipshim_vcmpne4((unsigned)(a), (unsigned)(b))
+
+// Address of a shared-window pointer as an integer; CUDA's cvta entry point has no ROCm
+// counterpart, and on GCN the generic address of a shared object is its shared address.
+__attribute__((always_inline)) inline __device__ unsigned long long
+__cvta_generic_to_shared(const void* p) {
+    return reinterpret_cast<unsigned long long>(p);
+}
 
 // --- functions -----------------------------------------------------------------------------
 // All of these are ordinary functions or function templates in the HIP headers with the same
@@ -207,3 +346,17 @@ inline cudaError_t cudaFuncSetAttribute(Kernel kernel, cudaFuncAttribute attribu
                                          int value) {
     return hipFuncSetAttribute(reinterpret_cast<const void*>(kernel), attribute, value);
 }
+
+// --- kernel markers -----------------------------------------------------------------------
+// CUDA's __grid_constant__ annotates by-value kernel parameters that TMA reads through
+// their parameter address. HIP has no spelling for it and needs none: the parameter is
+// already read-only in the kernel's parameter space. Defined empty so the TMA-path
+// headers that name it parse; without TMA the annotation carries no information.
+#define __grid_constant__
+
+// CUDA's per-kernel register cap. It is an attribute-like call on the __global__
+// declarator (`__maxnreg__(120) void k(...)`), and without a spelling here clang reads
+// the name as the declarator's type and the whole declaration collapses. HIP has no
+// equivalent — waves get a fixed share of the register file — so an empty macro is
+// both the parse fix and the honest translation.
+#define __maxnreg__(...)

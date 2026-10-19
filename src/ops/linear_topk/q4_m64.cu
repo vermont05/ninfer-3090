@@ -64,7 +64,7 @@ __device__ __forceinline__ int swizzle_128(int row, int column) {
 
 template <int TileColumns, int kBlockK = 128>
 __global__
-__launch_bounds__(M64Schedule<TileColumns, kBlockK>::kThreads, 2) void q4_m64_linear_topk_kernel(
+__launch_bounds__((M64Schedule<TileColumns, kBlockK>::kThreads), 2) void q4_m64_linear_topk_kernel(
     const __nv_bfloat16* __restrict__ hidden, const std::uint8_t* __restrict__ weight_codes,
     const std::uint8_t* __restrict__ weight_scales,
     const std::int32_t* __restrict__ row_to_global_ids, std::uint64_t* __restrict__ partial_keys,

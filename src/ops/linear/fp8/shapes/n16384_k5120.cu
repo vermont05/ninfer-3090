@@ -56,6 +56,11 @@ std::size_t partial_capacity_bytes(std::int32_t max_tokens) {
 }
 } // namespace
 
+// The table's members are host launchers, and a const global defined alongside
+// a __global__ kernel is emitted into the HIP device module, where those
+// references leave nothing for amdgcn-link to resolve. Define it host-side.
+#ifndef __HIP_DEVICE_COMPILE__
 const Fp8LinearShape kFp8N16384K5120{16384,     5120,    launch_a16,
                                      launch_a8, uses_a8, partial_capacity_bytes};
+#endif
 } // namespace ninfer::ops::detail
