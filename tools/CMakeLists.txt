@@ -40,3 +40,16 @@ target_link_libraries(ninfer-w4-row-scale-error PRIVATE ninfer_artifact)
 ninfer_internal_includes(ninfer-w4-row-scale-error)
 set_target_properties(ninfer-w4-row-scale-error PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools")
+
+# First device contact for the HIP backend's memory system: DeviceContext construction,
+# cuMemGetAllocationGranularity plus a VmmRegion back/release/restore round-trip, an arena
+# suballocation, and a graph capture/instantiate/launch. It runs no model -- it only proves the
+# memory system is live on the real device (and that hipGraph capture is legal on this part)
+# before anything is asked to compute there. Links ninfer_core, which carries the runtime and
+# driver interfaces.
+add_executable(ninfer-hip-memory-probe hip_memory_probe.cu)
+target_link_libraries(ninfer-hip-memory-probe PRIVATE ninfer_core)
+ninfer_internal_includes(ninfer-hip-memory-probe)
+ninfer_hipify_cu(ninfer-hip-memory-probe)
+set_target_properties(ninfer-hip-memory-probe PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools")
