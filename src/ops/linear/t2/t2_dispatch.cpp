@@ -41,7 +41,7 @@ T2Launch select_t2_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
         case 14336:
         case 16384:
         case 34816:
-            if (t == 1 && decode_simt) { return launch_t2_gemv_r8_w1_k5120; }
+            if (t == 1 && decode_simt) { return launch_t2_gemv_r4_w1_word; }
             return small_t();
         case 131072:
         case 248320:
@@ -53,13 +53,13 @@ T2Launch select_t2_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
         break;
     case 6144:
         if (n == 5120) {
-            if (t == 1 && decode_simt) { return launch_t2_gemv_r8_w1_k6144; }
+            if (t == 1 && decode_simt) { return launch_t2_gemv_r4_w1_word; }
             return small_t();
         }
         break;
     case 17408:
         if (n == 5120) {
-            if (t == 1 && decode_simt) { return launch_t2_gemv_r8_w1_k17408; }
+            if (t == 1 && decode_simt) { return launch_t2_gemv_r4_w1_word; }
             return small_t();
         }
         break;
