@@ -179,9 +179,16 @@ __attribute__((always_inline)) inline __device__ T __hipshim_ldg(const T* p) {
 // name, and a busy wait is exactly what the loop does without it.
 #define __nanosleep(t) ((void)(t))
 
-// Byte dot-product. The four signed-byte products it folds are a handful of integer
-// multiplies, and it appears only on SIMT-dequant routes.
+// Byte dot-product. One byte dot per word pair: __builtin_amdgcn_sudot4 decodes to
+// the V_SUDOT4 the ISA provides (same instruction the PRISM llama.cpp fork selects
+// for RDNA2/3), so SIMT-dequant routes pay one instruction per word instead of the
+// extract-and-multiply chain they would otherwise fold out of integer multiplies.
+// The builtin is gated on __AMDGCN__: this table is also read by plain-C++ translation
+// units, whose target declares no such builtin.
 __attribute__((always_inline)) inline __device__ int __dp4a(int a, int b, int c) {
+#if defined(__AMDGCN__)
+    return __builtin_amdgcn_sudot4(true, a, true, b, c, false);
+#else
     const unsigned x = static_cast<unsigned>(a);
     const unsigned y = static_cast<unsigned>(b);
     int acc = c;
@@ -191,6 +198,7 @@ __attribute__((always_inline)) inline __device__ int __dp4a(int a, int b, int c)
         acc += lo * hi;
     }
     return acc;
+#endif
 }
 
 // CUDA's packed-byte video intrinsics (cuda_video_intrinsics.h), used by the GGML and

@@ -160,17 +160,15 @@ __device__ __forceinline__ float dot_b4e4m3w8(const unsigned* a, const unsigned*
     return s;
 }
 
+// RDNA2+ ships V_DOT_INSTS-style byte dot products; gfx1102 (RDNA3) decodes
+// __builtin_amdgcn_sudot4 into V_SUDOT4, and one call replaces the eight sign-extended
+// byte products of one word pair. The hardware sum order matches the loop's word order;
+// like every reference here the partial order only differs from the tensor-core order.
 __device__ __forceinline__ int dot_s8w8(const unsigned* a, const unsigned* b) {
     int s = 0;
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
-        const unsigned x = a[i], y = b[i];
-#pragma unroll
-        for (int e = 0; e < 4; ++e) {
-            const auto av = static_cast<int>(static_cast<signed char>((x >> (e * 8)) & 0xFFu));
-            const auto bv = static_cast<int>(static_cast<signed char>((y >> (e * 8)) & 0xFFu));
-            s += av * bv;
-        }
+        s = __builtin_amdgcn_sudot4(true, a[i], true, b[i], s, false);
     }
     return s;
 }
@@ -179,13 +177,7 @@ __device__ __forceinline__ int dot_s8w4(const unsigned* a, const unsigned* b) {
     int s = 0;
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
-        const unsigned x = a[i], y = b[i];
-#pragma unroll
-        for (int e = 0; e < 4; ++e) {
-            const auto av = static_cast<int>(static_cast<signed char>((x >> (e * 8)) & 0xFFu));
-            const auto bv = static_cast<int>(static_cast<signed char>((y >> (e * 8)) & 0xFFu));
-            s += av * bv;
-        }
+        s = __builtin_amdgcn_sudot4(true, a[i], true, b[i], s, false);
     }
     return s;
 }
