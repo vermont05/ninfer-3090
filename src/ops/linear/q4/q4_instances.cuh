@@ -91,4 +91,7 @@ using MmaR32T32K64Wr16Wt8S4A4B2 =
                      Q4ScaleLoad::Pair32>;
 using SimtR4T4W2G8S2    =Q4A16SimtSchedule<4, 4, 2, 8, 2, Cache::ca, 1>;
 using SimtR4T1W2G8S2    = Q4A16SimtSchedule<4, 1, 2, 8, 2, Cache::ca, 1>;
+// The eight-row, sixteen-group tile that measures fastest on gfx1102 at every token count
+// from 6 to 512 on n5120_k17408 (bench/ops/linear_schedule_bench.cu `q4:5120x17408`).
+using SimtR8T8W1G16S2 = Q4A16SimtSchedule<8, 8, 1, 16, 2, Cache::ca, 1>;
 } // namespace ninfer::ops::detail::q4_instances

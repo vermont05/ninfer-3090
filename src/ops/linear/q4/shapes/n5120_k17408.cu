@@ -2,22 +2,21 @@
 #include "ops/linear/q4/q4_ksplit_launch.cuh"
 
 namespace ninfer::ops::detail {
-// The DFlash2 adapter of a ternary target is Q4. This shape is its hidden-width output or
-// feature projection; the ladder is n5120_k6144.cu's, not separately measured at this K.
+// Measured on gfx1102 with bench/ops/linear_schedule_bench.cu (`q4:5120x17408`), cold, median
+// of 9. The table that arrived here was n5120_k6144.cu's ladder moved to a deeper K without a
+// measurement, and on this card that ladder is wrong in both of its halves:
+//
+//   T=1    gemv_r4_w1  221.8 vs ksplit8 (the old route) 1529 -- 6.9x
+//   T=8    simt_r8_c8   740.6 vs ksplit8                1455 -- the ksplit rungs cost ~400 us of
+//                                                       fixed overhead here, every capacity
+//   T=128  simt_r8_c8 10757 vs mma_r64_c64t (best mma)  38741 -- the MMA tiers reach 7-72 ms at
+//          every column count on gfx1102; the sm_86 ladder that chose them never applied.
+//
+// The eight-row SIMT tile wins every interval from 6 through 512; the four-row one leads at
+// 2 and 4 by 4-6% and is not worth a second compiled instance next to the GEMV at 1.
 Q4Launch select_q4_n5120_k17408(std::int32_t tokens) {
-    if (tokens <= 8) return launch_q4_ksplit<5120, 17408, 8>;
-    if (tokens <= 24) return launch_q4_ksplit<5120, 17408, 24>;
-    if (tokens <= 32) return launch_q4_a16_mma_r32_t32_k64_wr16_wt8_s4_a4_b2;
-    if (tokens <= 64) return launch_q4_a16_mma_r32_t32_k64_wr16_wt16_s3_a3_b2;
-    if (tokens <= 80) return launch_q4_a16_mma_r64_t80;
-    if (tokens <= 96) return launch_q4_a16_mma_r64_t96;
-    if (tokens <= 128) return launch_q4_a16_mma_r64_t64_k64_wr32_wt16_s2_a2_b2;
-    if (tokens <= 160) return launch_q4_a16_mma_r64_t80;
-    if (tokens <= 192) return launch_q4_a16_mma_r64_t96;
-    if (tokens <= 224) return launch_q4_a16_mma_r64_t112;
-    if (tokens <= 256) return launch_q4_a16_mma_r64_t128;
-    if (tokens <= 320) return launch_q4_a16_mma_r64_t80;
-    return launch_q4_a16_mma_r64_t128;
+    if (tokens == 1) return launch_q4_a16_gemv_r4_w1_direct;
+    return launch_q4_a16_simt_r8_t8_w1_g16_s2;
 }
 
 } // namespace ninfer::ops::detail

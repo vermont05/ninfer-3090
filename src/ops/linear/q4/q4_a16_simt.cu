@@ -12,4 +12,9 @@ void launch_q4_a16_simt_r4_t1_w2_g8_s2(const Tensor& x, const Weight& w, Tensor&
     launch_q4_a16_simt_instance<q4_instances::SimtR4T1W2G8S2>(x, w, out, stream);
 }
 
+void launch_q4_a16_simt_r8_t8_w1_g16_s2(const Tensor& x, const Weight& w, Tensor& out,
+                                        cudaStream_t stream) {
+    launch_q4_a16_simt_instance<q4_instances::SimtR8T8W1G16S2>(x, w, out, stream);
+}
+
 } // namespace ninfer::ops::detail

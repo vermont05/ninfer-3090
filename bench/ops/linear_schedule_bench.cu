@@ -91,9 +91,8 @@ using Q4GemvR1W8 =
 
 template <int N, int K>
 std::vector<Candidate<detail::Q4Launch>> q4_candidates() {
-    return {
+    std::vector<Candidate<detail::Q4Launch>> candidates = {
         {"gemv_r4_w1", detail::launch_q4_a16_gemv_r4_w1_direct, 1},
-        {"gemv_r1_w8", detail::launch_q4_a16_gemv_instance<Q4GemvR1W8<K>>, 1},
         {"simt_r4_c4",
          detail::launch_q4_a16_simt_instance<Q4A16SimtSchedule<4, 4, 1, 8, 2, Cache::ca, 1, true>>,
          0},
@@ -122,6 +121,15 @@ std::vector<Candidate<detail::Q4Launch>> q4_candidates() {
         {"mma_r64_c120", detail::launch_q4_a16_mma_r64_t120, 0},
         {"mma_r64_c128", detail::launch_q4_a16_mma_r64_t128, 0},
     };
+    // GemvR1W8's static row ownership holds 8 warps x 16 groups = 128 groups, so it only
+    // compiles for K up to 128*64. Larger-K shapes (the down projections) sweep without it.
+    if constexpr (K <= 8192) {
+        candidates.insert(candidates.begin() + 1,
+                            Candidate<detail::Q4Launch>{"gemv_r1_w8",
+                                                         detail::launch_q4_a16_gemv_instance<Q4GemvR1W8<K>>,
+                                                         1});
+    }
+    return candidates;
 }
 
 // --- Q5 ----------------------------------------------------------------------------------------
@@ -335,6 +343,7 @@ const Shape kShapes[] = {
     {"q4:7168x5120", sweep_q4<7168, 5120>},
     {"q4:34816x5120", sweep_q4<34816, 5120>},
     {"q4:5120x6144", sweep_q4<5120, 6144>},
+    {"q4:5120x17408", sweep_q4<5120, 17408>},
     {"q4:131072x5120", sweep_q4<131072, 5120>},
     {"q5:1024x5120", sweep_q5<1024, 5120, 4>},
     {"q5:6144x5120", sweep_q5<6144, 5120, 4>},
