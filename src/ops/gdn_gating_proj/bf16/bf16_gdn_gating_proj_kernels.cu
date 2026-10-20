@@ -257,6 +257,11 @@ void require_shape35(const Weight& w, const char* name) {
     }
 }
 
+// The sm_86-measured resident-CTA occupancy, used only as the fallback when the runtime
+// occupancy query fails. The live figure is queried per launch site: occupancy is a property
+// of the device as much as of the kernel (a 40-KiB-smem BN128 CTA fits two per SM on sm_86's
+// 100-KiB smem but only one per gfx1102 CU's 64 KiB), and chunking a grid from the wrong figure
+// makes the driver reject the cooperative launch outright.
 template <class Geometry, int SplitK>
 constexpr std::int32_t cooperative_resident_ctas_per_sm() noexcept {
     static_assert(SplitK > 1);
@@ -365,8 +370,30 @@ bool launch_bf16_prefill_mma(Bf16GdnGatingTokenVariant variant, const Tensor& x,
     } else {
         constexpr std::int64_t kCtasPerTokenTile =
             static_cast<std::int64_t>(Geometry::kHeads / kBf16GdnBlockM) * SplitK;
-        constexpr std::int32_t kResidentCtasPerSm =
-            cooperative_resident_ctas_per_sm<Geometry, SplitK>();
+        // Resident CTAs per SM for this instantiation, from the device itself: the whole
+        // grid must be simultaneously resident, and the sm_86 constant is only right on
+        // sm_86. Once per instantiation; both token variants share smem, threads and (for
+        // these kernels) registers, so they agree -- take the smaller answer if they ever
+        // don't. A failed query falls back to the sm_86 measurement.
+        static const std::int32_t kResidentCtasPerSm = [] {
+            auto per_sm = [](auto kernel) -> int {
+                int blocks = 0;
+                return cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                           &blocks, kernel, Warps * 32, kSmemBytes) == cudaSuccess
+                           ? blocks
+                           : -1;
+            };
+            const int full       = per_sm(bf16_gdn_gating_proj_gemm_mma_kernel<
+                                                           Geometry, SplitK, true, Warps,
+                                                           NormalizeInput, NormTokenCapacity>);
+            const int predicated = per_sm(bf16_gdn_gating_proj_gemm_mma_kernel<
+                                                           Geometry, SplitK, false, Warps,
+                                                           NormalizeInput, NormTokenCapacity>);
+            if (full < 0 || predicated < 0) {
+                return cooperative_resident_ctas_per_sm<Geometry, SplitK>();
+            }
+            return full < predicated ? full : predicated;
+        }();
         const std::int64_t resident_ctas =
             static_cast<std::int64_t>(multiprocessor_count) * kResidentCtasPerSm;
         const std::int64_t max_token_tiles = resident_ctas / kCtasPerTokenTile;
