@@ -37,8 +37,9 @@ __device__ __forceinline__ int causal_swizzle(int row, int col) {
     return (((col >> 3) ^ (row & 7)) << 3) | (col & 7);
 }
 
-__device__ __forceinline__ unsigned causal_swizzle_address(unsigned base, unsigned column,
-                                                           unsigned matrix, unsigned row) {
+__device__ __forceinline__ std::uintptr_t causal_swizzle_address(std::uintptr_t base,
+                                                                  unsigned column, unsigned matrix,
+                                                                  unsigned row) {
     return base + ((column | matrix) ^ row);
 }
 

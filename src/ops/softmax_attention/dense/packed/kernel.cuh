@@ -152,17 +152,17 @@ __launch_bounds__(Br * 2, 128 / Br) __global__ void packed_attention_flash_kerne
     const int b_koff    = ((lane >> 3) & 1) << 3;
     const int warp_row0 = warp * 16;
 
-    const unsigned q_sbase     = smem_addr(q_s);
-    const unsigned k_sbase     = smem_addr(k_s);
-    const unsigned v_sbase     = smem_addr(v_s);
-    const unsigned q_lane_base = q_sbase + static_cast<unsigned>((warp_row0 + a_rowoff) * RowBytes);
+    const auto q_sbase     = smem_addr(q_s);
+    const auto k_sbase     = smem_addr(k_s);
+    const auto v_sbase     = smem_addr(v_s);
+    const auto q_lane_base = q_sbase + static_cast<unsigned>((warp_row0 + a_rowoff) * RowBytes);
     const unsigned q_as        = static_cast<unsigned>((a_mat >> 1) << 4);
     const unsigned q_r         = static_cast<unsigned>(a_rin << 4);
-    const unsigned k_lane_base = k_sbase + static_cast<unsigned>(b_rin * RowBytes) +
+    const auto k_lane_base = k_sbase + static_cast<unsigned>(b_rin * RowBytes) +
                                  static_cast<unsigned>((lane >> 4) * 8 * RowBytes);
     const unsigned k_as        = static_cast<unsigned>((b_koff >> 3) << 4);
     const unsigned k_r         = static_cast<unsigned>(b_rin << 4);
-    const unsigned v_lane_base = v_sbase + static_cast<unsigned>(((lane >> 3) & 1) * 8 * RowBytes) +
+    const auto v_lane_base = v_sbase + static_cast<unsigned>(((lane >> 3) & 1) * 8 * RowBytes) +
                                  static_cast<unsigned>(b_rin * RowBytes);
     const unsigned v_as = static_cast<unsigned>((lane >> 4) << 4);
     const unsigned v_r  = static_cast<unsigned>(b_rin << 4);

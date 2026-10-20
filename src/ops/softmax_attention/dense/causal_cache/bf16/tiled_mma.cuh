@@ -62,22 +62,22 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     const int warp_row0 = warp * 16; // this warp owns rows [warp_row0, warp_row0+16)
 
     // Per-lane precomputed swizzled ldmatrix base addresses (see causal_swizzle_address).
-    const unsigned q_sbase = smem_addr(q_s);
-    const unsigned k_sbase = smem_addr(k_s);
-    const unsigned v_sbase = smem_addr(v_s);
+    const auto q_sbase = smem_addr(q_s);
+    const auto k_sbase = smem_addr(k_s);
+    const auto v_sbase = smem_addr(v_s);
     // Q A-fragment: row = warp_row0 + a_rowoff, col = k*16 + a_coloff.
-    const unsigned q_lane_base = q_sbase + static_cast<unsigned>((warp_row0 + a_rowoff) * (D * 2));
+    const auto q_lane_base = q_sbase + static_cast<unsigned>((warp_row0 + a_rowoff) * (D * 2));
     const unsigned q_as        = static_cast<unsigned>((a_mat >> 1) << 4);
     const unsigned q_r         = static_cast<unsigned>(a_rin << 4);
     // K B-fragment via ldmatrix.x4 (2 n-tiles/instr): lanes 16-31 fetch the +8-key
     // half (eight D-wide rows), lanes with bit3 set fetch the +8 d-contract half.
-    const unsigned k_lane_base = k_sbase + static_cast<unsigned>(b_rin * (D * 2)) +
+    const auto k_lane_base = k_sbase + static_cast<unsigned>(b_rin * (D * 2)) +
                                  (static_cast<unsigned>(lane >> 4) * (8 * D * 2));
     const unsigned k_as = static_cast<unsigned>((b_koff >> 3) << 4);
     const unsigned k_r  = static_cast<unsigned>(b_rin << 4);
     // V B-fragment via ldmatrix.x4.trans (2 n-tiles/instr): row = k*16 + (bit3)*8 + b_rin,
     // col = n*8 + (lane>>4)*8.
-    const unsigned v_lane_base = v_sbase + static_cast<unsigned>(((lane >> 3) & 1) * (8 * D * 2)) +
+    const auto v_lane_base = v_sbase + static_cast<unsigned>(((lane >> 3) & 1) * (8 * D * 2)) +
                                  static_cast<unsigned>(b_rin * (D * 2));
     const unsigned v_as = static_cast<unsigned>((lane >> 4) << 4);
     const unsigned v_r  = static_cast<unsigned>(b_rin << 4);

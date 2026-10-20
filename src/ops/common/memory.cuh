@@ -3,6 +3,8 @@
 #include <cuda_pipeline.h>
 #include <cuda_runtime.h>
 
+#include <cstdint>
+
 namespace ninfer::ops {
 
 enum class Cache { ca, cg };
@@ -28,9 +30,19 @@ __device__ __forceinline__ void store_vec(T* ptr, V value) {
     *reinterpret_cast<V*>(ptr) = value;
 }
 
+#if defined(__HIPCC__)
+// GCN uses flat addressing: an LDS object's shared address is its 64-bit generic address.
+// The CUDA path's 32-bit cvta value truncates it to garbage, which the SIMT ldmatrix
+// reference in mma.cuh then dereferences -- the exact invalid-address fault. The whole
+// HIP chain (smem_addr, the ldmatrix reference parameters) is std::uintptr_t-wide.
+__device__ __forceinline__ std::uintptr_t smem_addr(const void* ptr) {
+    return reinterpret_cast<std::uintptr_t>(ptr);
+}
+#else
 __device__ __forceinline__ unsigned smem_addr(const void* ptr) {
     return static_cast<unsigned>(__cvta_generic_to_shared(ptr));
 }
+#endif
 
 #if defined(__HIPCC__)
 // cp.async is PTX-only, and RDNA3 has no async-copy instruction to route it to.

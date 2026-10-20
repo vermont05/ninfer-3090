@@ -235,8 +235,8 @@ __device__ __forceinline__ void context_query_split_partial_body(
     float l0 = 0.0f;
     float l1 = 0.0f;
 
-    const unsigned v_sbase     = smem_addr(v_s);
-    const unsigned v_lane_base = v_sbase + static_cast<unsigned>(((lane >> 3) & 1) * 8 * RowBytes) +
+    const auto v_sbase     = smem_addr(v_s);
+    const auto v_lane_base = v_sbase + static_cast<unsigned>(((lane >> 3) & 1) * 8 * RowBytes) +
                                  static_cast<unsigned>(b_rin * RowBytes);
     const unsigned v_as = static_cast<unsigned>((lane >> 4) << 4);
     const unsigned v_r  = static_cast<unsigned>(b_rin << 4);

@@ -233,15 +233,15 @@ __device__ __forceinline__ float dot_b4nib2(const unsigned* a, const unsigned* b
 // c0,c1 = (g, 2t),(g, 2t+1) and c2,c3 = (g+8, 2t),(g+8, 2t+1); the fp16-accumulator form packs
 // (g, 2t..2t+1) into c0 and (g+8, 2t..2t+1) into c1.
 
-__device__ __forceinline__ void ldmatrix_x2(unsigned& r0, unsigned& r1, unsigned addr) {
+__device__ __forceinline__ void ldmatrix_x2(unsigned& r0, unsigned& r1, std::uintptr_t addr) {
     const unsigned l = mma_detail::lane();
     const std::uintptr_t a = addr;
     r0 = mma_detail::pair_at(a, 0u, l >> 2, (l & 3u) * 2u);
     r1 = mma_detail::pair_at(a, 8u, l >> 2, (l & 3u) * 2u);
 }
 
-__device__ __forceinline__ void ldmatrix_x4(unsigned& r0, unsigned& r1, unsigned& r2, unsigned& r3,
-                                            unsigned addr) {
+__device__ __forceinline__ void ldmatrix_x4(unsigned& r0, unsigned& r1, unsigned& r2,
+                                            unsigned& r3, std::uintptr_t addr) {
     const unsigned l = mma_detail::lane();
     const std::uintptr_t a = addr;
     r0 = mma_detail::pair_at(a, 0u, l >> 2, (l & 3u) * 2u);
@@ -252,7 +252,7 @@ __device__ __forceinline__ void ldmatrix_x4(unsigned& r0, unsigned& r1, unsigned
 
 // .trans inverts the tile: lane's pair of the transpose is provider rows 2 * (lane & 3)
 // and +1, read at column lane >> 2.
-__device__ __forceinline__ void ldmatrix_x2_t(unsigned& r0, unsigned& r1, unsigned addr) {
+__device__ __forceinline__ void ldmatrix_x2_t(unsigned& r0, unsigned& r1, std::uintptr_t addr) {
     const unsigned l = mma_detail::lane();
     const std::uintptr_t a = addr;
     r0 = mma_detail::bcast_pair_t(a, 0u, (l & 3u) * 2u);
@@ -260,7 +260,7 @@ __device__ __forceinline__ void ldmatrix_x2_t(unsigned& r0, unsigned& r1, unsign
 }
 
 __device__ __forceinline__ void ldmatrix_x4_t(unsigned& r0, unsigned& r1, unsigned& r2,
-                                              unsigned& r3, unsigned addr) {
+                                              unsigned& r3, std::uintptr_t addr) {
     const unsigned l = mma_detail::lane();
     const std::uintptr_t a = addr;
     r0 = mma_detail::bcast_pair_t(a, 0u, (l & 3u) * 2u);
