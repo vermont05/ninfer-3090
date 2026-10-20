@@ -126,6 +126,33 @@ __device__ __forceinline__ float t2_gemv_word_partial(std::uint32_t packed, cons
     return partial;
 }
 
+// Same signed sum as t2_gemv_word_partial, built from shifts, masks and sign-bit xors:
+// bit-identical on the hardware path (bf16 -> f32 widening is a 16-bit shift). Lower VALU
+// instruction count per word; measured faster on the low-row-count decode shapes.
+__device__ __forceinline__ float t2_gemv_word_partial_bits(std::uint32_t packed, const uint4& xa,
+                                                            const uint4& xb) {
+    const std::uint32_t halves[8] = {xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w};
+    float partial                 = 0.0f;
+#pragma unroll
+    for (int pair = 0; pair < 8; ++pair) {
+        const std::uint32_t h  = halves[pair];
+        const std::uint32_t lo = h << 16;
+        const std::uint32_t hi = h & 0xffff0000u;
+        const std::uint32_t s0 = (packed >> (4 * pair)) & 1u;
+        const std::uint32_t n0 = (packed >> (4 * pair + 1)) & 1u;
+        const std::uint32_t s1 = (packed >> (4 * pair + 2)) & 1u;
+        const std::uint32_t n1 = (packed >> (4 * pair + 3)) & 1u;
+        float f0, f1;
+        const std::uint32_t b0 = (lo & (0u - s0)) ^ (n0 << 31);
+        const std::uint32_t b1 = (hi & (0u - s1)) ^ (n1 << 31);
+        __builtin_memcpy(&f0, &b0, 4);
+        __builtin_memcpy(&f1, &b1, 4);
+        partial += f0;
+        partial += f1;
+    }
+    return partial;
+}
+
 template <class Schedule>
 __device__ __forceinline__ float
 t2_gemv_dot_byte_static(T2GemvTileStorage<Schedule>& tiles, int cta_warp,
@@ -174,7 +201,7 @@ t2_gemv_dot_byte_static(T2GemvTileStorage<Schedule>& tiles, int cta_warp,
     return accumulator;
 }
 
-template <class Schedule>
+template <class Schedule, bool WordPartialBits = false>
 __device__ __forceinline__ float t2_gemv_dot_word_sync(T2GemvTileStorage<Schedule>& tiles,
                                                        int cta_warp,
                                                        const __nv_bfloat16* __restrict__ activation,
@@ -221,7 +248,11 @@ __device__ __forceinline__ float t2_gemv_dot_word_sync(T2GemvTileStorage<Schedul
                                     lane_in_group * T2RowSplitStorage::kCodesPerWord;
                 const uint4 xa    = load_vec<uint4>(activation + k_begin);
                 const uint4 xb    = load_vec<uint4>(activation + k_begin + 8);
-                accumulator       = fmaf(t2_gemv_word_partial(packed, xa, xb), scale, accumulator);
+                if constexpr (WordPartialBits) {
+                    accumulator = fmaf(t2_gemv_word_partial_bits(packed, xa, xb), scale, accumulator);
+                } else {
+                    accumulator = fmaf(t2_gemv_word_partial(packed, xa, xb), scale, accumulator);
+                }
             }
         }
         __syncwarp();
@@ -229,7 +260,7 @@ __device__ __forceinline__ float t2_gemv_dot_word_sync(T2GemvTileStorage<Schedul
     return accumulator;
 }
 
-template <class Schedule>
+template <class Schedule, bool WordPartialBits = false>
 __global__ __launch_bounds__(
     Schedule::kThreads,
     Schedule::
@@ -274,7 +305,7 @@ __global__ __launch_bounds__(
                                                             group_begin, lane);
         } else {
             if (group_begin < group_end) {
-                accumulator = t2_gemv_dot_word_sync<Schedule>(
+                accumulator = t2_gemv_dot_word_sync<Schedule, WordPartialBits>(
                     tiles, cta_warp, x, code_row, scale_row, group_begin, group_end, lane);
             }
         }

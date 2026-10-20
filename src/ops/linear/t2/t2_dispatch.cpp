@@ -33,9 +33,14 @@ T2Launch select_t2_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
     switch (k) {
     case 5120:
         switch (n) {
+        case 6144:
+            // On gfx1102 the bit-trick word partial measures 8-13% faster than the cndmask
+            // lowering on the low-row-count decode shapes like this one; large-n shapes
+            // (gate_up 34816, the text heads) measure faster with the cndmask one.
+            if (t == 1 && decode_simt) { return launch_t2_gemv_r4_w1_word_bits; }
+            return small_t();
         case 1024:
         case 4096:
-        case 6144:
         case 7168:
         case 12288:
         case 14336:
@@ -59,7 +64,7 @@ T2Launch select_t2_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
         break;
     case 17408:
         if (n == 5120) {
-            if (t == 1 && decode_simt) { return launch_t2_gemv_r4_w1_word; }
+            if (t == 1 && decode_simt) { return launch_t2_gemv_r4_w1_word_bits; }
             return small_t();
         }
         break;

@@ -9,13 +9,13 @@
 namespace ninfer::ops::detail {
 namespace {
 
-template <class Schedule>
+template <class Schedule, bool WordPartialBits = false>
 void launch_gemv(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     const std::int32_t rows = out.ne[0];
     const std::int32_t k    = x.ne[0];
     const dim3 grid(static_cast<unsigned>(div_up(rows, Schedule::kRowsPerCta)), 1u, 1u);
     constexpr dim3 block(static_cast<unsigned>(Schedule::kThreads), 1u, 1u);
-    t2_rowsplit_gemv_kernel<Schedule><<<grid, block, 0, stream>>>(
+    t2_rowsplit_gemv_kernel<Schedule, WordPartialBits><<<grid, block, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
         static_cast<const std::uint8_t*>(w.scales), static_cast<__nv_bfloat16*>(out.data), rows, k);
     CUDA_CHECK(cudaGetLastError());
@@ -40,6 +40,13 @@ void launch_t2_gemv_r8_w1_k17408(const Tensor& x, const Weight& w, Tensor& out,
 
 void launch_t2_gemv_r4_w1_word(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     launch_gemv<T2GemvR4W1WordSchedule>(x, w, out, stream);
+}
+
+// Bit-trick word partial: measured faster than the cndmask lowering on the low-row-count
+// decode shapes (n <= 6144); large-n shapes keep the default partial.
+void launch_t2_gemv_r4_w1_word_bits(const Tensor& x, const Weight& w, Tensor& out,
+                                     cudaStream_t stream) {
+    launch_gemv<T2GemvR4W1WordSchedule, true>(x, w, out, stream);
 }
 
 } // namespace ninfer::ops::detail
