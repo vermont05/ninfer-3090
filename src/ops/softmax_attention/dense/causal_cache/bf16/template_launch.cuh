@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/device.h"
+#include "ops/softmax_attention/dense/causal_cache/bf16/lds_fit.cuh"
 #include "ops/softmax_attention/dense/causal_cache/bf16/grouped_mma.cuh"
 #include "ops/softmax_attention/dense/causal_cache/bf16/tiled_mma.cuh"
 #include "ops/softmax_attention/dense/causal_cache/bf16/merge.cuh"
@@ -85,11 +86,17 @@ void launch_bf16_kv_tiled_mma(const CausalAttentionOperands& p, Bf16KvReadView c
     validate_bf16_kv_operands<Geometry>(p, cache);
     if (p.batch != 1)
         throw std::invalid_argument("BF16 tiled attention requires a complete single-row query");
+#if defined(__HIPCC__)
+    // Same 64 KiB ceiling as the linear tiers: descend the table tile before configuring it.
+    using ScheduleFit = typename Bf16KvTiledLdsFit<Geometry, Schedule>::type;
+#else
+    using ScheduleFit = Schedule;
+#endif
     const auto launch = [&]<class Metadata>(Metadata metadata) {
-        constexpr auto kernel = bf16_kv_tiled_mma_kernel<Geometry, Schedule, Metadata>;
+        constexpr auto kernel = bf16_kv_tiled_mma_kernel<Geometry, ScheduleFit, Metadata>;
         const int bytes =
-            bf16_kv_dynamic_shared<bf16_kv_tiled_shared_bytes<Geometry, Schedule>, kernel>();
-        const dim3 grid(div_up(p.width, Schedule::kQueryRows), Geometry::QHeads);
+            bf16_kv_dynamic_shared<bf16_kv_tiled_shared_bytes<Geometry, ScheduleFit>, kernel>();
+        const dim3 grid(div_up(p.width, ScheduleFit::kQueryRows), Geometry::QHeads);
         kernel<<<grid, Schedule::kThreads, bytes, stream>>>(p.q, cache.keys, cache.values, metadata,
                                                             p.positions, p.scale, p.out, p.width);
         CUDA_CHECK(cudaGetLastError());

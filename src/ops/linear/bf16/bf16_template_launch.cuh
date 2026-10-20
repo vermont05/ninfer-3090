@@ -2,6 +2,7 @@
 
 #include "ops/common/math.h"
 #include "ops/common/token_slices.h"
+#include "ops/linear/bf16/bf16_lds_fit.cuh"
 #include "ops/linear/bf16/bf16_operands.h"
 #include "ops/linear/bf16/bf16_a16_gemv.cuh"
 #include "ops/linear/bf16/bf16_a16_simt.cuh"
@@ -67,9 +68,14 @@ void launch_bf16_a16_simt(const Bf16A16Operands& p, Output output, Epilogue epil
     });
 }
 
-template <class Schedule, int Splits, class Output, class Epilogue>
+template <class ScheduleIn, int Splits, class Output, class Epilogue>
 void launch_bf16_mma_partitions(const Bf16A16Operands& p, Output output, Epilogue epilogue,
                                 cudaStream_t stream) {
+#if defined(__HIPCC__)
+    using Schedule = typename Bf16LdsFit<ScheduleIn>::type;
+#else
+    using Schedule = ScheduleIn;
+#endif
     static_assert(Splits >= 1 && Splits <= 32);
     static_assert(Schedule::kThreads == Schedule::kWarpsRows * Schedule::kWarpsTokens * 32,
                   "cp.async MMA schedules must not reserve TMA producer warps");
@@ -106,9 +112,14 @@ void launch_bf16_a16_mma(const Bf16A16Operands& p, Output output, Epilogue epilo
     launch_bf16_mma_partitions<Schedule, 1>(p, output, epilogue, stream);
 }
 
-template <class Schedule, class Output, class Epilogue>
+template <class ScheduleIn, class Output, class Epilogue>
 void launch_bf16_a16_sliced_k_mma(const Bf16A16Operands& p, Output output, Epilogue epilogue,
                                   cudaStream_t stream) {
+#if defined(__HIPCC__)
+    using Schedule = typename Bf16LdsFit<ScheduleIn>::type;
+#else
+    using Schedule = ScheduleIn;
+#endif
     validate_bf16_operands<Schedule>(p);
     if ((!bf16_predicated_rows<Schedule> && p.rows % Schedule::kBlockRows) ||
         p.k % (bf16_predicated_k<Schedule> ? 8 : Schedule::kBlockK))
