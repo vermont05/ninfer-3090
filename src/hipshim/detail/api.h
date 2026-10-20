@@ -92,6 +92,7 @@ using cudaLaunchConfig_t       = hipLaunchConfig_t;
 #define cudaStreamCaptureStatusNone hipStreamCaptureStatusNone
 #define cudaStreamCaptureStatusActive hipStreamCaptureStatusActive
 #define cudaStreamCaptureModeThreadLocal hipStreamCaptureModeThreadLocal
+#define cudaStreamCaptureModeGlobal hipStreamCaptureModeGlobal
 #define cudaEventDisableTiming hipEventDisableTiming
 #define cudaEventRecordExternal hipEventRecordExternal
 #define cudaHostAllocDefault hipHostAllocDefault
