@@ -304,6 +304,7 @@ __cvta_generic_to_shared(const void* p) {
 #define cudaGraphDestroy hipGraphDestroy
 #define cudaGraphExecDestroy hipGraphExecDestroy
 #define cudaGraphUpload hipGraphUpload
+#define cudaGraphGetNodes hipGraphGetNodes
 
 #define cudaLaunchKernelEx hipLaunchKernelEx
 #define cudaOccupancyMaxActiveBlocksPerMultiprocessor \
