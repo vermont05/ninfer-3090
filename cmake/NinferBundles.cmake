@@ -19,6 +19,9 @@
 function(ninfer_bundle_program bundle name)
   cmake_parse_arguments(PARSE_ARGV 2 arg "" "" "SOURCES;LIBRARIES")
   add_library(${name} OBJECT ${arg_SOURCES})
+  # Under the HIP backend a .cu source has no language until it is retagged HIP; without this
+  # the target silently carries no compiles and the bundle links without its entry symbol.
+  ninfer_hipify_cu(${name})
   target_link_libraries(${name} PRIVATE ${arg_LIBRARIES})
   target_compile_definitions(${name} PRIVATE main=ninfer_bundle_entry_${name})
   # A renamed main loses main's implicit `return 0`, so falling off its end returns garbage and a

@@ -115,6 +115,11 @@ using cudaLaunchConfig_t       = hipLaunchConfig_t;
 #define cudaDevAttrMaxPitch hipDeviceAttributeMaxPitch
 #define cudaDevAttrMultiProcessorCount hipDeviceAttributeMultiprocessorCount
 #define cudaDevAttrUnifiedAddressing hipDeviceAttributeUnifiedAddressing
+#define cudaDevAttrMemoryClockRate hipDeviceAttributeMemoryClockRate
+// HIP spells the bus-width enumerator without the "Global" prefix CUDA uses.
+#define cudaDevAttrGlobalMemoryBusWidth hipDeviceAttributeMemoryBusWidth
+#define cudaDevAttrComputeCapabilityMajor hipDeviceAttributeComputeCapabilityMajor
+#define cudaDevAttrComputeCapabilityMinor hipDeviceAttributeComputeCapabilityMinor
 
 // Math constants used by the kernels; CUDA exports them from its own headers.
 #ifndef CUDART_INF_F
