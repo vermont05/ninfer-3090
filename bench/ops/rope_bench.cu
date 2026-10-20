@@ -23,6 +23,16 @@
 using namespace ninfer;
 using namespace ninfer::bench;
 
+// Keeps a pair of loaded values live through the optimizer, and orders the surrounding
+// shared-memory traffic. The operand-carrying PTX sink is NVIDIA-only; the shared caches
+// these reads come from are __shared__ volatile, so on AMDGCN a clobber-only barrier
+// preserves the access without needing a float register constraint.
+#if defined(__HIPCC__)
+#define NINFER_ROPE_SINK2(a, b) asm volatile("" ::: "memory")
+#else
+#define NINFER_ROPE_SINK2(a, b) asm volatile("" : : "f"(a), "f"(b) : "memory")
+#endif
+
 namespace {
 
 constexpr int kTextHeadDim        = 256;
@@ -117,6 +127,13 @@ DeviceBuffer make_vision_positions(int patches) {
 }
 
 __device__ __forceinline__ void copy_bf16x8(__nv_bfloat16* data, std::int64_t index) {
+#if defined(__HIPCC__)
+    // The PTX below is NVIDIA-only. The uint4 is 16-byte aligned here (the index advances by
+    // 8 bf16s), so the portable copy lowers to one 128-bit load and store on AMDGCN too.
+    uint4 value;
+    __builtin_memcpy(&value, data + index, sizeof(value));
+    __builtin_memcpy(data + index, &value, sizeof(value));
+#else
     void* address = data + index;
     unsigned int x, y, z, w;
     asm volatile("ld.global.v4.u32 {%0, %1, %2, %3}, [%4];"
@@ -127,6 +144,7 @@ __device__ __forceinline__ void copy_bf16x8(__nv_bfloat16* data, std::int64_t in
                  :
                  : "l"(address), "r"(x), "r"(y), "r"(z), "r"(w)
                  : "memory");
+#endif
 }
 
 template <ops::RopeKernelMode Mode, int HeadDim, int RotaryDim, int QHeads, int KHeads>
@@ -149,7 +167,7 @@ rope_payload_control_kernel(const std::int32_t* positions, __nv_bfloat16* q, __n
     if (threadIdx.x < half) {
         const float cosine = cos_cache[threadIdx.x];
         const float sine   = sin_cache[threadIdx.x];
-        asm volatile("" : : "f"(cosine), "f"(sine) : "memory");
+        NINFER_ROPE_SINK2(cosine, sine);
     }
 
     const int lane        = static_cast<int>(threadIdx.x) & 31;
@@ -192,7 +210,7 @@ __global__ void rope_split_payload_control_kernel(const std::int32_t* positions,
     if (threadIdx.x < kHalf) {
         const float cosine = cos_cache[threadIdx.x];
         const float sine   = sin_cache[threadIdx.x];
-        asm volatile("" : : "f"(cosine), "f"(sine) : "memory");
+        NINFER_ROPE_SINK2(cosine, sine);
     }
 
     const int lane          = static_cast<int>(threadIdx.x) & 31;
