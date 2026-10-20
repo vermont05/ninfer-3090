@@ -44,6 +44,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <initializer_list>
 #include <limits>
 #include <stdexcept>
@@ -53,6 +55,140 @@
 
 namespace ninfer::models::qwen3_5::execution {
 namespace {
+
+// Diagnostic only. With NINFER_STEP_PROFILE set, the decode body segments its device work
+// with event pairs (embed | layers | norm+head | tail) and prints rolling per-segment means
+// to stderr every 64 steps. The step before a call is fenced by the round loop's device sync,
+// so the previous step's pairs are complete when the next call opens.
+struct DecodeStepProbe {
+    cudaEvent_t begin    = nullptr;
+    cudaEvent_t after[3] = {};
+    cudaEvent_t end      = nullptr;
+    double      sum[4]   = {};
+    cudaEvent_t prev[5]  = {};
+
+    // Per-layer recording: for layer i the boundary events are prev_layers[1+i] (after the
+    // layer) with prev_layers[i] before it and prev_layers[64+1+i] between mixer and mlp.
+    // Buckets: [kind][0=mixer,1=mlp] with kind 0=GDN, 1=FullAttention.
+    std::vector<cudaEvent_t> layer_pool;
+    std::vector<cudaEvent_t> prev_layers;
+    std::vector<int>         prev_kinds;
+    double      bucket[2][2] = {};
+
+    bool        pending  = false;
+    long        steps    = 0;
+    bool        enabled  = false;
+
+    DecodeStepProbe() {
+        const char* value = std::getenv("NINFER_STEP_PROFILE");
+        enabled             = value != nullptr && std::string(value) != "0";
+        if (!enabled) { return; }
+        cudaEventCreate(&begin);
+        cudaEventCreate(&after[0]);
+        cudaEventCreate(&after[1]);
+        cudaEventCreate(&after[2]);
+        cudaEventCreate(&end);
+    }
+    ~DecodeStepProbe() {
+        if (!enabled) { return; }
+        dump();
+        cudaEventDestroy(begin);
+        cudaEventDestroy(end);
+        for (auto& e : after) { cudaEventDestroy(e); }
+        for (auto& e : layer_pool) { cudaEventDestroy(e); }
+    }
+    DecodeStepProbe(const DecodeStepProbe&)            = delete;
+    DecodeStepProbe& operator=(const DecodeStepProbe&) = delete;
+
+    [[nodiscard]] cudaEvent_t layer_event(std::size_t index) {
+        if (layer_pool.size() <= index) {
+            const std::size_t room = index + 1 > 256 ? index + 1 : 256;
+            while (layer_pool.size() < room) {
+                cudaEvent_t e = nullptr;
+                cudaEventCreate(&e);
+                layer_pool.push_back(e);
+            }
+        }
+        return layer_pool[index];
+    }
+
+    // Folds the previous step's finished pairs into the running sums, then opens this one.
+    void open(cudaStream_t stream) {
+        if (pending) {
+            for (int i = 0; i < 4; ++i) {
+                float ms = 0.0f;
+                if (cudaEventElapsedTime(&ms, prev[i], prev[i + 1]) == cudaSuccess) {
+                    sum[i] += static_cast<double>(ms);
+                }
+            }
+            for (std::size_t i = 0; 2 * i + 2 < prev_layers.size(); ++i) {
+                float ms = 0.0f, ml = 0.0f;
+                const int k = prev_kinds[i];
+                if (cudaEventElapsedTime(&ml, prev_layers[2 * i], prev_layers[2 * i + 1]) == cudaSuccess) {
+                    bucket[k][0] += static_cast<double>(ml);
+                }
+                if (cudaEventElapsedTime(&ms, prev_layers[2 * i + 1], prev_layers[2 * i + 2]) == cudaSuccess) {
+                    bucket[k][1] += static_cast<double>(ms);
+                }
+            }
+            ++steps;
+        }
+        std::vector<cudaEvent_t>().swap(prev_layers);
+        std::vector<int>().swap(prev_kinds);
+        for (auto& e : prev) { e = nullptr; }
+        cudaEventRecord(begin, stream);
+        prev[0] = begin;
+    }
+    void begin_layers(cudaStream_t stream) {
+        prev_layers.clear();
+        prev_kinds.clear();
+        prev_layers.push_back(layer_event(0));
+        cudaEventRecord(prev_layers[0], stream);
+    }
+    void mid_layer(cudaStream_t stream) {
+        if (prev_layers.empty()) { return; }
+        cudaEvent_t e = layer_event(prev_layers.size());
+        cudaEventRecord(e, stream);
+        prev_layers.push_back(e);
+    }
+    void end_layer(cudaStream_t stream, int kind) {
+        if (prev_layers.empty()) { return; }
+        cudaEvent_t e = layer_event(prev_layers.size());
+        cudaEventRecord(e, stream);
+        prev_layers.push_back(e);
+        prev_kinds.push_back(kind);
+    }
+    void mark(int i, cudaStream_t stream) {
+        cudaEventRecord(after[i], stream);
+        prev[i + 1] = after[i];
+    }
+    void close(cudaStream_t stream) {
+        cudaEventRecord(end, stream);
+        prev[4] = end;
+        pending = true;
+        if (steps % 64 == 0) { dump(); }
+    }
+
+private:
+    void dump() const {
+        if (steps == 0) { return; }
+        std::fprintf(stderr,
+                       "[step-probe] steps=%ld embed=%.2fms layers=%.2fms head=%.2fms "
+                       "tail=%.2fms total=%.2fms | gdn_mixer=%.2f gdn_mlp=%.2f attn_mixer=%.2f "
+                       "attn_mlp=%.2f (per step)\n",
+                       steps, sum[0] / steps, sum[1] / steps, sum[2] / steps, sum[3] / steps,
+                       (sum[0] + sum[1] + sum[2] + sum[3]) / steps, bucket[0][0] / steps,
+                       bucket[0][1] / steps, bucket[1][0] / steps, bucket[1][1] / steps);
+        std::fflush(stderr);
+    }
+};
+DecodeStepProbe g_decode_step_probe;
+
+inline bool capturing(cudaStream_t stream) {
+    cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(stream, &status) != cudaSuccess) { return false; }
+    return status != cudaStreamCaptureStatusNone;
+}
 
 void copy_i32(const std::int32_t* source, Tensor& destination, cudaStream_t stream) {
     if (source == nullptr || destination.dtype != DType::I32 || !destination.is_contiguous() ||
@@ -699,12 +835,19 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
         ScopedValue<std::int32_t> batch_binding(active_sequence_batch_, batch);
         ScopedValue<std::int32_t> width_binding(active_sequence_width_, 1);
 
+        const bool probe = g_decode_step_probe.enabled;
+        auto& step       = g_decode_step_probe;
+        if (probe) { step.open(stream); }
         Tensor x = work_.alloc(DType::BF16, {dimension(config_.hidden_size), batch});
         embed_tokens(ids, *embed_, parameters_.text.token_embedding_signs, x, stream);
+        if (probe) { step.mark(0, stream); }
         NullTap tap;
         run_layers(x, Phase::Verify, tap);
+        if (probe) { step.mark(1, stream); }
         ops::rmsnorm(x, *final_norm_, config_.rms_norm_eps, true, hidden, stream);
         project(hidden, *lm_head_, logits, work_, stream);
+        if (probe) { step.mark(2, stream); }
+        if (probe) { step.close(stream); }
     }
     work_.reset();
 }
@@ -1131,6 +1274,8 @@ template <class Tap>
 void TextContext::run_stage_layers(std::size_t stage, Tensor& x, Phase ph, Tap& tap) {
     const bool prefill      = ph == Phase::Prefill;
     const std::uint32_t end = parameters_.text.stage_end(stage);
+    const bool layer_probe  = g_decode_step_probe.enabled && !prefill && !capturing(ctx_.stream);
+    if (layer_probe) { g_decode_step_probe.begin_layers(ctx_.stream); }
     for (std::uint32_t layer = parameters_.text.stage_begin[stage]; layer < end; ++layer) {
         const auto& block  = parameters_.text.layers[layer];
         const bool full    = config_.layer_types[layer] == MixerKind::FullAttention;
@@ -1156,6 +1301,7 @@ void TextContext::run_stage_layers(std::size_t stage, Tensor& x, Phase ph, Tap& 
                     gdn_mix(block, x, compact, ph);
                 }
             }
+            if (layer_probe) { g_decode_step_probe.mid_layer(ctx_.stream); }
             {
                 nvtx::ScopedRange range(prefill ? nvtx::Name::PrefillPostMixer
                                                 : nvtx::Name::VerifyPostMixer,
@@ -1167,6 +1313,9 @@ void TextContext::run_stage_layers(std::size_t stage, Tensor& x, Phase ph, Tap& 
                 mlp_tail(block, x, ph,
                          layer + 1 < end ? next_projection_hints(static_cast<int>(layer))
                                          : ops::SparseMoeHints{});
+            }
+            if (layer_probe) {
+                g_decode_step_probe.end_layer(ctx_.stream, full ? 1 : 0);
             }
             if constexpr (Tap::enabled) {
                 tap.capture_layer(static_cast<int>(layer), x, ctx_.stream);

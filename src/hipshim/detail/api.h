@@ -304,6 +304,7 @@ __cvta_generic_to_shared(const void* p) {
 #define cudaStreamCreate hipStreamCreate
 #define cudaStreamCreateWithFlags hipStreamCreateWithFlags
 #define cudaStreamDestroy hipStreamDestroy
+#define cudaStreamIsCapturing hipStreamIsCapturing
 #define cudaStreamSynchronize hipStreamSynchronize
 #define cudaStreamWaitEvent hipStreamWaitEvent
 #define cudaStreamBeginCapture hipStreamBeginCapture
