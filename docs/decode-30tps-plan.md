@@ -54,6 +54,32 @@ Gate (measure against cal7's bits number, same harness):
 - GO  if ≥ 1.5x bits on gate_up with correct sums → Phase 2.
 - NO-GO → Phase 3 fallback.
 
+### Phase 1 result (2026-10-20): NO-GO
+
+Classic rocwmma (`#include <rocwmma/rocwmma.hpp>`, therock headers + therock clang,
+single `--offload-arch=gfx1102`) compiles and **computes correctly** on gfx1102:
+16x16 gemm matches the CPU reference (cal10 step-1, cal10i end-to-end probe).
+
+But the whole classic-API load path is ~10x too slow for GEMV. cal10/cal10g on
+34816x5120 (same shape as the cal7 bits bar):
+
+| variant | time | vs 331 µs bar |
+|---|---|---|
+| cal10 (stack tmp store) | 3.85 ms | 0.09x |
+| launch sweep best (cal10b, bs=128 nb=64) | 3.46 ms | 0.10x |
+| cal10g (shuffle extract, unrolled k) | 1.97 ms | 0.17x |
+
+`load_matrix_sync` on gfx11 is not a vectorized per-lane load: it costs far more than a
+dwordx4 per lane and the k-loop can't amortize it. Fragment layout (measured via
+accessors, cal10j — authoritative): for both A (row-major) and B (col-major) tag,
+lane L holds ONE contiguous 8-half chunk: lanes 0..15 = cols 0..7 of rows 0..15,
+lanes 16..31 = cols 8..15 of the same rows; C: lane L<16 = row L even cols
+{0,2,..14}, lane 16..31 = row (L-16) odd cols. An LDS-staged loader could close some
+of the gap but plausibly not the 6x needed to beat the bar, let alone the 1.5x gate
+(≤220 µs). No MFMA on gfx1102 (ISA rejects it), and the builtin-asm path can't be
+filled by hand because fragment storage layout ≠ accessor view (raw dword pokes
+disagree with operator[]). **WMMA line closed; Phase 3 is the way.**
+
 ## Phase 2 — production integration (if spike passes)
 
 1. New kernel family `t2_gemv_wmma` in `src/ops/linear/t2/` (schedule table extended,
