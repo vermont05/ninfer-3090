@@ -214,10 +214,22 @@ at destination offsets — the T=1 qkv vector swallows both legs without strided
 Step probe after, same harness/recipe: proj 0.229 -> 0.191 ms/layer, gdn_mixer
 17.16 -> ~16.2, step total 60.6 -> 58.8 ms (~+3 %); decode probe 16.4 -> 16.9 t/s.
 
+CUDA graphs (2026-10-21): the server's graph path works on this HIP build (boot
+"CUDA graphs ready | 173 ms") and is worth ~+0.4 t/s — server legs measured 17.3-17.4
+decode with graphs on vs 16.9-17.0 with --no-cuda-graph, and the outputs are
+byte-identical between the two legs (one 64-token temperature-0 request per leg,
+content+reasoning compared; /tmp/graph_ab.sh). So the default launch (no flag) is
+the faster canonical path for throughput runs. Measurement caveat: the step probe
+mis-accounts under graph replay (its events sit inside captured graphs — the
+graph-run tail printed garbage buckets: steps=5, layers=77.53 ms, fine n=1); keep
+--no-cuda-graph for any bucket-level probing, graphs-on for wall/throughput.
+
 ## Verification protocol (every step)
 
 - Server: the NINFER_T2_DECODE=simt / NINFER_T2_I8_SMALL=off launch recipe + ROCR_VISIBLE_DEVICES=1
-  + Tensile path (see docs/rocm-port-analysis.md; env landmines in memory).
+  + Tensile path (see docs/rocm-port-analysis.md; env landmines in memory). Add
+  `--no-cuda-graph` for step-probe/fine-probe runs (the probe mis-accounts under replay;
+  see the CUDA-graphs note in Phase 4), leave graphs on for wall-clock/throughput legs.
 - Bench harness: `/tmp/gemv_cal7.cu` patterns; run idle GPU (check `pgrep -x ninfer-serve`
   is empty AND lock-free before trusting a number).
 - ctest area tests (build-hip has BUILD_TESTING=OFF → use step probe + server output).
