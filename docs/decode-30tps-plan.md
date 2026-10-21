@@ -91,16 +91,39 @@ disagree with operator[]). **WMMA line closed; Phase 3 is the way.**
    existing linear test vectors + a 3-prompt logit diff vs the bits build.
 4. Full step probe + server t/s; goal gate ≥ 20 t/s end-to-end, stretch 25+.
 
-## Phase 3 — fallback levers (if spike fails)
+## Phase 3 — integer-dot DP4A path (result 2026-10-21: WINNER)
 
-Order, cheapest first; each is a cal-bench before any repo change:
-1. `v_perm_b32` (SGPR-selector byte permute) for 2-bit-field extraction → fewer ops/word than
-   the shl/and/neg/xor mix; only try fields that table-map (this is the permt-table idea,
-   now with the one permute instruction that exists).
-2. Split partial: move dequant out of the dot loop for the 34816-row shape (batch-dequant a
-   code row, reuse across... n/a for GEMV) — expected NO, verify cheaply.
-3. Reduce steps' fixed cost: launch-bounds/occupancy already tuned (cal4); skip.
-4. Accept ceiling: ship the 14.6→17 band improvements and re-baseline the target.
+Phase 1 closed WMMA; the fallback lever list is superseded by a bigger find —
+**hardware byte-dot works on gfx1102 after all**:
+
+- `__builtin_amdgcn_sudot4(true, a, true, b, c, false)` assembles to `v_dot4_i32_iu8`
+  and executes correctly (plain `sdot4` is rejected: needs `dot1-insts`).
+- `__builtin_amdgcn_perm` (=`v_perm_b32`) compiles and executes; with a 4-entry
+  symbol table it expands one code byte → four sign bytes in 2-3 VALU + 1 perm.
+- Prism precedent: llama.cpp-prism ships `build-rocm-dp4a` for gfx1102 with
+  `-DGGML_HIP_PTQ1_DP4A=1`; q2_0 symbols use the same perm trick (vecdotq.cuh).
+
+Calibration (`/tmp/gemv_cal11.cu` + `/tmp/gemv_cal12.cu`, idle GPU, cal7 harness):
+
+| shape | floor | bits (current bar) | dp4a-int8 best | speedup vs bits |
+|---|---|---|---|---|
+| gate_up 34816x5120 | 171 | 346-365 (T16/T32) | 246.7 (T16) | 1.40x |
+| down 5120x17408 | 58.6 | 182 (T16) | 95.4 (T32) | 1.91x |
+| attn 6144x5120 | 45.8 | 70 (T32) | 39.1 (T32) | 1.79x |
+
+Correctness: `/tmp/cal11c.cu` — sym4+dp4a vs scalar reference over 8192 random
+words (x8 16 codes, t2_g128 table 0→0,1→+1,2→0,3→−1): 0/8192 mismatch. The
+16-code dot probe matched too (`/tmp/cal11v.cu`).
+
+Semantics note: `v_perm_b32`'s selector is a 4-bit-per-byte source-byte index
+(16 = byte 0 of src1, etc. — probed via src0=0x33../src1=0x77.. ladder); my earlier
+identity-model of it was wrong, which is why the standalone table probe looked
+broken while the composed dot is right. Trust the end-to-end probe.
+
+Next: production kernel family on this route (int8 x quantized per 128-elem group,
+scale per group like weight scales; quant kernel once per GEMV call, not per row),
+A/B vs current route on the four decode shapes, FP32-oracle + logit-diff qualification,
+then make it the dispatch default (env-gated divergence is the 4.3x trap).
 
 ## Phase 4 — the rest of the budget (do not start before Phase 2 lands)
 
