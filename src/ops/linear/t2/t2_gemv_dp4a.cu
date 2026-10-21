@@ -16,6 +16,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <string>
 
 namespace ninfer::ops::detail {
 namespace {
@@ -120,8 +122,52 @@ namespace {
 void invalid(const char* what) { throw std::invalid_argument(what); }
 } // namespace
 
+bool t2_gemv_dp4a_enabled() {
+    static const bool on = [] {
+        const char* value = std::getenv("NINFER_T2_DP4A");
+        return value == nullptr || std::string(value) != "off";
+    }();
+    return on;
+}
+
 bool t2_gemv_dp4a_supported(std::int32_t n, std::int32_t k) {
     return find_dp4a_shape(n, k) != nullptr;
+}
+
+T2Dp4aActivation t2_gemv_dp4a_prepare(const Tensor& x, WorkspaceArena& workspace,
+                                       cudaStream_t stream) {
+    const std::int32_t k = x.ne[0];
+    if (x.ne[1] != 1) { invalid("t2 dp4a: expects a single contiguous BF16 column"); }
+    if (k % T2RowSplitStorage::kGroupK != 0) { invalid("t2 dp4a: k is not a group multiple"); }
+    if (k > 17408) { invalid("t2 dp4a: k beyond the scratch"); }
+
+    auto* xq = static_cast<std::uint8_t*>(workspace.alloc_bytes(t2_gemv_dp4a_scratch_bytes(k)).data);
+    auto* xs = reinterpret_cast<std::uint16_t*>(xq + static_cast<std::size_t>(k) + 16u);
+
+    const std::int32_t groups = k / T2RowSplitStorage::kGroupK;
+    const dim3 qblock(32u, static_cast<unsigned>(kDp4aQuantizeWarps));
+    const dim3 qgrid(
+        static_cast<unsigned>((groups + kDp4aQuantizeWarps - 1) / kDp4aQuantizeWarps));
+    t2_gemv_quantize_kernel<<<qgrid, qblock, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(x.data), xq, xs, k);
+    CUDA_CHECK(cudaGetLastError());
+    return T2Dp4aActivation{xq, xs, k};
+}
+
+void t2_gemv_dp4a_run_prepared(const T2Dp4aActivation& activation, const Weight& w, Tensor& out,
+                                cudaStream_t stream) {
+    if (activation.xq == nullptr) { invalid("t2 dp4a: empty activation plane"); }
+    const Dp4aShape* shape = find_dp4a_shape(w.n, w.k);
+    if (shape == nullptr) { invalid("t2 dp4a: unregistered shape"); }
+    if (shape->k != activation.k) { invalid("t2 dp4a: activation width does not match the weight"); }
+    if (out.ne[0] != shape->n) { invalid("t2 dp4a: destination rows do not match the weight"); }
+    if (shape->tile == 16) {
+        launch_dp4a_gemv<T2GemvDp4aWord16Schedule>(*shape, w, out, activation.xq, activation.xs,
+                                                     activation.k, stream);
+    } else {
+        launch_dp4a_gemv<T2GemvDp4aWord32Schedule>(*shape, w, out, activation.xq, activation.xs,
+                                                     activation.k, stream);
+    }
 }
 
 std::size_t t2_gemv_dp4a_scratch_bytes(std::int32_t k) {
@@ -132,32 +178,10 @@ std::size_t t2_gemv_dp4a_scratch_bytes(std::int32_t k) {
 
 void t2_gemv_dp4a_run(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& workspace,
                        cudaStream_t stream) {
-    const std::int32_t k = x.ne[0];
-    const std::int32_t t = x.ne[1];
-    if (t != 1 || k % T2RowSplitStorage::kGroupK != 0) {
-        invalid("t2 dp4a: expects a single contiguous BF16 column");
-    }
-    const Dp4aShape* shape = find_dp4a_shape(w.n, w.k);
-    if (shape == nullptr) { invalid("t2 dp4a: unregistered shape"); }
-    if (k > 17408) { invalid("t2 dp4a: k beyond the scratch"); }
-
+    if (find_dp4a_shape(w.n, w.k) == nullptr) { invalid("t2 dp4a: unregistered shape"); }
     const auto scope = workspace.scope();
-    auto* xq = static_cast<std::uint8_t*>(workspace.alloc_bytes(t2_gemv_dp4a_scratch_bytes(k)).data);
-    auto* xs           = reinterpret_cast<std::uint16_t*>(xq + static_cast<std::size_t>(k) + 16u);
-
-    const std::int32_t groups = k / T2RowSplitStorage::kGroupK;
-    const dim3 qblock(32u, static_cast<unsigned>(kDp4aQuantizeWarps));
-    const dim3 qgrid(
-        static_cast<unsigned>((groups + kDp4aQuantizeWarps - 1) / kDp4aQuantizeWarps));
-    t2_gemv_quantize_kernel<<<qgrid, qblock, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(x.data), xq, xs, k);
-    CUDA_CHECK(cudaGetLastError());
-
-    if (shape->tile == 16) {
-        launch_dp4a_gemv<T2GemvDp4aWord16Schedule>(*shape, w, out, xq, xs, k, stream);
-    } else {
-        launch_dp4a_gemv<T2GemvDp4aWord32Schedule>(*shape, w, out, xq, xs, k, stream);
-    }
+    const auto activation = t2_gemv_dp4a_prepare(x, workspace, stream);
+    t2_gemv_dp4a_run_prepared(activation, w, out, stream);
 }
 
 } // namespace ninfer::ops::detail

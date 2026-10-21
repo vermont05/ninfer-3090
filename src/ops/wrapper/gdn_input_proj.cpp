@@ -788,6 +788,31 @@ void t2_two_parent_project(const Tensor& x, const Weight& qk_weight, const Weigh
                                          {value_z_weight, qkv, kQkRows, kValueRows, z, 0}, stream);
         return;
     }
+#ifdef NINFER_BACKEND_HIP
+    // The byte-dot decode route at width 1, folded: one quantization feeds all three legs
+    // and the GEMVs land in the destinations directly. The generic path below takes three
+    // quantizations (the route runs it per leg), two staging planes, and the strided
+    // assembly copies; at width 1 the qkv plane is a single 10240-element vector, so q/k is
+    // its first 4096 and value the next 6144 with no stride involved. The gate mirrors
+    // t2_dispatch's (env, policy family, width, registered shapes) so the routes agree.
+    if (cols == 1 && allows_a8_int(policy) && detail::t2_gemv_dp4a_enabled() &&
+        detail::t2_gemv_dp4a_supported(kQkRows, 5120) &&
+        detail::t2_gemv_dp4a_supported(kValueRows, 5120) &&
+        detail::t2_gemv_dp4a_supported(kZRows, 5120)) {
+        const auto activation = detail::t2_gemv_dp4a_prepare(x, workspace, stream);
+        const Weight value_parent_rows = detail::t2_row_view(value_z_weight, 0, kValueRows);
+        const Weight z_parent_rows =
+            detail::t2_row_view(value_z_weight, kValueRows, kZRows);
+        auto* qkv_base = static_cast<char*>(qkv.data);
+        Tensor qk_slot{qkv_base, DType::BF16, {kQkRows, 1}};
+        Tensor value_slot{qkv_base + static_cast<std::size_t>(kQkRows) * 2, DType::BF16,
+                            {kValueRows, 1}};
+        detail::t2_gemv_dp4a_run_prepared(activation, qk_weight, qk_slot, stream);
+        detail::t2_gemv_dp4a_run_prepared(activation, value_parent_rows, value_slot, stream);
+        detail::t2_gemv_dp4a_run_prepared(activation, z_parent_rows, z, stream);
+        return;
+    }
+#endif
     Tensor qk_plane    = workspace.alloc(DType::BF16, {kQkRows, cols});
     Tensor value_plane = workspace.alloc(DType::BF16, {kValueRows, cols});
     linear(x, qk_weight, qk_plane, policy, workspace, stream);

@@ -208,6 +208,12 @@ once per call (three quantizes of the same vector) plus two strided-assembly cop
 folding to one quantize + three GEMVs into the destination planes is a launch/overhead
 cut of maybe ~10-20 us/layer, not a kernel-shape change.
 
+SHIPPED (2026-10-21): the fold is in the pair wrapper (t2_gemv_dp4a_prepare +
+run_prepared; the wrapper's width-1 branch quantizes once and lands the three GEMVs
+at destination offsets — the T=1 qkv vector swallows both legs without strided copies).
+Step probe after, same harness/recipe: proj 0.229 -> 0.191 ms/layer, gdn_mixer
+17.16 -> ~16.2, step total 60.6 -> 58.8 ms (~+3 %); decode probe 16.4 -> 16.9 t/s.
+
 ## Verification protocol (every step)
 
 - Server: the NINFER_T2_DECODE=simt / NINFER_T2_I8_SMALL=off launch recipe + ROCR_VISIBLE_DEVICES=1

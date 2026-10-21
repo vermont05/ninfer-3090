@@ -108,12 +108,8 @@ void t2_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy pol
     // by default -- LoadOptions::prefill_a8), and an explicit A16Only caller keeps its
     // documented A16 schedules. A call without a workspace takes the schedules too: the
     // route has no caller-owned place to put its quantised x otherwise.
-    static const bool dp4a_enabled = [] {
-        const char* value = std::getenv("NINFER_T2_DP4A");
-        return value == nullptr || std::string(value) != "off";
-    }();
-    if (dp4a_enabled && workspace != nullptr && allows_a8_int(policy) && x.ne[1] == 1 &&
-        t2_gemv_dp4a_supported(w.n, w.k)) {
+    if (t2_gemv_dp4a_enabled() && workspace != nullptr && allows_a8_int(policy) &&
+        x.ne[1] == 1 && t2_gemv_dp4a_supported(w.n, w.k)) {
         t2_gemv_dp4a_run(x, w, out, *workspace, stream);
         return;
     }
