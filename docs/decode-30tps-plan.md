@@ -147,9 +147,15 @@ gdn_mixer=17.16  gdn_mlp=21.34  attn_mixer=9.31  attn_mlp=6.97  (head 1.79)
 gdn-mixer internal (NINFER_STEP_PROBE_FINE=1, per sampled layer, ~45 gdn layers):
   proj=0.229  out=0.075  rec=0.035  nc=0.023  norm=0.021   (sum 0.383/layer)
 
-Lever: the gdn input projection ("proj", gdn_projection -> ops::gdn_input_proj) is
-the single biggest gdn-mixer sub-cost and is NOT on the t2_dispatch dp4a route
-(its own op). Extending byte-dot to that projection is the next Phase-4 candidate.
+Lever (located 2026-10-21): the gdn input projection ("proj", 0.229/layer — the
+biggest gdn-mixer sub-cost) is NOT on the t2_dispatch dp4a route. It is its own
+op: `ops::gdn_input_proj` -> `q8_gdn_input_dispatch` -> `launch_q8_a16_gemv`
+(`q8_gdn_input_decode.cu`), a Q8_G32 (group-32 int8 weights, k=2048) A16-activation
+GEMV with a fused conv epilogue — no byte-dot, and on the same class of SIMT word
+path Phase 3 just beat 1.4-1.9x. So the concrete Phase-4 candidate is a byte-dot
+(v_dot4_i32_iu8) Q8 decode GEMV for that fused path, mirroring t2_gemv_dp4a.
+Verify the exact schedule/shape and run cal13q-style numeric qualification before
+trusting any gain. (Phase 2 / t2 dp4a has landed, so the "before Phase 2" gate holds.)
 
 
 
