@@ -1,5 +1,9 @@
 #include "ops/linear/t2/t2_dispatch.h"
 
+#ifdef NINFER_BACKEND_HIP
+#include "ops/linear/t2/t2_gemv_dp4a.h"
+#endif
+
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
@@ -95,6 +99,19 @@ void t2_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy pol
     if (w.layout != QuantLayout::RowSplit || w.qdata == nullptr || w.scales == nullptr) {
         throw std::invalid_argument("t2 linear: requires a row-split weight");
     }
+#ifdef NINFER_BACKEND_HIP
+    // T = 1 decode on a registered shape takes the byte-dot route (t2_gemv_dp4a.cuh:
+    // cal12 1.40-1.91x over the bit-trick word partial at the same bar). NINFER_T2_DP4A=off
+    // falls back to the word schedules below (benchmark A/B, escape hatch).
+    static const bool dp4a_enabled = [] {
+        const char* value = std::getenv("NINFER_T2_DP4A");
+        return value == nullptr || std::string(value) != "off";
+    }();
+    if (dp4a_enabled && x.ne[1] == 1 && t2_gemv_dp4a_supported(w.n, w.k)) {
+        t2_gemv_dp4a_run(x, w, out, stream);
+        return;
+    }
+#endif
     const T2Launch launch = select_t2_launch(w.n, w.k, x.ne[1], policy);
     launch(x, w, out, stream);
 }
