@@ -171,6 +171,16 @@ path Phase 3 just beat 1.4-1.9x. So the concrete Phase-4 candidate is a byte-dot
 Verify the exact schedule/shape and run cal13q-style numeric qualification before
 trusting any gain. (Phase 2 / t2 dp4a has landed, so the "before Phase 2" gate holds.)
 
+Calibration 2026-10-21 (`/tmp/gemv_cal14.cu`, idle eGPU, shape n=12288 x k=2048 —
+the gdn-proj class): the a16-SIMT bar clone (with the production `warp_reduce_sum`
+fold — an early fork that dropped it mis-measured 160 us and failed its own
+reference) runs 59.1 us; floor 20.5 us; dp4a-direct (int8 x, sym-free: Q8 codes go
+straight into `v_dot4_i32_iu8`) 39.7 us, dp4a-with-LDS-staging 49.5 us. Both probe
+kernels verify bad=0/64 against f64 pipeline mirrors. So the byte-dot route is
+**1.49x over the a16 bar** on this shape (not the 4x the broken clone suggested),
+which is the same class as the shipped t2 win and worth a production kernel
+family + cal13q-style qualification + server A/B next.
+
 
 
 gdn_mixer non-GEMV is ~20 % of its 18.3 ms; attn_mixer 9.9 ms includes softmax/flash and KV.
