@@ -125,6 +125,20 @@ scale per group like weight scales; quant kernel once per GEMV call, not per row
 A/B vs current route on the four decode shapes, FP32-oracle + logit-diff qualification,
 then make it the dispatch default (env-gated divergence is the 4.3x trap).
 
+**SHIPPED (2026-10-21, commit 3f13fb32):** `src/ops/linear/t2/t2_gemv_dp4a.{cuh,cu}`
+plus the `t2_dispatch` hook (env `NINFER_T2_DP4A=off` to fall back). Server A/B on
+the eGPU, same 256-token decode, same request:
+
+| leg | step | wall |
+|---|---|---|
+| bits (NINFER_T2_DP4A=off) | 70.26 ms (gdn_mlp 29.6, attn_mlp 9.90) | 24.4 s |
+| dp4a default | 56.65 ms (gdn_mlp 21.6, attn_mlp 7.06) | 17.8 s |
+
+1.24x step, 1.37x wall — steady-state decode ~14.2 -> ~17.5 t/s. The first
+integration silently vanished because the dispatch hook was guarded `__HIPCC__`
+in a host TU (no `-x hip`); guards are `NINFER_BACKEND_HIP` now (the convention
+CMakeLists.txt:55 documents).
+
 ## Phase 4 — the rest of the budget (do not start before Phase 2 lands)
 
 gdn_mixer non-GEMV is ~20 % of its 18.3 ms; attn_mixer 9.9 ms includes softmax/flash and KV.
