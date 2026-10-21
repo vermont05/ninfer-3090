@@ -194,6 +194,20 @@ gdn_mixer non-GEMV is ~20 % of its 18.3 ms; attn_mixer 9.9 ms includes softmax/f
 lm_head (2.7 ms) is the 248320-row word GEMV — same Phase-1 kernel family applies.
 Sequence: re-measure buckets after each merged change; do not tune on old buckets.
 
+Calibration 2026-10-21 (`/tmp/gemv_cal15.cu`): the cal14 direct-vs-staged question asked
+of the T2 shapes — shipped staged partial (cal12 mode 2 + production fold) as control vs
+direct-global-load variants (1 row/warp) and 2/4-rows-per-wavefront (shared x loads), all
+bit-identical to the control's reference (the cal12-mode-2 original never stores; the
+fork adds the production warp fold + lane-0 store so the comparison is real). NO-GO:
+control stays within noise of the best direct variant on every shape (gate_up 258 vs
+247, down 103 vs 102, attn 44 vs 44, value_z 84 vs 83 us; inter-run noise ~4-8 %). The T2
+stage/lane mapping already sits at issue+load balance; de-staging is not a lever here.
+Next T2-side candidate from the pair-path survey: the A16 two-parent route (the swift
+bonsai decode path, band off) calls the GEMV three times per gdn layer and quantizes x
+once per call (three quantizes of the same vector) plus two strided-assembly copies;
+folding to one quantize + three GEMVs into the destination planes is a launch/overhead
+cut of maybe ~10-20 us/layer, not a kernel-shape change.
+
 ## Verification protocol (every step)
 
 - Server: the NINFER_T2_DECODE=simt / NINFER_T2_I8_SMALL=off launch recipe + ROCR_VISIBLE_DEVICES=1
