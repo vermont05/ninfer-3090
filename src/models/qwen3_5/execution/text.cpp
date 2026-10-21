@@ -56,6 +56,12 @@
 namespace ninfer::models::qwen3_5::execution {
 namespace {
 
+inline bool capturing(cudaStream_t stream) {
+    cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(stream, &status) != cudaSuccess) { return false; }
+    return status != cudaStreamCaptureStatusNone;
+}
+
 // Diagnostic only. With NINFER_STEP_PROFILE set, the decode body segments its device work
 // with event pairs (embed | layers | norm+head | tail) and prints rolling per-segment means
 // to stderr every 64 steps. The step before a call is fenced by the round loop's device sync,
@@ -75,6 +81,19 @@ struct DecodeStepProbe {
     std::vector<int>         prev_kinds;
     double      bucket[2][2] = {};
 
+    // Fine mode (NINFER_STEP_PROBE_FINE=1): one sampled GDN mixer split into
+    // nc/proj/conv/rec/norm/out sub-stages per step.
+    std::vector<cudaEvent_t> fine_pool;
+    std::vector<cudaEvent_t> prev_fine;
+    double      fine_sum[6] = {};
+    long        fine_steps  = 0;
+    int         fine_slot   = -1;
+    int         fine_seq    = 0;
+    int         fine_every  = 8;
+    bool        fine        = false;
+    bool        fine_init   = false;
+    int         fine_dbg    = 0;
+
     bool        pending  = false;
     long        steps    = 0;
     bool        enabled  = false;
@@ -83,6 +102,13 @@ struct DecodeStepProbe {
         const char* value = std::getenv("NINFER_STEP_PROFILE");
         enabled             = value != nullptr && std::string(value) != "0";
         if (!enabled) { return; }
+        const char* fine_value = std::getenv("NINFER_STEP_PROBE_FINE");
+        fine                     = fine_value != nullptr && std::string(fine_value) != "0";
+        if (const char* every = std::getenv("NINFER_STEP_PROBE_FINE_EVERY"); every != nullptr &&
+                                                                                *every != '\0') {
+            const int v = std::atoi(every);
+            if (v > 0) { fine_every = v; }
+        }
         cudaEventCreate(&begin);
         cudaEventCreate(&after[0]);
         cudaEventCreate(&after[1]);
@@ -96,6 +122,7 @@ struct DecodeStepProbe {
         cudaEventDestroy(end);
         for (auto& e : after) { cudaEventDestroy(e); }
         for (auto& e : layer_pool) { cudaEventDestroy(e); }
+        for (auto& e : fine_pool) { cudaEventDestroy(e); }
     }
     DecodeStepProbe(const DecodeStepProbe&)            = delete;
     DecodeStepProbe& operator=(const DecodeStepProbe&) = delete;
@@ -131,9 +158,20 @@ struct DecodeStepProbe {
                     bucket[k][1] += static_cast<double>(ms);
                 }
             }
+            if (prev_fine.size() >= 6) {
+                for (int i = 0; i + 1 < static_cast<int>(prev_fine.size()) && i < 6; ++i) {
+                    float fms = 0.0f;
+                    if (cudaEventElapsedTime(&fms, prev_fine[static_cast<std::size_t>(i)],
+                                              prev_fine[static_cast<std::size_t>(i + 1)]) == cudaSuccess) {
+                        fine_sum[i] += static_cast<double>(fms);
+                    }
+                }
+                ++fine_steps;
+            }
             ++steps;
         }
         std::vector<cudaEvent_t>().swap(prev_layers);
+        std::vector<cudaEvent_t>().swap(prev_fine);
         std::vector<int>().swap(prev_kinds);
         for (auto& e : prev) { e = nullptr; }
         cudaEventRecord(begin, stream);
@@ -158,6 +196,42 @@ struct DecodeStepProbe {
         prev_layers.push_back(e);
         prev_kinds.push_back(kind);
     }
+
+    // Fine-mode plumbing. gdn_mix calls gdn_fine_begin once per layer per step; only
+    // every fine_every-th call records, and prev_fine holds that step's 7 boundaries
+    // (0=start,1=after norm_control,2=after projection,3=after conv,4=after recurrent,
+    //  5=after gated norm,6=after output projection).
+    cudaEvent_t fine_event(std::size_t index) {
+        if (fine_pool.size() <= index) {
+            const std::size_t room = index + 1 > 64 ? index + 1 : 64;
+            while (fine_pool.size() < room) {
+                cudaEvent_t e = nullptr;
+                cudaEventCreate(&e);
+                fine_pool.push_back(e);
+            }
+        }
+        return fine_pool[index];
+    }
+    bool gdn_fine_begin(cudaStream_t stream) {
+        if (!fine_init) {
+            fine_init = true;
+            std::fprintf(stderr, "[step-probe] fine gate: enabled=%d fine=%d capturing=%d\n",
+                           (int)enabled, (int)fine, (int)capturing(stream));
+        }
+        if (!enabled || !fine || capturing(stream)) { return false; }
+        ++fine_seq;
+        if ((fine_seq % static_cast<long>(fine_every)) != 0) { return false; }
+        prev_fine.clear();
+        prev_fine.push_back(fine_event(0));
+        cudaEventRecord(prev_fine[0], stream);
+        return true;
+    }
+    void gdn_fine_mark(cudaStream_t stream) {
+        if (prev_fine.empty()) { return; }
+        cudaEvent_t e = fine_event(prev_fine.size());
+        cudaEventRecord(e, stream);
+        prev_fine.push_back(e);
+    }
     void mark(int i, cudaStream_t stream) {
         cudaEventRecord(after[i], stream);
         prev[i + 1] = after[i];
@@ -179,18 +253,21 @@ private:
                        steps, sum[0] / steps, sum[1] / steps, sum[2] / steps, sum[3] / steps,
                        (sum[0] + sum[1] + sum[2] + sum[3]) / steps, bucket[0][0] / steps,
                        bucket[0][1] / steps, bucket[1][0] / steps, bucket[1][1] / steps);
+        if (fine_steps > 0) {
+            std::fprintf(stderr,
+                           "[step-probe] gdn-mixer fine (per sampled layer, n=%ld): nc=%.3f "
+                           "proj=%.3f rec=%.3f norm=%.3f out=%.3f (ms)\n",
+                           fine_steps, fine_sum[0] / fine_steps, fine_sum[1] / fine_steps,
+                           fine_sum[2] / fine_steps, fine_sum[3] / fine_steps,
+                           fine_sum[4] / fine_steps);
+        }
         std::fflush(stderr);
     }
 };
 DecodeStepProbe g_decode_step_probe;
 
-inline bool capturing(cudaStream_t stream) {
-    cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
-    if (cudaStreamIsCapturing(stream, &status) != cudaSuccess) { return false; }
-    return status != cudaStreamCaptureStatusNone;
-}
-
 void copy_i32(const std::int32_t* source, Tensor& destination, cudaStream_t stream) {
+
     if (source == nullptr || destination.dtype != DType::I32 || !destination.is_contiguous() ||
         destination.data == nullptr) {
         throw std::invalid_argument("copy_i32: invalid host source or I32 destination");
@@ -1087,8 +1164,10 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
     Tensor h           = control.hidden;
     Tensor g           = control.g;
     Tensor beta        = control.beta;
+    const bool fine = g_decode_step_probe.gdn_fine_begin(s);
     const InputBasis projection_basis = gdn_norm_control(x, w.input_norm, config_.rms_norm_eps, p,
                                                          h, g, beta, work_, ctx_.execution_view());
+    if (fine) { g_decode_step_probe.gdn_fine_mark(s); }
 
     const auto projection = workspace::gdn_projection(work_, config_, T);
     Tensor z  = projection.output_gate.view({dimension(config_.gdn->linear_value_head_dim),
@@ -1136,6 +1215,7 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
                 *active_linear_state_source_slots_, *active_linear_state_destination_slots_,
                 query_output, key_output, value_output, gate_output, work_, s, projection_basis);
         }
+        if (fine) { g_decode_step_probe.gdn_fine_mark(s); }
     } else {
         Tensor qkv    = workspace::gdn_prefill_conv(work_, config_, T);
         Tensor z_flat = z.view({dimension(config_.gdn->value_width()), T});
@@ -1208,6 +1288,7 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
             /*normalize_qk=*/true, work_, recurrent_state_in, recurrent_state_out, o,
             ctx_.execution_view());
     }
+    if (fine) { g_decode_step_probe.gdn_fine_mark(s); }
 
     Tensor on = workspace::gdn_normalized_output(work_, config_, T)
                     .view({dimension(config_.gdn->linear_value_head_dim),
@@ -1216,11 +1297,15 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
     if (rotated(p.output.hadamard_signs)) {
         ops::gated_rmsnorm_hadamard(o, p.norm, z, config_.rms_norm_eps, p.output.hadamard_signs,
                                     normalized, s);
+        if (fine) { g_decode_step_probe.gdn_fine_mark(s); }
         project_add(normalized, p.output, x, work_, s, InputBasis::Rotated);
+        if (fine) { g_decode_step_probe.gdn_fine_mark(s); }
         return;
     }
     ops::gated_rmsnorm(o, p.norm, z, config_.rms_norm_eps, on, ctx_.execution_view());
+    if (fine) { g_decode_step_probe.gdn_fine_mark(s); }
     project_add(normalized, p.output, x, work_, s);
+    if (fine) { g_decode_step_probe.gdn_fine_mark(s); }
 }
 
 ops::SparseMoeHints TextContext::next_projection_hints(int layer) const {
