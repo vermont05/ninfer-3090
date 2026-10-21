@@ -140,6 +140,18 @@ in a host TU (no `-x hip`); guards are `NINFER_BACKEND_HIP` now (the convention
 CMakeLists.txt:55 documents).
 
 ## Phase 4 — the rest of the budget (do not start before Phase 2 lands)
+### Phase 4 fresh buckets (dp4a build, 2026-10-21, per step)
+
+gdn_mixer=17.16  gdn_mlp=21.34  attn_mixer=9.31  attn_mlp=6.97  (head 1.79)
+
+gdn-mixer internal (NINFER_STEP_PROBE_FINE=1, per sampled layer, ~45 gdn layers):
+  proj=0.229  out=0.075  rec=0.035  nc=0.023  norm=0.021   (sum 0.383/layer)
+
+Lever: the gdn input projection ("proj", gdn_projection -> ops::gdn_input_proj) is
+the single biggest gdn-mixer sub-cost and is NOT on the t2_dispatch dp4a route
+(its own op). Extending byte-dot to that projection is the next Phase-4 candidate.
+
+
 
 gdn_mixer non-GEMV is ~20 % of its 18.3 ms; attn_mixer 9.9 ms includes softmax/flash and KV.
 lm_head (2.7 ms) is the 248320-row word GEMV — same Phase-1 kernel family applies.
