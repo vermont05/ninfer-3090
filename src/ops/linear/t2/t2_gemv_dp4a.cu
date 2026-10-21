@@ -1,6 +1,8 @@
 // Byte-dot decode GEMV for T2 row-split weights (gfx1102): one quantize wavefront per
 // 128-group of x, then the row-quad dp4a kernel (t2_gemv_dp4a.cuh). The quantized activation
-// plane lives in a lazily allocated process buffer sized for the widest registered shape.
+// plane is bump-allocated from the caller's workspace scope for the call's k, so it is
+// sized per call and shared only with other routes on this arena (same-stream calls
+// serialize on it: a later call's quantize cannot pass this call's GEMV).
 // HIP-only: the byte dots that make it win do not exist on NVIDIA (mma.cuh gates the same way).
 
 #ifdef NINFER_BACKEND_HIP
@@ -12,6 +14,7 @@
 #include "core/device.h"
 #include "ops/common/math.h"
 
+#include <cstddef>
 #include <cstdint>
 
 namespace ninfer::ops::detail {
@@ -20,18 +23,8 @@ namespace {
 // Groups per quantize CTA (quantize kernel blockDim.y).
 constexpr int kDp4aQuantizeWarps = 4;
 
-// Quantized-activation scratch: the widest registered shape (k = 17408: 17408 code bytes +
-// 136 binary16 scales) plus alignment slack, one cudaMalloc on first use. Same-stream calls
-// serialize on it (a later call's quantize cannot pass this call's GEMV).
-struct Dp4aScratch {
-    DeviceBuffer backing{32u * 1024u};
-    std::uint8_t* const xq  = static_cast<std::uint8_t*>(backing.p);
-    std::uint16_t* const xs = reinterpret_cast<std::uint16_t*>(xq + 17408u + 16u);
-};
-
-Dp4aScratch& dp4a_scratch() {
-    static Dp4aScratch scratch;
-    return scratch;
+constexpr std::size_t align16(std::size_t bytes) noexcept {
+    return (bytes + 15u) & ~std::size_t{15u};
 }
 
 } // namespace
@@ -131,7 +124,14 @@ bool t2_gemv_dp4a_supported(std::int32_t n, std::int32_t k) {
     return find_dp4a_shape(n, k) != nullptr;
 }
 
-void t2_gemv_dp4a_run(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
+std::size_t t2_gemv_dp4a_scratch_bytes(std::int32_t k) {
+    if (k % T2RowSplitStorage::kGroupK != 0) { invalid("t2 dp4a: k is not a group multiple"); }
+    const std::size_t groups = static_cast<std::size_t>(k) / T2RowSplitStorage::kGroupK;
+    return align16(static_cast<std::size_t>(k) + 16u + groups * 2u);
+}
+
+void t2_gemv_dp4a_run(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& workspace,
+                       cudaStream_t stream) {
     const std::int32_t k = x.ne[0];
     const std::int32_t t = x.ne[1];
     if (t != 1 || k % T2RowSplitStorage::kGroupK != 0) {
@@ -141,9 +141,9 @@ void t2_gemv_dp4a_run(const Tensor& x, const Weight& w, Tensor& out, cudaStream_
     if (shape == nullptr) { invalid("t2 dp4a: unregistered shape"); }
     if (k > 17408) { invalid("t2 dp4a: k beyond the scratch"); }
 
-    Dp4aScratch& scratch = dp4a_scratch();
-    auto* xq             = scratch.xq;
-    auto* xs             = scratch.xs;
+    const auto scope = workspace.scope();
+    auto* xq = static_cast<std::uint8_t*>(workspace.alloc_bytes(t2_gemv_dp4a_scratch_bytes(k)).data);
+    auto* xs           = reinterpret_cast<std::uint16_t*>(xq + static_cast<std::size_t>(k) + 16u);
 
     const std::int32_t groups = k / T2RowSplitStorage::kGroupK;
     const dim3 qblock(32u, static_cast<unsigned>(kDp4aQuantizeWarps));

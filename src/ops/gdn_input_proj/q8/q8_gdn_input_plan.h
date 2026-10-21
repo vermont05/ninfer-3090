@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/arena.h"
 #include "core/weight.h"
 #include "core/tensor.h"
 
@@ -46,7 +47,9 @@ Q8GdnInputPlan q8_gdn_input_resolve_plan(const Q8GdnInputProblem& problem);
 Q8GdnInputConvPlan q8_gdn_input_conv_resolve_plan(const Q8GdnInputProblem& problem,
                                                   std::int32_t batch_size);
 
+// Routes one Q8_G32 GDN input projection. `workspace` (nullable) is handed to the decode
+// launches; see q8_gdn_input_kernels.h.
 void q8_gdn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
-                           cudaStream_t stream);
+                            WorkspaceArena* workspace, cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

@@ -6,6 +6,9 @@
 #include "ninfer/ops/linear.h"
 #include "ops/linear/t2/t2_a8.h"
 #include "ops/linear/t2/t2_weight_view.h"
+#ifdef NINFER_BACKEND_HIP
+#include "ops/linear/t2/t2_gemv_dp4a.h"
+#endif
 #include "ops/linear_swiglu/q4cublas/w4_cublas_prefill.h"
 #include "ops/gdn_input_proj/fp8/fp8_gdn_conv_plan.h"
 #include "ops/gdn_input_proj/fp8/fp8_gdn_input_plan.h"
@@ -359,7 +362,7 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& qkv, 
     require_matrix(z, kZRows, cols, "z");
     require_single_parent_nonoverlap(x, qkv, z);
     require_q8_rowsplit(weight, kRows, "query/key/value/z weight");
-    detail::q8_gdn_input_dispatch(x, weight, qkv, z, stream);
+    detail::q8_gdn_input_dispatch(x, weight, qkv, z, workspace, stream);
 }
 
 // The Q4/Q5 conv forms always materialize the projection through gdn_input_proj() and run the conv
@@ -571,7 +574,7 @@ void dispatch_single_parent_snapshot(const Tensor& x, const Weight& weight,
     if (plan.schedule == detail::Q8GdnInputConvScheduleId::DecodeFused) {
         detail::q8_gdn_input_decode_conv_snapshot_launch(
             x, weight, conv_weight, conv_states, valid_columns, initial_state_slots,
-            snapshot_base_slots, query, key, value, z, stream);
+            snapshot_base_slots, query, key, value, z, &workspace, stream);
         return;
     }
     if (plan.schedule == detail::Q8GdnInputConvScheduleId::SplitKMmaFused) {
@@ -802,8 +805,10 @@ void t2_two_parent_project(const Tensor& x, const Weight& qk_weight, const Weigh
 }
 
 // Transient storage of t2_two_parent_project over each width in [min_columns, max_columns]: the
-// integer route's activation planes where it takes the width, otherwise the q/k and value planes of
-// the A16 route (whose T2 linears take no workspace).
+// integer route's activation planes where it takes the width, otherwise the q/k and value
+// planes of the A16 route. On a single-column call under an integer-A8 policy the A16 legs take
+// the byte-dot decode route, whose quantised-x plane the builder carries on top (its own
+// route's peak is the one plane the call holds at a time).
 std::size_t t2_two_parent_projection_bytes(std::int32_t min_columns, std::int32_t max_columns,
                                            LinearPolicy policy = LinearPolicy::A16Only) {
     std::size_t bytes = 0;
@@ -813,6 +818,16 @@ std::size_t t2_two_parent_projection_bytes(std::int32_t min_columns, std::int32_
             !detail::t2_a8_layout_activations(layout, 5120, columns)) {
             (void)layout.alloc(DType::BF16, {4096, columns});
             (void)layout.alloc(DType::BF16, {6144, columns});
+#ifdef NINFER_BACKEND_HIP
+            // The decode gate (t2_dispatch) takes the dp4a route only at T = 1; each leg
+            // bumps its quantised x in its own nested scope, which is why the footprint is
+            // one plane, not the three legs' sum.
+            if (columns == 1 && allows_a8_int(policy) &&
+                detail::t2_gemv_dp4a_supported(4096, 5120)) {
+                const auto leg = layout.scope();
+                (void)layout.alloc_bytes(detail::t2_gemv_dp4a_scratch_bytes(5120));
+            }
+#endif
         }
         bytes = std::max(bytes, layout.peak_bytes(1));
     }
@@ -936,7 +951,9 @@ std::size_t gdn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int
             {input_rows, 8192, 4096, parent_rows, input_rows, min_tokens});
         (void)detail::q8_gdn_input_resolve_plan(
             {input_rows, 8192, 4096, parent_rows, input_rows, max_tokens});
-        return 0;
+        // The T=1 leg of the interval takes the byte-dot decode route, which bumps its
+        // quantised x plane from this call's arena scope.
+        return detail::q8_gdn_input_dp4a_scratch_bytes();
     }
     throw std::invalid_argument("gdn_input_proj workspace: unsupported parent profile");
 }
@@ -983,7 +1000,9 @@ std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
         (void)resolve_q8_conv_plan(max_width, 1);
         if (max_width >= 17) { largest_materialized_width = max_width; }
     }
-    if (largest_materialized_width == 0) { return 0; }
+    // The DecodeFused leg (width 1) bumps its quantised x plane from this call's arena
+    // scope; the materialized legs above already carry their projected plane.
+    if (largest_materialized_width == 0) { return detail::q8_gdn_input_dp4a_scratch_bytes(); }
     WorkspaceLayoutBuilder layout;
     (void)allocate_projected_workspace(layout, channels, largest_materialized_width);
     return layout.peak_bytes(1);

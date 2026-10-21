@@ -11,6 +11,9 @@
 #include "ops/linear/q8/q8_dispatch.h"
 #include "ops/linear/t2/t2_a8.h"
 #include "ops/linear/t2/t2_dispatch.h"
+#ifdef NINFER_BACKEND_HIP
+#include "ops/linear/t2/t2_gemv_dp4a.h"
+#endif
 
 #include <cstdint>
 #include <limits>
@@ -45,6 +48,25 @@ void validate_linear_policy(LinearPolicy policy) {
     if (!valid_linear_policy(policy)) {
         throw std::invalid_argument("linear: invalid compute policy");
     }
+}
+
+// T2 workspace reservation: the A8 route's quantised-activation planes, plus (on HIP) the
+// byte-dot decode route's quantised x plane when this shape/policy admits it. A call
+// bumps one route or the other, never both; reserving the sum keeps a stage that
+// switches routes (or runs both across widths) inside capacity without re-planning.
+std::size_t t2_workspace_bytes(std::int32_t output_rows, std::int32_t input_rows,
+                                LinearPolicy policy, std::int32_t max_tokens) {
+    std::size_t bytes =
+        detail::t2_a8_workspace_bytes(output_rows, input_rows, policy, max_tokens);
+#ifdef NINFER_BACKEND_HIP
+    if (allows_a8_int(policy) && detail::t2_gemv_dp4a_supported(output_rows, input_rows)) {
+        // Both routes bump the same arena in their call scope; reserving the sum keeps
+        // a stage that switches routes (or runs them for different token widths) inside
+        // capacity without re-planning.
+        bytes += detail::t2_gemv_dp4a_scratch_bytes(input_rows);
+    }
+#endif
+    return bytes;
 }
 
 void validate_linear_semantics(const Tensor& x, const Weight& w, const Tensor& out,
@@ -96,7 +118,7 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
             detail::t2_a8_linear(x, w, out, *workspace, stream);
             return;
         }
-        detail::t2_dispatch(x, w, out, policy, stream);
+        detail::t2_dispatch(x, w, out, policy, workspace, stream);
         return;
     case QType::BF16:
         detail::bf16_dispatch(x, w, out, policy, stream);
@@ -152,7 +174,7 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
     case QType::T2_G128_FP16:
         (void)detail::select_t2_launch(output_rows, input_rows, min_tokens, policy);
         (void)detail::select_t2_launch(output_rows, input_rows, max_tokens, policy);
-        return detail::t2_a8_workspace_bytes(output_rows, input_rows, policy, max_tokens);
+        return t2_workspace_bytes(output_rows, input_rows, policy, max_tokens);
     case QType::BF16:
         (void)detail::select_bf16_launch(output_rows, input_rows, min_tokens, policy);
         (void)detail::select_bf16_launch(output_rows, input_rows, max_tokens, policy);

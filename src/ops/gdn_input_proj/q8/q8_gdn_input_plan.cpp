@@ -93,13 +93,13 @@ Q8GdnInputConvPlan q8_gdn_input_conv_resolve_plan(const Q8GdnInputProblem& probl
 }
 
 void q8_gdn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
-                           cudaStream_t stream) {
+                           WorkspaceArena* workspace, cudaStream_t stream) {
     const Q8GdnInputProblem problem{x.ne[0], qkv.ne[0], z.ne[0], weight.n, weight.padded_shape[1],
                                     x.ne[1]};
     const Q8GdnInputPlan plan = q8_gdn_input_resolve_plan(problem);
     switch (plan.schedule) {
     case Q8GdnInputScheduleId::DecodeR8Direct:
-        q8_gdn_input_decode_launch(x, weight, qkv, z, stream);
+        q8_gdn_input_decode_launch(x, weight, qkv, z, workspace, stream);
         return;
     case Q8GdnInputScheduleId::SplitKMmaDirect:
         q8_gdn_input_splitk_mma_launch(x, weight, qkv, z, stream);

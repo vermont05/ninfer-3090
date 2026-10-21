@@ -8,11 +8,13 @@
 
 #ifdef NINFER_BACKEND_HIP
 
+#include "core/arena.h"
 #include "core/tensor.h"
 #include "core/weight.h"
 
 #include <cuda_runtime.h>
 
+#include <cstddef>
 #include <cstdint>
 
 namespace ninfer::ops::detail {
@@ -20,9 +22,16 @@ namespace ninfer::ops::detail {
 // True when the dp4a route registers this (n, k) for the T = 1 decode shape.
 [[nodiscard]] bool t2_gemv_dp4a_supported(std::int32_t n, std::int32_t k);
 
+// Bytes of the quantised-activation scratch one k-wide call takes from the workspace:
+// one s8 code per element plus one binary16 scale per 128-group (the quantize kernel
+// writes the two planes from one wavefront, so they travel together).
+[[nodiscard]] std::size_t t2_gemv_dp4a_scratch_bytes(std::int32_t k);
+
 // out [n,1] = w [n,k] x x [k,1], single wavefront quantize + dp4a GEMV. Takes the shapes
-// t2_gemv_dp4a_supported admits; throws otherwise.
-void t2_gemv_dp4a_run(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
+// t2_gemv_dp4a_supported admits; throws otherwise. The quantised x plane is allocated
+// from workspace (in a nested scope), so concurrent streams must get distinct arenas.
+void t2_gemv_dp4a_run(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& workspace,
+                       cudaStream_t stream);
 
 } // namespace ninfer::ops::detail
 

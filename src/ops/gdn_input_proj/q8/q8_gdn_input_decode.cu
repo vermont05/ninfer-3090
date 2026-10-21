@@ -61,19 +61,23 @@ make_conv_epilogue(const Tensor& conv_weight, Tensor& conv_states, const Tensor&
 
 #ifdef NINFER_BACKEND_HIP
 // Byte-dot decode route (cal14: 1.49x over the a16 SIMT bar on 12288x2048, cal14-calibrated
-// pipeline exact against f64 mirrors). NINFER_Q8_DP4A=off falls back to the SIMT schedules.
+// pipeline exact against f64 mirrors). NINFER_Q8_DP4A=off falls back to the SIMT schedules;
+// a call without a workspace takes them too (the scratch needs an arena).
 constexpr int kDp4aGroupK = 128;
 constexpr int kDp4aStaticK = 2048;
+// One call's quantised-x plane: 2048 code bytes + 16 B gap + 16 binary16 scales, the
+// quantize kernel's layout.
+constexpr std::size_t kDp4aScratchBytes = static_cast<std::size_t>(kDp4aStaticK) + 16u +
+                                            static_cast<std::size_t>(kDp4aStaticK / kDp4aGroupK) * 2u;
 
 struct Dp4aScratch {
-    DeviceBuffer backing{8192u};
-    std::uint8_t* const xq = static_cast<std::uint8_t*>(backing.p);
-    std::uint16_t* const xs = reinterpret_cast<std::uint16_t*>(xq + kDp4aStaticK + 16u);
+    std::uint8_t* xq;
+    std::uint16_t* xs;
 };
 
-Dp4aScratch& dp4a_scratch() {
-    static Dp4aScratch scratch;
-    return scratch;
+Dp4aScratch make_dp4a_scratch(void* base) {
+    auto* const xq = static_cast<std::uint8_t*>(base);
+    return Dp4aScratch{xq, reinterpret_cast<std::uint16_t*>(xq + kDp4aStaticK + 16u)};
 }
 
 // One warp per 128-group of x: group amax -> binary16 scale -> s8 codes. Identical
@@ -133,13 +137,12 @@ bool dp4a_decode_enabled() {
 
 template <class Output, class Epilogue>
 void launch_dp4a_gemv(const Tensor& x, const Weight& weight, Output output,
-                       const Epilogue& epilogue, cudaStream_t stream) {
+                       const Epilogue& epilogue, Dp4aScratch scratch, cudaStream_t stream) {
     const Q8LinearOperands operands = q8_linear_operands(x, weight);
     validate_q8_operands(operands);
     if (operands.tokens != 1 || operands.k != kDp4aStaticK || operands.padded_k != kDp4aStaticK) {
         throw std::invalid_argument("Q8 GDN dp4a decode: unsupported operands");
     }
-    Dp4aScratch& scratch = dp4a_scratch();
 
     constexpr int kQuantizeWarps = 4;
     constexpr int kGroups = kDp4aStaticK / kDp4aGroupK;
@@ -163,17 +166,29 @@ void launch_dp4a_gemv(const Tensor& x, const Weight& weight, Output output,
 
 } // namespace
 
-void q8_gdn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
-                                cudaStream_t stream) {
+// One bump's worst-case footprint: the plane itself plus the alignment slack the
+// 256-aligned start of the bump can sit behind.
+#ifdef NINFER_BACKEND_HIP
+std::size_t q8_gdn_input_dp4a_scratch_bytes() noexcept { return kDp4aScratchBytes + 256u; }
+#else
+std::size_t q8_gdn_input_dp4a_scratch_bytes() noexcept { return 0; }
+#endif
 
+void q8_gdn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
+                                 WorkspaceArena* workspace, cudaStream_t stream) {
     constexpr int kRowsPerCta = 8;
     static_assert((8192 % kRowsPerCta) == 0 && (4096 % kRowsPerCta) == 0);
     const Output output{static_cast<__nv_bfloat16*>(qkv.data), static_cast<__nv_bfloat16*>(z.data)};
 #ifdef NINFER_BACKEND_HIP
-    if (dp4a_decode_enabled()) {
-        launch_dp4a_gemv(x, weight, output, LinearIdentityEpilogue{}, stream);
+    if (workspace != nullptr && dp4a_decode_enabled()) {
+        const auto scope = workspace->scope();
+        launch_dp4a_gemv(x, weight, output, LinearIdentityEpilogue{},
+                         make_dp4a_scratch(workspace->alloc_bytes(kDp4aScratchBytes).data),
+                         stream);
         return;
     }
+#else
+    static_cast<void>(workspace);
 #endif
     launch_q8_a16_gemv<Q8A16GemvSchedule<kRowsPerCta, 1, 2, 2048>>(
         q8_linear_operands(x, weight), output, LinearIdentityEpilogue{}, stream);
@@ -183,8 +198,8 @@ void q8_gdn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor& q
 void q8_gdn_input_decode_conv_snapshot_launch(
     const Tensor& x, const Weight& weight, const Tensor& conv_weight, Tensor& conv_states,
     const Tensor& valid_columns, const Tensor& initial_slot, const Tensor& snapshot_base_slot,
-    Tensor& query, Tensor& key, Tensor& value, Tensor& z, cudaStream_t stream) {
-
+    Tensor& query, Tensor& key, Tensor& value, Tensor& z, WorkspaceArena* workspace,
+    cudaStream_t stream) {
     constexpr int kRowsPerCta = 8;
     const Output ignored_output{static_cast<__nv_bfloat16*>(query.data),
                                 static_cast<__nv_bfloat16*>(z.data)};
@@ -194,10 +209,15 @@ void q8_gdn_input_decode_conv_snapshot_launch(
         static_cast<__nv_bfloat16*>(z.data),
     };
 #ifdef NINFER_BACKEND_HIP
-    if (dp4a_decode_enabled()) {
-        launch_dp4a_gemv(x, weight, ignored_output, epilogue, stream);
+    if (workspace != nullptr && dp4a_decode_enabled()) {
+        const auto scope = workspace->scope();
+        launch_dp4a_gemv(x, weight, ignored_output, epilogue,
+                         make_dp4a_scratch(workspace->alloc_bytes(kDp4aScratchBytes).data),
+                         stream);
         return;
     }
+#else
+    static_cast<void>(workspace);
 #endif
     launch_q8_a16_gemv<Q8A16GemvSchedule<kRowsPerCta, 1, 2, 2048>>(
         q8_linear_operands(x, weight), ignored_output, epilogue, stream);
