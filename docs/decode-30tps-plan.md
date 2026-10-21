@@ -139,6 +139,20 @@ integration silently vanished because the dispatch hook was guarded `__HIPCC__`
 in a host TU (no `-x hip`); guards are `NINFER_BACKEND_HIP` now (the convention
 CMakeLists.txt:55 documents).
 
+
+
+Qualification data (2026-10-21, this tick): cal13q proves the dp4a kernel matches the
+float64 reference for the *quantized pipeline* (bad=0 at k=5120/17408), and the single
+sample /tmp/cal13q harness covers the kernel. Production end-to-end, the route is an
+int8-activation approximation of the exact-BF16 bits route, and the difference is not
+cosmetic: a 10-prompt greedy suite (temperature 0, 64 tokens, deterministic server --
+verified by running the bits leg twice with identical output) gives 2/10 fully
+identical outputs and 7/10 first divergence at char <= 30 (the first generated token
+flips). Whether that tolerance is acceptable is a product call -- Prism ships the same
+int8-activation design; this build now matches it. The plan's "FP32/FP64 oracle +
+logit-diff qualification" gate should be closed on a coherent corpus before the route
+ships beyond this machine.
+
 ## Phase 4 — the rest of the budget (do not start before Phase 2 lands)
 ### Phase 4 fresh buckets (dp4a build, 2026-10-21, per step)
 
