@@ -161,25 +161,32 @@ gdn_mixer=17.16  gdn_mlp=21.34  attn_mixer=9.31  attn_mlp=6.97  (head 1.79)
 gdn-mixer internal (NINFER_STEP_PROBE_FINE=1, per sampled layer, ~45 gdn layers):
   proj=0.229  out=0.075  rec=0.035  nc=0.023  norm=0.021   (sum 0.383/layer)
 
-Lever (located 2026-10-21): the gdn input projection ("proj", 0.229/layer — the
-biggest gdn-mixer sub-cost) is NOT on the t2_dispatch dp4a route. It is its own
-op: `ops::gdn_input_proj` -> `q8_gdn_input_dispatch` -> `launch_q8_a16_gemv`
-(`q8_gdn_input_decode.cu`), a Q8_G32 (group-32 int8 weights, k=2048) A16-activation
-GEMV with a fused conv epilogue — no byte-dot, and on the same class of SIMT word
-path Phase 3 just beat 1.4-1.9x. So the concrete Phase-4 candidate is a byte-dot
-(v_dot4_i32_iu8) Q8 decode GEMV for that fused path, mirroring t2_gemv_dp4a.
-Verify the exact schedule/shape and run cal13q-style numeric qualification before
-trusting any gain. (Phase 2 / t2 dp4a has landed, so the "before Phase 2" gate holds.)
+Lever (located 2026-10-21; corrected the same day after the A/B below): the gdn
+input projection ("proj", 0.229/layer — the biggest gdn-mixer sub-cost) was thought
+to sit on the Q8_G32 single-parent route (`q8_gdn_input_dispatch` ->
+`launch_q8_a16_gemv`, k = 2048, A16-activation GEMV + fused conv epilogue), and a
+byte-dot version was implemented there. It does not: swift bonsai's gdn input
+projection is the **T2 two-parent route** (`t2_two_parent_project` over
+{4096,5120} + {12288,5120}; conversion manifest bf16/fp32/t2_g128_fp16, and
+parameters.cpp registers integer_route_pair for exactly those shapes), which
+already passes the `t2_dispatch` dp4a gate at T = 1. The Q8 single-parent route
+serves a different profile (qwen3.5-9b class) and never dispatches for this model
+— verified by symbol presence (nm/strings) plus the 2026-10-21 server A/B: dp4a
+24.72 s vs NINFER_Q8_DP4A=off 24.84 s wall, with per-bucket and fine-probe numbers
+identical between legs. So the null A/B was real, not a stale binary.
 
-Calibration 2026-10-21 (`/tmp/gemv_cal14.cu`, idle eGPU, shape n=12288 x k=2048 —
-the gdn-proj class): the a16-SIMT bar clone (with the production `warp_reduce_sum`
-fold — an early fork that dropped it mis-measured 160 us and failed its own
-reference) runs 59.1 us; floor 20.5 us; dp4a-direct (int8 x, sym-free: Q8 codes go
-straight into `v_dot4_i32_iu8`) 39.7 us, dp4a-with-LDS-staging 49.5 us. Both probe
-kernels verify bad=0/64 against f64 pipeline mirrors. So the byte-dot route is
-**1.49x over the a16 bar** on this shape (not the 4x the broken clone suggested),
-which is the same class as the shipped t2 win and worth a production kernel
-family + cal13q-style qualification + server A/B next.
+Calibration 2026-10-21 (`/tmp/gemv_cal14.cu`, idle eGPU, shape n=12288 x k=2048):
+the a16-SIMT bar clone (with the production `warp_reduce_sum` fold — an early fork
+that dropped it mis-measured 160 us and failed its own reference) runs 59.1 us;
+floor 20.5 us; dp4a-direct (int8 x, sym-free: Q8 codes go straight into
+`v_dot4_i32_iu8`) 39.7 us, dp4a-with-LDS-staging 49.5 us. Both probe kernels verify
+bad=0/64 against f64 pipeline mirrors. The 1.49x-over-bar result stands for the
+Q8_G32 shape class, but is inert for swift bonsai (route not on its path). The
+remaining gdn-proj lever for this model is inside the T2 pair path — the pair
+GEMVs are already byte-dot, so the candidates there are the separate
+conv/snapshot kernel behind the GEMVs and the small-T band, not a new Q8 route.
+(Caveat from review: the fine "proj" bucket covers more than the isolated GEMV,
+so a standalone kernel ratio cannot be multiplied across layers.)
 
 
 

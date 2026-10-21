@@ -103,15 +103,22 @@ __global__ void dp4a_quantize_kernel(const __nv_bfloat16* __restrict__ x,
         amax = amax > o ? amax : o;
     }
     const float scale = amax * (1.0f / 127.0f);
-    if (amax > 0.0f) {
-        xs[group] = static_cast<std::uint16_t>(__half_as_ushort(__float2half_rn(scale)));
+    // Warp-uniform scale (the fold above leaves every lane identical): lane 0 publishes,
+    // and the group quantises with the local value. An all-zero group gets a defined 0
+    // instead of a stale or uninitialized scale.
+    const __half sh = __float2half_rn(scale);
+    if (l == 0) {
+        xs[group] = static_cast<std::uint16_t>(__half_as_ushort(sh));
     }
-    const float s = amax > 0.0f ? __half2float(__ushort_as_half(xs[group])) : 0.0f;
+    const float s   = __half2float(sh);
     const float inv = s > 0.0f ? 1.0f / s : 0.0f;
     std::uint8_t* ob = xq + static_cast<std::int64_t>(group) * kDp4aGroupK;
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
-        const int q = static_cast<int>(__float2int_rn(v[i] * inv));
+        int q = static_cast<int>(__float2int_rn(v[i] * inv));
+        // |v| <= amax bounds q at 127; clamp guards the rounding boundary so a stray +1
+        // cannot wrap to -128 through the uint8 cast.
+        q = q > 127 ? 127 : q < -127 ? -127 : q;
         ob[l + i * 32] = static_cast<std::uint8_t>(q);
     }
 }

@@ -103,11 +103,15 @@ void t2_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy pol
     // T = 1 decode on a registered shape takes the byte-dot route (t2_gemv_dp4a.cuh:
     // cal12 1.40-1.91x over the bit-trick word partial at the same bar). NINFER_T2_DP4A=off
     // falls back to the word schedules below (benchmark A/B, escape hatch).
+    // The route quantises x to s8, so it belongs to the integer-A8 family: it is admitted
+    // only under a policy that admits s8 activations (the engine's routes carry AllowA8Int
+    // by default -- LoadOptions::prefill_a8), and an explicit A16Only caller keeps its
+    // documented A16 schedules.
     static const bool dp4a_enabled = [] {
         const char* value = std::getenv("NINFER_T2_DP4A");
         return value == nullptr || std::string(value) != "off";
     }();
-    if (dp4a_enabled && x.ne[1] == 1 && t2_gemv_dp4a_supported(w.n, w.k)) {
+    if (dp4a_enabled && allows_a8_int(policy) && x.ne[1] == 1 && t2_gemv_dp4a_supported(w.n, w.k)) {
         t2_gemv_dp4a_run(x, w, out, stream);
         return;
     }
