@@ -1,6 +1,10 @@
 #include "ops/linear_attention/gated_delta_net/chunked/launch.h"
+#include "ops/linear_attention/gated_delta_net/chunked/recurrence_wmma.cuh"
 #include "ops/common/math.cuh"
 #include "ops/common/mma.cuh"
+
+#include <cstdlib>
+#include <string>
 
 namespace ninfer::ops::detail::gated_delta_net::chunked {
 namespace {
@@ -135,6 +139,146 @@ __device__ __forceinline__ void store_output(const Arguments& args, float (&acc)
     if (t0 + 8 < args.tokens) {
         store_vec(args.out + o0 + static_cast<std::int64_t>(8) * args.value_heads * kStateDim,
                   __floats2bfloat162_rn(acc[2] * args.scale, acc[3] * args.scale));
+    }
+}
+
+// ---------- hardware-WMMA variant (gfx1102; probes cal25/26/30/32/33/34/35) ----
+//
+// Variant of chunk_recurrence_kernel below running the NT >= kWarps shape's MMA
+// sites (site-2 prediction/history, the matrix_delta chain and the site-3 state
+// update) on hardware WMMA instead of the mma.cuh SIMT emulation. The block
+// contract is cal35's narrow tile: one 32-byte chunk per lane, lane l owning row
+// (l & 15) of a 16-row x 8-column block, so every phase feeds the next phase's
+// loader without shuffles. Warp w owns the stripe column block w * 8 and the
+// block phases touch only their own stripe, so the SIMT path's block-wide
+// matrix_delta barriers shrink to __syncwarp() here; the stage and snapshot
+// __syncthreads() stay. Not bit-identical to the emulation: deterministic 1-3 ULP
+// instruction noise plus TF32 -> BF16 on the prediction dot. Selected by the
+// NINFER_GDN_REC_WMMANATIVE gate (host, below).
+template <int DV>
+__global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurrence_wmma_kernel(
+    Arguments args, const QkChunk* __restrict__ qk_workspace,
+    const ControlChunk* __restrict__ control_workspace) {
+    constexpr int kWarps = kThreads<DV> / 32;
+    constexpr int NT     = DV / 8;
+    static_assert(NT >= kWarps, "WMMA variant covers the NT >= kWarps shapes only");
+    constexpr int MPW = kStateDim / 16;
+    using Lay = typename wmma_detail::LayFor<DV>::type;
+    extern __shared__ __align__(256) unsigned char backing[];
+    auto& sm      = *reinterpret_cast<RecurrenceShared<DV>*>(backing);
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid / 32;
+    const int head        = blockIdx.x / (kStateDim / DV);
+    const int value_start = blockIdx.x % (kStateDim / DV) * DV;
+    const int n_start     = warp % NT;
+    const int colbase     = n_start * 8;
+    const int chunks      = chunk_count(args.tokens);
+    const auto state_base = static_cast<std::int64_t>(head) * kStateDim * kStateDim;
+    const wmma_detail::f8v32 zero{0, 0, 0, 0, 0, 0, 0, 0};
+
+    // S^T[key, value] in the block contract: state[mi] is the 32-byte chunk of key
+    // row (mi * 16 + (lane & 15)) across this warp's stripe; the SIMT path's
+    // float4-of-4-scalars state, widened to the fragment's own shape. No fragment
+    // reshuffle anywhere.
+    wmma_detail::f8v32 state[MPW];
+    auto load_state = [&](int mi) {
+        const int row = mi * 16 + (lane & 15);
+        auto* chunk   = reinterpret_cast<float*>(&state[mi]);
+#pragma unroll
+        for (int e = 0; e < 8; ++e)
+            chunk[e] = args.state_in[state_base +
+                                          static_cast<std::int64_t>(value_start + colbase + e) *
+                                              kStateDim +
+                                          row];
+    };
+#pragma unroll
+    for (int mi = 0; mi < MPW; ++mi)
+        load_state(mi);
+    load_stage<DV>(sm.stage[0], args, qk_workspace, control_workspace, head, value_start, 0,
+                     tid);
+    if (chunks > 1)
+        load_stage<DV>(sm.stage[1], args, qk_workspace, control_workspace, head, value_start,
+                         1, tid);
+
+    for (int chunk = 0; chunk < chunks; ++chunk) {
+        if (chunk + 1 < chunks)
+            cp_wait<1>();
+        else
+            cp_wait<0>();
+        __syncthreads();
+        // Snapshot the live state into the swizzled block slots site 2 reads
+        // (the SIMT snapshot stage in chunk-per-lane shape).
+#pragma unroll
+        for (int mi = 0; mi < MPW; ++mi)
+            wmma_detail::store_chunk8<Lay>(sm.snapshot, mi * 16, colbase, lane, state[mi]);
+        __syncthreads();
+
+        const auto& stage     = sm.stage[chunk & 1];
+        const ControlChunk& p = stage.control;
+        const QkChunk& qk     = stage.qk;
+
+        // Site 2: prediction = K . S and history = Q . S over the snapshot stripe.
+        wmma_detail::f8v32 prediction;
+        wmma_detail::f8v32 history;
+        wmma_detail::site2_pred_history<DV>(qk, sm.snapshot, colbase, lane, prediction, history);
+        wmma_detail::store_residual_wmma<Lay, DV>(sm.delta, stage.value, prediction, colbase,
+                                                     lane, p.prefix);
+        __syncthreads();
+
+        // matrix_delta chain on this warp's stripe block; the block is
+        // warp-private, so warp barriers scope it.
+        wmma_detail::store_chunk8<Lay>(sm.delta, 0, colbase, lane,
+                                         wmma_detail::dot_square<Lay>(p.solve, sm.delta, colbase,
+                                                                        lane, zero));
+        __syncwarp();
+        wmma_detail::f8v32 out;
+        {
+            const float scale = p.prefix[lane & 15];
+            const auto* hp = reinterpret_cast<const float*>(&history);
+            auto* op         = reinterpret_cast<float*>(&out);
+#pragma unroll
+            for (int q = 0; q < 8; ++q)
+                op[q] = hp[q] * scale;
+        }
+        out = wmma_detail::dot_square<Lay>(p.mqk, sm.delta, colbase, lane, out);
+        wmma_detail::store_chunk_row(args, out, chunk, head, value_start, colbase, lane);
+
+        // Site 3: S^T = gamma S^T + K^T diag(suffix) Delta. The snapshot row IS
+        // this lane's state chunk scaled by the decay (the SIMT path's state
+        // pre-multiply inlined), chained over the eight key slices; each slice
+        // is rewritten for the next chunk's snapshot.
+        {
+            const float decay = p.prefix[kChunkSize - 1];
+#pragma unroll
+            for (int mi = 0; mi < MPW; ++mi) {
+                const int keybase = mi * 16;
+                const wmma_detail::f8v32 snapshot_row =
+                    *reinterpret_cast<const wmma_detail::f8v32*>(
+                        sm.snapshot + Lay::index(keybase + (lane & 15), colbase));
+                const auto* sp = reinterpret_cast<const float*>(&snapshot_row);
+                auto* tp         = reinterpret_cast<float*>(&state[mi]);
+#pragma unroll
+                for (int e = 0; e < 8; ++e)
+                    tp[e] = sp[e] * decay;
+                state[mi] = wmma_detail::state_tile<Lay>(qk.k, keybase, sm.delta, colbase, lane,
+                                                           p.suffix, state[mi]);
+            }
+        }
+        __syncthreads();
+        if (chunk + 2 < chunks) {
+            load_stage<DV>(sm.stage[chunk & 1], args, qk_workspace, control_workspace, head,
+                             value_start, chunk + 2, tid);
+        }
+    }
+#pragma unroll
+    for (int mi = 0; mi < MPW; ++mi) {
+        if (lane >= 16) continue;
+        const int row = mi * 16 + (lane & 15);
+        const auto* chunk_p = reinterpret_cast<const float*>(&state[mi]);
+#pragma unroll
+        for (int e = 0; e < 8; ++e)
+            args.state_out[state_base +
+                             static_cast<std::int64_t>(value_start + colbase + e) * kStateDim +
+                             row] = chunk_p[e];
     }
 }
 
@@ -350,10 +494,32 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
     }
 }
 
+// Hardware-WMMA variant gate for the DV=64 shape (t2_a8's idiom; read once).
+inline bool rec_wmma_native() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("NINFER_GDN_REC_WMMANATIVE");
+        return value == nullptr || std::string(value) != "off";
+    }();
+    return enabled;
+}
+
 template <int DV>
 void launch(const Arguments& args, const QkChunk* qk, const ControlChunk* control,
             cudaStream_t stream) {
     constexpr int shared_bytes = sizeof(RecurrenceShared<DV>);
+    if constexpr (DV == 64) {
+        if (rec_wmma_native()) {
+            CUDA_CHECK(cudaFuncSetAttribute(chunk_recurrence_wmma_kernel<DV>,
+                                              cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                              shared_bytes));
+            chunk_recurrence_wmma_kernel<DV><<<args.value_heads * (kStateDim / DV),
+                                                   kThreads<DV>, shared_bytes, stream>>>(args,
+                                                                                            qk,
+                                                                                            control);
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
+    }
     CUDA_CHECK(cudaFuncSetAttribute(chunk_recurrence_kernel<DV>,
                                     cudaFuncAttributeMaxDynamicSharedMemorySize, shared_bytes));
     chunk_recurrence_kernel<DV>
