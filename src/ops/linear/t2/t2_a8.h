@@ -21,7 +21,10 @@
 
 namespace ninfer::ops::detail {
 
-inline constexpr std::int32_t kT2A8MinTokens = 64;
+// Below this width a call has no integer route. The floor sits at 17 after the probe showed
+// the prefill tile beating the A16 dispatch schedules at it (boot chunk of 51 tokens: 4.9 s
+// through r64_c64, 0.46 s through the tile; request tail of 34: 5.0 s vs 0.37 s).
+inline constexpr std::int32_t kT2A8MinTokens = 17;
 // The widths the small-T kernel takes by default; NINFER_T2_I8_SMALL=off|lo,hi overrides them.
 inline constexpr std::int32_t kT2I8SmallMinTokens = 1;
 inline constexpr std::int32_t kT2I8SmallMaxTokens = 192;

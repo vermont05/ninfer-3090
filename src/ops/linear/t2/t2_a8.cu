@@ -12,6 +12,9 @@
 #include "core/device.h"
 #include "ops/common/rowsplit_a8_mma.cuh"
 #include "ops/linear/t2/t2_prefill_i8.cuh"
+#if defined(__HIPCC__)
+#include "ops/linear/t2/t2_prefill_wmma.cuh" // gfx1102 WMMA tile; the whole body is __HIPCC__-gated
+#endif
 #include "ops/linear/t2/t2_small_t_i8.cuh"
 
 #include <cuda_bf16.h>
@@ -62,6 +65,22 @@ bool prefill_tile() {
     return enabled;
 }
 
+#if defined(__HIPCC__)
+// The hardware-WMMA prefill tile (t2_prefill_wmma.cuh) is the default: bit-identical
+// outputs to the mma.cuh emulation (cal19/cal23 batteries) at ~9x its standalone time
+// on the engine shapes (cal23: gate_up 28.7 ms vs 264 ms), and ~2x its end-to-end
+// prefill rate (cold-boot table, docs/remaining-work.md §3). NINFER_T2_A8_WMMANATIVE=off
+// puts the mma.cuh emulation back for A/B. Present only on the HIP backend, where the
+// WMMA tile exists; the NVIDIA build always takes the t2_prefill_i8_kernel path.
+bool prefill_wmma_native() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("NINFER_T2_A8_WMMANATIVE");
+        return value == nullptr || std::string(value) != "off";
+    }();
+    return enabled;
+}
+#endif
+
 std::int32_t tile_columns(std::int32_t tokens) {
     constexpr std::int32_t kColumns = T2PrefillI8::kColumns;
     return (tokens + kColumns - 1) / kColumns * kColumns;
@@ -80,7 +99,17 @@ struct SmallBand {
 SmallBand small_band() {
     static const SmallBand band = [] {
         const char* value = std::getenv("NINFER_T2_I8_SMALL");
-        if (value == nullptr) { return SmallBand{kT2I8SmallMinTokens, kT2I8SmallMaxTokens}; }
+#ifdef NINFER_BACKEND_HIP
+        // The band is off by default on gfx1102: t2_small_t_i8 takes its mma from
+        // ops/common/mma.cuh, whose __HIPCC__ branch is the SIMT reference emulation, and it
+        // loses to the hardware-WMMA prefill tile even at narrow widths (probe 2026-10-22:
+        // a 51-token chunk costs ~4.9 s through the band against ~0.46 s through the tile,
+        // and sub-64 chunks left off the band run the A16 route in ~5 s).
+        const SmallBand fallback{1, 0};
+#else
+        const SmallBand fallback{kT2I8SmallMinTokens, kT2I8SmallMaxTokens};
+#endif
+        if (value == nullptr) { return fallback; }
         const std::string text(value);
         if (text == "off") { return SmallBand{1, 0}; }
         const std::size_t comma = text.find(',');
@@ -292,6 +321,22 @@ void tile_gemm(const T2A8Activations& x, const Weight& w, Epilogue epilogue, cud
     const unsigned column_blocks = static_cast<unsigned>(columns / C::kColumns);
     const unsigned row_blocks    = static_cast<unsigned>(w.n / C::kRows);
     const dim3 grid = rows_fast ? dim3(row_blocks, column_blocks) : dim3(column_blocks, row_blocks);
+#if defined(__HIPCC__)
+    if (prefill_wmma_native()) {
+        // One-warp tile (16 rows x 32 cols, cal23's fastest family): its own grid.
+        constexpr int kTileColumns = 32;
+        constexpr int kTileRows    = 16;
+        const unsigned wcolumn_blocks = static_cast<unsigned>(columns) / kTileColumns;
+        const unsigned wrow_blocks    = static_cast<unsigned>(w.n) / kTileRows;
+        const dim3 wgrid = rows_fast ? dim3(wrow_blocks, wcolumn_blocks)
+                                       : dim3(wcolumn_blocks, wrow_blocks);
+        t2_prefill_wmma1_kernel<1, 2, Epilogue><<<wgrid, 32, 0, stream>>>(
+            static_cast<const std::uint8_t*>(w.qdata), static_cast<const __half*>(w.scales),
+            x.codes, x.scales, kCols, columns, x.tokens, rows_fast, epilogue);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+#endif
     t2_prefill_i8_kernel<kCols, Epilogue><<<grid, C::kThreads, 0, stream>>>(
         static_cast<const std::uint8_t*>(w.qdata), static_cast<const __half*>(w.scales), x.codes,
         x.scales, columns, x.tokens, rows_fast, epilogue);
