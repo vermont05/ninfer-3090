@@ -47,6 +47,8 @@ using cudaFuncAttribute        = hipFuncAttribute;
 using cudaGraph_t              = hipGraph_t;
 using cudaGraphExec_t          = hipGraphExec_t;
 using cudaGraphNode_t          = hipGraphNode_t;
+using cudaGraphNodeType        = hipGraphNodeType;
+using cudaMemcpy3DParms        = hipMemcpy3DParms;
 using cudaUUID_t               = hipUUID_t;
 // Extensible-launch plumbing: the HIP structs carry the CUDA layout (id, pad, val/value),
 // and gdn_gating_proj's cooperative launch reads exactly those members.
@@ -301,6 +303,7 @@ __cvta_generic_to_shared(const void* p) {
 #define cudaEventSynchronize hipEventSynchronize
 #define cudaEventElapsedTime hipEventElapsedTime
 
+#define cudaStreamQuery hipStreamQuery
 #define cudaStreamCreate hipStreamCreate
 #define cudaStreamCreateWithFlags hipStreamCreateWithFlags
 #define cudaStreamDestroy hipStreamDestroy
@@ -316,6 +319,13 @@ __cvta_generic_to_shared(const void* p) {
 #define cudaGraphExecDestroy hipGraphExecDestroy
 #define cudaGraphUpload hipGraphUpload
 #define cudaGraphGetNodes hipGraphGetNodes
+// Graph-introspection calls the tests use to find a capture's memcpy node and count edges;
+// HIP names them the same.
+#define cudaGraphNodeGetType hipGraphNodeGetType
+#define cudaGraphGetEdges hipGraphGetEdges
+#define cudaGraphMemcpyNodeGetParams hipGraphMemcpyNodeGetParams
+#define cudaGraphNodeTypeEmpty hipGraphNodeTypeEmpty
+#define cudaGraphNodeTypeMemcpy hipGraphNodeTypeMemcpy
 
 #define cudaLaunchKernelEx hipLaunchKernelEx
 #define cudaOccupancyMaxActiveBlocksPerMultiprocessor \

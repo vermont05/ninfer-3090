@@ -266,6 +266,208 @@ private:
 };
 DecodeStepProbe g_decode_step_probe;
 
+// Diagnostic only. With NINFER_PREFILL_PROFILE set, each prefill call — the chunk loop in
+// prefill_impl breaks after its first chunk, so one per call — is segmented with event
+// pairs: embed | layers | tail around the stage loop, and inside the stage loop a
+// mixer/mlp pair per layer tagged by kind (0=GDN, 1=FullAttention). Each GDN layer also
+// gets a fine split (nc | proj+conv | rec | norm | out), the decode probe's segments
+// moved to chunk scope. prefill_impl's tail device sync fences the chunk, and finish()
+// folds and prints it after that sync. The per-segment times are exact only when the
+// stream drains between segments (true for the single-lane path these probes drive;
+// cross-stream concurrency overlaps the intervals, so treat them as coarse attribution).
+struct PrefillProbe {
+    static constexpr std::size_t kFineCap = 96;  // bound on per-layer fine events
+
+    struct Chunk {
+        cudaEvent_t          begin = nullptr;
+        cudaEvent_t          pre   = nullptr;
+        cudaEvent_t          post  = nullptr;
+        cudaEvent_t          end   = nullptr;
+        std::vector<cudaEvent_t> bounds;       // [mid_i, end_i] per layer
+        std::vector<int>         kinds;        // layer i: 0=GDN, 1=FullAttention
+        std::vector<int>         fine_slot;    // layer index per fine sample
+        std::vector<cudaEvent_t> fine_bounds;  // 6 events per sample
+        std::size_t layers = 0;
+        std::size_t tokens = 0;
+        bool      in_layers = false;
+    };
+    Chunk   cur;
+    bool    enabled   = false;
+    bool    said_env  = false;
+    long    calls     = 0;
+    double  call_ms   = 0.0;  // sum of folded chunk totals (device time)
+
+    PrefillProbe() {
+        const char* value = std::getenv("NINFER_PREFILL_PROFILE");
+        enabled               = value != nullptr && std::string(value) != "0";
+    }
+    PrefillProbe(const PrefillProbe&)            = delete;
+    PrefillProbe& operator=(const PrefillProbe&) = delete;
+
+    static cudaEvent_t fresh() {
+        cudaEvent_t e = nullptr;
+        cudaEventCreate(&e);
+        return e;
+    }
+
+    void begin_chunk(std::size_t tokens, cudaStream_t stream) {
+        if (!enabled) { return; }
+        if (!said_env) {
+            said_env = true;
+            std::fprintf(stderr, "[prefill-probe] env NINFER_T2_A8_WMMANATIVE=%s NINFER_T2_DECODE=%s NINFER_T2_I8_SMALL=%s\n",
+                           std::getenv("NINFER_T2_A8_WMMANATIVE") ? std::getenv("NINFER_T2_A8_WMMANATIVE") : "(unset)",
+                           std::getenv("NINFER_T2_DECODE") ? std::getenv("NINFER_T2_DECODE") : "(unset)",
+                           std::getenv("NINFER_T2_I8_SMALL") ? std::getenv("NINFER_T2_I8_SMALL") : "(unset)");
+        }
+        cur = Chunk{};
+        cur.tokens    = tokens;
+        cur.begin     = fresh();
+        cur.pre       = fresh();
+        cur.post      = fresh();
+        cur.end       = fresh();
+        cur.in_layers = false;
+        cudaEventRecord(cur.begin, stream);
+    }
+    // Stage-loop hooks. run_stage_layers calls these with the same shape as the decode
+    // probe's begin_layers/mid_layer/end_layer.
+    void begin_layers(cudaStream_t stream) {
+        if (!enabled) { return; }
+        cur.bounds.clear();
+        cur.kinds.clear();
+        cur.fine_slot.clear();
+        cur.fine_bounds.clear();
+        cur.layers    = 0;
+        cur.in_layers = true;
+        cudaEventRecord(cur.pre, stream);
+    }
+    void mid_layer(cudaStream_t stream) {
+        if (!enabled || !cur.in_layers) { return; }
+        cudaEvent_t e = fresh();
+        cudaEventRecord(e, stream);
+        cur.bounds.push_back(e);
+    }
+    void end_layer(cudaStream_t stream, int kind) {
+        if (!enabled || !cur.in_layers) { return; }
+        cudaEvent_t e = fresh();
+        cudaEventRecord(e, stream);
+        cur.bounds.push_back(e);
+        cur.kinds.push_back(kind);
+        ++cur.layers;
+    }
+    // Fine-mode plumbing, mirroring DecodeStepProbe: gdn_mix calls gdn_fine_begin once per
+    // GDN layer (sampled every 4th), and gdn_fine_mark five times after it. Boundaries per
+    // sample: start, after norm_control, after projection+conv, after recurrence, after
+    // gated norm, after output projection.
+    bool gdn_fine_begin(cudaStream_t stream) {
+        if (!enabled || !cur.in_layers || capturing(stream)) { return false; }
+        if (cur.fine_slot.size() >= kFineCap) { return false; }
+        // Layer indices 3 mod 4 are the full-attention layers (gdn_mix is never called
+        // there), so sampling on them would never fire; 0 mod 4 lands on GDN layers.
+        if ((cur.layers & 3u) != 0u) { return false; }
+        cur.fine_slot.push_back(static_cast<int>(cur.layers));
+        cur.fine_bounds.push_back(fresh());
+        cudaEventRecord(cur.fine_bounds.back(), stream);
+        return true;
+    }
+    void gdn_fine_mark(cudaStream_t stream) {
+        if (!enabled || cur.fine_slot.empty()) { return; }
+        if (cur.fine_bounds.size() >= cur.fine_slot.size() * 6) { return; }
+        cur.fine_bounds.push_back(fresh());
+        cudaEventRecord(cur.fine_bounds.back(), stream);
+    }
+    void enter_tail(cudaStream_t stream) {
+        if (!enabled || !cur.in_layers) { return; }
+        cur.in_layers = false;
+        cudaEventRecord(cur.post, stream);
+    }
+    void leave_chunk(cudaStream_t stream) {
+        if (!enabled || cur.begin == nullptr || cur.end == nullptr) { return; }
+        cudaEventRecord(cur.end, stream);
+    }
+    // Fold the chunk: called after the call's tail device sync, so every recorded event has
+    // completed. Prints the per-chunk attribution line and returns; the probe is single-shot
+    // per call.
+    void finish() {
+        if (!enabled) { return; }
+        if (cur.begin == nullptr) { return; }
+        if (cur.end == nullptr) { destroy_cur(); return; }
+        ++calls;
+        double total = 0, embed = 0, layers = 0, tail = 0;
+        elapsed(total, cur.begin, cur.end);
+        elapsed(embed, cur.begin, cur.pre);
+        elapsed(layers, cur.pre, cur.post);
+        elapsed(tail, cur.post, cur.end);
+        call_ms += total;
+
+        double bucket[2][2] = {};  // [kind][0=mixer,1=mlp]
+        double in_layers_sum = 0, fine_total = 0;
+        {
+            cudaEvent_t prev = cur.pre;
+            for (std::size_t i = 0; 2 * i + 1 < cur.bounds.size() && i < cur.kinds.size(); ++i) {
+                double mixer = 0, mlp = 0, layer = 0;
+                elapsed(mixer, prev, cur.bounds[2 * i]);
+                elapsed(mlp, cur.bounds[2 * i], cur.bounds[2 * i + 1]);
+                elapsed(layer, prev, cur.bounds[2 * i + 1]);
+                const int k = cur.kinds[i];
+                bucket[k][0] += mixer;
+                bucket[k][1] += mlp;
+                in_layers_sum += layer;
+                prev = cur.bounds[2 * i + 1];
+            }
+        }
+        double fine[5] = {};
+        std::size_t fine_samples = 0;
+        for (std::size_t s = 0; s * 6 + 5 < cur.fine_bounds.size(); ++s) {
+            double v = 0;
+            for (int part = 0; part < 5; ++part) {
+                elapsed(v, cur.fine_bounds[s * 6 + part], cur.fine_bounds[s * 6 + part + 1]);
+                fine[part] += v;
+                fine_total += v;
+            }
+            ++fine_samples;
+        }
+
+        std::fprintf(stderr,
+                       "[prefill-probe] tokens=%zu total=%.1fms embed=%.1fms layers=%.1fms "
+                       "tail=%.1fms gdn_mixer=%.1f gdn_mlp=%.1f attn_mixer=%.1f attn_mlp=%.1f "
+                       "layers_sum=%.1fms\n",
+                       cur.tokens, total, embed, layers, tail, bucket[0][0], bucket[0][1],
+                       bucket[1][0], bucket[1][1], in_layers_sum);
+        if (fine_samples > 0) {
+            std::fprintf(stderr,
+                           "[prefill-probe] gdn-mixer fine (per sampled layer, n=%zu): nc=%.3f "
+                           "proj=%.3f rec=%.3f norm=%.3f out=%.3f (ms)\n",
+                           fine_samples, fine[0] / static_cast<double>(fine_samples),
+                           fine[1] / static_cast<double>(fine_samples),
+                           fine[2] / static_cast<double>(fine_samples),
+                           fine[3] / static_cast<double>(fine_samples),
+                           fine[4] / static_cast<double>(fine_samples));
+        }
+        std::fflush(stderr);
+        destroy_cur();
+    }
+    ~PrefillProbe() { destroy_cur(); }
+    PrefillProbe& operator=(PrefillProbe&&) = delete;
+
+  private:
+    static void elapsed(double& out, cudaEvent_t a, cudaEvent_t b) {
+        out = 0;
+        if (a == nullptr || b == nullptr) { return; }
+        float ms = 0.0f;
+        if (cudaEventElapsedTime(&ms, a, b) == cudaSuccess) { out = static_cast<double>(ms); }
+    }
+    void destroy_cur() {
+        if (cur.begin) { cudaEventDestroy(cur.begin); }
+        if (cur.pre) { cudaEventDestroy(cur.pre); }
+        if (cur.post) { cudaEventDestroy(cur.post); }
+        if (cur.end) { cudaEventDestroy(cur.end); }
+        for (auto& e : cur.bounds) { cudaEventDestroy(e); }
+        for (auto& e : cur.fine_bounds) { cudaEventDestroy(e); }
+        cur = Chunk{};
+    }
+};
+PrefillProbe g_prefill_probe;
+
 void copy_i32(const std::int32_t* source, Tensor& destination, cudaStream_t stream) {
 
     if (source == nullptr || destination.dtype != DType::I32 || !destination.is_contiguous() ||
@@ -1165,9 +1367,11 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
     Tensor g           = control.g;
     Tensor beta        = control.beta;
     const bool fine = g_decode_step_probe.gdn_fine_begin(s);
+    const bool pfine = ph == Phase::Prefill && g_prefill_probe.gdn_fine_begin(s);
     const InputBasis projection_basis = gdn_norm_control(x, w.input_norm, config_.rms_norm_eps, p,
                                                          h, g, beta, work_, ctx_.execution_view());
     if (fine) { g_decode_step_probe.gdn_fine_mark(s); }
+    if (pfine) { g_prefill_probe.gdn_fine_mark(s); }
 
     const auto projection = workspace::gdn_projection(work_, config_, T);
     Tensor z  = projection.output_gate.view({dimension(config_.gdn->linear_value_head_dim),
@@ -1227,6 +1431,7 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
         ops::causal_conv1d_silu_split(qkv, p.convolution, conv_state_in, conv_state_out, qc, kc, vc,
                                       s);
     }
+    if (pfine) { g_prefill_probe.gdn_fine_mark(s); }
 
     Tensor q_recurrent = qc.view({dimension(config_.gdn->linear_key_head_dim),
                                   dimension(config_.gdn->linear_num_key_heads), T});
@@ -1289,6 +1494,7 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
             ctx_.execution_view());
     }
     if (fine) { g_decode_step_probe.gdn_fine_mark(s); }
+    if (pfine) { g_prefill_probe.gdn_fine_mark(s); }
 
     Tensor on = workspace::gdn_normalized_output(work_, config_, T)
                     .view({dimension(config_.gdn->linear_value_head_dim),
@@ -1298,14 +1504,18 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
         ops::gated_rmsnorm_hadamard(o, p.norm, z, config_.rms_norm_eps, p.output.hadamard_signs,
                                     normalized, s);
         if (fine) { g_decode_step_probe.gdn_fine_mark(s); }
+        if (pfine) { g_prefill_probe.gdn_fine_mark(s); }
         project_add(normalized, p.output, x, work_, s, InputBasis::Rotated);
         if (fine) { g_decode_step_probe.gdn_fine_mark(s); }
+        if (pfine) { g_prefill_probe.gdn_fine_mark(s); }
         return;
     }
     ops::gated_rmsnorm(o, p.norm, z, config_.rms_norm_eps, on, ctx_.execution_view());
     if (fine) { g_decode_step_probe.gdn_fine_mark(s); }
+    if (pfine) { g_prefill_probe.gdn_fine_mark(s); }
     project_add(normalized, p.output, x, work_, s);
     if (fine) { g_decode_step_probe.gdn_fine_mark(s); }
+    if (pfine) { g_prefill_probe.gdn_fine_mark(s); }
 }
 
 ops::SparseMoeHints TextContext::next_projection_hints(int layer) const {
@@ -1360,7 +1570,9 @@ void TextContext::run_stage_layers(std::size_t stage, Tensor& x, Phase ph, Tap& 
     const bool prefill      = ph == Phase::Prefill;
     const std::uint32_t end = parameters_.text.stage_end(stage);
     const bool layer_probe  = g_decode_step_probe.enabled && !prefill && !capturing(ctx_.stream);
+    const bool prefill_probe = prefill && g_prefill_probe.enabled && !capturing(ctx_.stream);
     if (layer_probe) { g_decode_step_probe.begin_layers(ctx_.stream); }
+    if (prefill_probe) { g_prefill_probe.begin_layers(ctx_.stream); }
     for (std::uint32_t layer = parameters_.text.stage_begin[stage]; layer < end; ++layer) {
         const auto& block  = parameters_.text.layers[layer];
         const bool full    = config_.layer_types[layer] == MixerKind::FullAttention;
@@ -1387,6 +1599,7 @@ void TextContext::run_stage_layers(std::size_t stage, Tensor& x, Phase ph, Tap& 
                 }
             }
             if (layer_probe) { g_decode_step_probe.mid_layer(ctx_.stream); }
+            if (prefill_probe) { g_prefill_probe.mid_layer(ctx_.stream); }
             {
                 nvtx::ScopedRange range(prefill ? nvtx::Name::PrefillPostMixer
                                                 : nvtx::Name::VerifyPostMixer,
@@ -1401,6 +1614,9 @@ void TextContext::run_stage_layers(std::size_t stage, Tensor& x, Phase ph, Tap& 
             }
             if (layer_probe) {
                 g_decode_step_probe.end_layer(ctx_.stream, full ? 1 : 0);
+            }
+            if (prefill_probe) {
+                g_prefill_probe.end_layer(ctx_.stream, full ? 1 : 0);
             }
             if constexpr (Tap::enabled) {
                 tap.capture_layer(static_cast<int>(layer), x, ctx_.stream);
@@ -1723,6 +1939,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
         const bool is_last = finalize_at_end && (t0 + len == T);
         nvtx::ScopedRange chunk_range(nvtx::Name::PrefillChunk, nvtx::Category::Prefill,
                                       static_cast<std::uint64_t>(len));
+        if (g_prefill_probe.enabled) { g_prefill_probe.begin_chunk(static_cast<std::size_t>(len), s); }
 
         {
             std::vector<std::int32_t> local_scatter_indices;
@@ -1811,6 +2028,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
             if constexpr (requires { tap.capture_positions(positions, s); }) {
                 tap.capture_positions(positions, s);
             }
+            if (g_prefill_probe.enabled) { g_prefill_probe.enter_tail(s); }
 
             Tensor xf = prefill_hidden_.data != nullptr
                             ? matrix_window(prefill_hidden_, len)
@@ -1934,6 +2152,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                                            cudaMemcpyDeviceToDevice, s));
             }
         }
+        if (g_prefill_probe.enabled) { g_prefill_probe.leave_chunk(s); }
 
         if constexpr (requires { tap.consume_prefill_chunk(len, false); }) {
             work_.reset();
@@ -1954,6 +2173,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
         timing.include({.gpu_elapsed_ns = static_cast<std::uint64_t>(
                             static_cast<double>(prefill_gpu_timer_->elapsed_ms()) * 1.0e6 + 0.5)});
     }
+    if (g_prefill_probe.enabled) { g_prefill_probe.finish(); }
     work_.reset();
     return PrefillChunkResult{.processed_tokens = static_cast<std::uint32_t>(t0),
                               .finalized        = finalize_at_end && t0 == T,
