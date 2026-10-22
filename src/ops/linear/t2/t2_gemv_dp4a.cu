@@ -83,14 +83,13 @@ namespace {
 struct Dp4aShape {
     std::int32_t n;
     std::int32_t k;
-    std::int32_t tile; // groups per warp tile of the GEMV schedule
 };
 
-// The registered decode shapes (t2_dispatch's switch), with the cal12 tile winner.
+// The registered decode shapes (t2_dispatch's switch).
 constexpr Dp4aShape kDp4aShapes[] = {
-    {34816, 5120, 16},   {6144, 5120, 32},   {1024, 5120, 32},  {4096, 5120, 32},
-    {7168, 5120, 32},    {12288, 5120, 32}, {14336, 5120, 32}, {16384, 5120, 32},
-    {131072, 5120, 16}, {248320, 5120, 16}, {5120, 6144, 32},  {5120, 17408, 32},
+    {34816, 5120}, {6144, 5120},   {1024, 5120},   {4096, 5120},
+    {7168, 5120}, {12288, 5120},  {14336, 5120},  {16384, 5120},
+    {131072, 5120}, {248320, 5120}, {5120, 6144},  {5120, 17408},
 };
 
 const Dp4aShape* find_dp4a_shape(std::int32_t n, std::int32_t k) {
@@ -100,19 +99,22 @@ const Dp4aShape* find_dp4a_shape(std::int32_t n, std::int32_t k) {
     return nullptr;
 }
 
-template <class Schedule>
-void launch_dp4a_gemv(const Dp4aShape& shape, const Weight& w, Tensor& out,
-                       const std::uint8_t* xq, const std::uint16_t* xs, std::int32_t k,
-                       cudaStream_t stream) {
+// The mmvq schedule (t2_gemv_dp4a.cuh): 2 rows per thread in 2-warp CTAs. cal17 measured it
+// faster than the staged row-quad on every registered shape at identical bits, so it
+// replaces the per-shape tile picks of the cal12 sweep.
+constexpr int kMmvqRowsPerThread = 2;
+constexpr int kMmvqWarpsPerCta   = 2;
+
+void launch_dp4a_gemv(const Weight& w, Tensor& out, const std::uint8_t* xq,
+                       const std::uint16_t* xs, std::int32_t k, cudaStream_t stream) {
     const std::int32_t rows = out.ne[0];
-    const dim3 grid(static_cast<unsigned>((rows + Schedule::kRowsPerCta - 1) /
-                                            Schedule::kRowsPerCta));
-    const dim3 block(static_cast<unsigned>(Schedule::kThreads), 1u, 1u);
-    t2_gemv_dp4a_kernel<Schedule><<<grid, block, 0, stream>>>(
+    const int rows_per_cta = kMmvqRowsPerThread * kMmvqWarpsPerCta;
+    const dim3 grid(static_cast<unsigned>((rows + rows_per_cta - 1) / rows_per_cta));
+    const dim3 block(static_cast<unsigned>(32 * kMmvqWarpsPerCta), 1u, 1u);
+    t2_gemv_dp4a_mmvq_kernel<kMmvqRowsPerThread, kMmvqWarpsPerCta><<<grid, block, 0, stream>>>(
         xq, xs, static_cast<const std::uint8_t*>(w.qdata),
         static_cast<const std::uint8_t*>(w.scales), static_cast<__nv_bfloat16*>(out.data), rows,
         k);
-    (void)shape;
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -161,13 +163,7 @@ void t2_gemv_dp4a_run_prepared(const T2Dp4aActivation& activation, const Weight&
     if (shape == nullptr) { invalid("t2 dp4a: unregistered shape"); }
     if (shape->k != activation.k) { invalid("t2 dp4a: activation width does not match the weight"); }
     if (out.ne[0] != shape->n) { invalid("t2 dp4a: destination rows do not match the weight"); }
-    if (shape->tile == 16) {
-        launch_dp4a_gemv<T2GemvDp4aWord16Schedule>(*shape, w, out, activation.xq, activation.xs,
-                                                     activation.k, stream);
-    } else {
-        launch_dp4a_gemv<T2GemvDp4aWord32Schedule>(*shape, w, out, activation.xq, activation.xs,
-                                                     activation.k, stream);
-    }
+    launch_dp4a_gemv(w, out, activation.xq, activation.xs, activation.k, stream);
 }
 
 std::size_t t2_gemv_dp4a_scratch_bytes(std::int32_t k) {

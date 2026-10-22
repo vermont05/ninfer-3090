@@ -224,6 +224,39 @@ mis-accounts under graph replay (its events sit inside captured graphs — the
 graph-run tail printed garbage buckets: steps=5, layers=77.53 ms, fine n=1); keep
 --no-cuda-graph for any bucket-level probing, graphs-on for wall/throughput.
 
+## Phase 5 — next decode levers (external review 2026-10-21, supersedes the Phase-4 tail)
+
+Source: a second Claude session read the plan + kernel and cross-checked the Oct-15 Prism
+tuning session (`~/.claude/.claude-config ... /memory/prism-tuning-history.md`, transcript
+`eb57dc99-…`). Decisions accepted from that review; the Prism **runtime stays unrun** (standing
+rule — it is read for design only).
+
+- **The GEMV gap is a schedule problem, not a code-unpacking problem.** Prism's PQ2_0 matvec on
+  this card hits ~268 GB/s (~93 % of the 288 GB/s class) with the *same* perm-codec family
+  (its `q2_0_symbols4_hip` ≈ `t2_gemv_sym4`); NInfer's dp4a gate_up runs ~63 % (247 µs vs 171 floor,
+  cal11). Prism's win was the schedule: 4 rows per thread reusing activation loads, 2 warps,
+  int8 activations in blocks of 32 with one scale each. So the earlier "~30 ALU ops vs 4 dp4a
+  per word — attack the unpack" idea is **closed as a lever**; the schedule is what to move.
+  cal15's 2/4-rows NO-GO does not cover this: it kept NInfer's per-word scale handling and
+  compared against the staged kernel, not the mmvq schedule.
+- **Next cal candidate (cal16): port the mmvq schedule** (rows=4, nwarps=2) as a standalone on
+  the NInfer shapes, standalone-harness first, against the shipped dp4a kernel's cal numbers.
+  If it lands near Prism's 93 %, the ~35 ms of GEMV in the 58.8 ms step shrinks a third →
+  ~19.5-20+ t/s territory. Design read from Prism is allowed; A/B is always NInfer-vs-NInfer.
+- **attn_mixer (9.31 ms/step) has never been broken down.** ~0.58 ms/layer vs gdn mixer's 0.34,
+  while its two GEMVs are ~0.1 ms — ~0.45 ms/layer unexplained. Suspect: the same `mma.cuh`
+  shuffle emulation that prefill uses (and whose `bcast_pair_t` bug was fixed 2026-10-21 —
+  all Phase-4 buckets are **pre-fix evidence**, re-measure before quoting).
+- **Trace before choosing.** One `rocprofv3 --kernel-trace --stats` over a few decode steps
+  (GPU idle, lock held) gives per-kernel time + inter-launch gaps and sizes the fusions
+  (norm+quantize, swiglu+quantize). Prism's whole tuning ladder came from exactly this.
+- Prism's ladder for reference (19.77 → 23.65 t/s): matvec schedule retune +9 %, graphs off
+  −2 %, FWHT-writes-int8-input (no separate quantize), DeltaNet in-place state read, gate/up
+  fusion, RMS-norm fused into FWHT. The transferable ones for NInfer: quantize fused into the
+  norm/rotation kernel, and the in-place state read idea.
+
+Suggested order: kernel trace → cal16 (mmvq schedule) → attn_mixer breakdown → fusions.
+
 ## Verification protocol (every step)
 
 - Server: the NINFER_T2_DECODE=simt / NINFER_T2_I8_SMALL=off launch recipe + ROCR_VISIBLE_DEVICES=1
@@ -239,3 +272,69 @@ graph-run tail printed garbage buckets: steps=5, layers=77.53 ms, fine n=1); kee
 - Re-run cal2-6 sweeps (family exhausted, memory `gemv-word-path-plateau`).
 - Touch prefill (explicitly deferred by user).
 - Trust any run with the default T2 dispatch env (4.3x trap).
+
+## Correction + RDNA3-native roadmap (2026-10-21, review against Prism)
+
+**ISA correction:** the survey above lists `v_wmma_i32_*_i8` as rejected. The RDNA3 instruction is
+`v_wmma_i32_16x16x16_iu8`, which does not appear in that survey; a wrong mnemonic is the likeliest
+reason. Prism's prefill matmul uses it on this card
+(`__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32`, `~/src/llama.cpp-prism-tune/ggml/src/ggml-cuda/mma.cuh`,
+RDNA3 branch) and reaches 17.8 TOPS. The Phase 1 NO-GO was rocwmma's `load_matrix_sync`, not WMMA:
+llama.cpp's `mma.cuh` calls the builtins directly with documented RDNA3 register layouts. Copy those.
+
+**Layout pinned (verified 2026-10-21, `.qual/wmma/cal16{c,e,f}.cu`):** the read units are whole
+16-byte per-lane tuples; byte probes (cal16c) show every slot is atomic, and dual-sparse probes
+(cal16e) pin the pairing exactly: `C(lane l, word w) = dot(Awin[(l<16?0:17)+2w], Bwin[l])`, byte-identical
+pairing. Loader: Bwin slot l = A row l (dup at l+16); Awin window 2c (c<8) / 17+2(c−8) = B column c
+(byte k = B[k][c]); product lands at `(A·B)(l&15, (l>=16?8:0)+w)`. Battery of 10 random/identity
+cases passes (cal16f). Instruction-bound ceiling: ~58.4 TOPS (cal16 peak, 64 blocks × 32 warps ×
+16 chains) — 3.3× Prism's end-to-end 17.8 TOPS, so schedule, not instruction support, is the gap.
+
+**Prism decode reference (same card, same model, 2026-10-15):** the PQ2_0 matvec runs at ~268 GB/s
+(93 % of 288) with the *same* perm codec as `t2_gemv_sym4`. The win was the schedule: 4 rows per
+thread reusing activation loads, 2 waves per block. NInfer's dp4a gate_up is ~63 % (247 vs 171 us).
+History: memory `prism-tuning-history`.
+
+Where to drop the CUDA shape, ranked by estimated win:
+
+1. **Prefill:** replace the shuffle emulation of `mma.sync`/`ldmatrix` (`src/ops/common/mma.cuh`)
+   with native iu8 WMMA tiles (ternary -> int8 via perm, int8 activations). ~20 -> 200-300 tok/s.
+2. **Decode GEMV:** Prism's mmvq schedule (4 rows/thread, x in registers, 2 waves, scale once per
+   group). ~10 ms/token, ~17.5 -> ~23 t/s.
+3. **int8 + per-128-scale as the inter-kernel activation format:** norm rotates and quantizes once;
+   every GEMV sharing that input (qkv, z, gate/up) reads it. 2-4 ms.
+4. **Fixed-shape fusions only a single-model engine can do:** DeltaNet prologue (conv + l2norm +
+   alpha/beta + gate), norm+rotate+quantize, swiglu+quantize; stretch: one persistent kernel per
+   layer. 3-6 ms.
+5. **Small-T verify on 16-wide WMMA tiles:** verifying 2-16 tokens costs about one; enables n-gram
+   copy drafting without a draft model (Prism + ngram-simple: whole-file edit 22 -> 61 t/s).
+6. **Attention decode:** unprofiled, 0.58 ms/layer (more than a whole GDN mixer); RDNA3 split-K kernel.
+7. **No cp.async on RDNA3:** hide latency with occupancy; 128 KB LDS/WGP and a 32 MB Infinity Cache
+   (GDN state 3.1 MB/layer fits) should shape items 1-2.
+
+Before any of it: one `rocprofv3 --kernel-trace --stats` decode run to confirm the GEMV share.
+The "Touch prefill" Do-Not above is superseded: prefill is the current thrust (`remaining-work.md` §3).
+
+## Phase 5 landing — mmvq decode GEMV (2026-10-21, cal17)
+
+cal17 (`.qual/gemv/cal17.cu`) ported the mmvq schedule onto the T2 RowSplit layout and it
+wins on every registered shape at bit-identical output: each warp owns R consecutive rows
+and strides the FULL group range (one 128-group per step: `(lane>>3)` picks the group slot,
+`(lane&7)` the slice), so one activation load feeds R code chains. The earlier cal16-era
+probe mis-partitioned groups per warp (each warp got a disjoint subset, no cross-warp
+combine) — that shape is invalid; the fixed schedule matches the shipped staged control
+bit-for-bit (cal17 battery, 8 shapes x 8 variants, all `ok`).
+
+Standalone (cal17, idle card, best of 9x5, vs staged control): m2w2 (2 rows/thread, 2-warp
+CTAs) is the uniform winner — gate_up 185.6 vs 251.9 us (1.36x), xl 671.9 vs 951.3 (1.41x),
+xxl 1280.5 vs 1847.4 (1.44x), attn_small 14.1 vs 34.2 (2.6x); R=4 always loses to R=2. It is
+now the shipped T=1 dp4a route for all 12 kDp4aShapes (t2_gemv_dp4a.cu; the staged row-quad
+stays in the header, unrouted).
+
+Shipped-path measurement (same recipe as the Phase 4 fold note):
+- step probe (--no-cuda-graph): step total **58.8 -> 54.4 ms** (gdn_mixer 16.6, gdn_mlp 20.6,
+  attn_mixer 9.2, attn_mlp 6.7; head/embed flat), steady over 320 steps;
+- decode: no-graph **16.9-17.0 -> 18.2 t/s**; graphs-on **17.3-17.4 -> 18.7 t/s** (two 64-token
+  temperature-0 legs, identical content, valid output).
+The GEMV share of the step moved from ~63 % of the memcpy-class floor toward Prism's ~93 %
+class on the big shapes; the next biggest unexplained bucket is still attn_mixer (9.2 ms).
