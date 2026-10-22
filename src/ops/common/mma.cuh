@@ -68,8 +68,10 @@ __device__ __forceinline__ unsigned bcast_pair_t(std::uintptr_t addr, unsigned b
     const std::uintptr_t r0 = bcast_ptr(addr, base + row_pair);
     const std::uintptr_t r1 = bcast_ptr(addr, base + row_pair + 1u);
     const unsigned col = lane() >> 2;
-    return static_cast<unsigned>(*reinterpret_cast<const std::uint16_t*>(r0) + col) |
-           (static_cast<unsigned>(*reinterpret_cast<const std::uint16_t*>(r1) + col) << 16);
+    return static_cast<unsigned>(*reinterpret_cast<const std::uint16_t*>(
+               r0 + static_cast<std::uintptr_t>(col) * 2u)) |
+           (static_cast<unsigned>(*reinterpret_cast<const std::uint16_t*>(
+                r1 + static_cast<std::uintptr_t>(col) * 2u)) << 16);
 }
 
 // --- element codecs ---------------------------------------------------------------------------

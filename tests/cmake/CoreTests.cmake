@@ -23,17 +23,19 @@ ninfer_add_test(ninfer_device_buffer_visibility_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_device_buffer_visibility.cu"
   LIBRARIES ninfer_core)
 
-ninfer_add_test(ninfer_vmm_graph_remap_test
-  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_vmm_graph_remap.cu"
-  LIBRARIES ninfer_core CUDA::cuda_driver)
+# Fragment-layout qualification of the SIMT ldmatrix references (ops/common/mma.cuh).
+ninfer_add_test(ninfer_mma_ldmatrix_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_mma_ldmatrix.cu"
+  LIBRARIES ninfer_core)
+set_tests_properties(ninfer_mma_ldmatrix_test PROPERTIES SKIP_RETURN_CODE 77)
 
 ninfer_add_test(ninfer_suspend_memory_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_suspend_memory.cu"
-  LIBRARIES ninfer_core CUDA::cuda_driver)
+  LIBRARIES ninfer_core ${NINFER_DRIVER_TARGET})
 
 ninfer_add_test(ninfer_evictable_kv_pool_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_evictable_kv_pool.cu"
-  LIBRARIES ninfer_core CUDA::cuda_driver)
+  LIBRARIES ninfer_core ${NINFER_DRIVER_TARGET})
 
 ninfer_add_test(ninfer_evictable_weight_pool_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_evictable_weight_pool.cu"
@@ -42,11 +44,19 @@ ninfer_add_test(ninfer_evictable_weight_pool_test
 set_tests_properties(
   ninfer_arena_ranks_test
   ninfer_device_buffer_visibility_test
-  ninfer_vmm_graph_remap_test
   ninfer_suspend_memory_test
   ninfer_evictable_kv_pool_test
   ninfer_evictable_weight_pool_test
   PROPERTIES SKIP_RETURN_CODE 77)
+
+# The VMM remap test is written against the NVIDIA driver API (it includes cuda.h and calls
+# cuMemMap-family entry points); the HIP backend has neither, so the test is not built there.
+if(NOT NINFER_BACKEND STREQUAL "hip")
+  ninfer_add_test(ninfer_vmm_graph_remap_test
+    SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_vmm_graph_remap.cu"
+    LIBRARIES ninfer_core CUDA::cuda_driver)
+  set_tests_properties(ninfer_vmm_graph_remap_test PROPERTIES SKIP_RETURN_CODE 77)
+endif()
 
 ninfer_add_test(ninfer_device_test       SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_device.cpp"
   LIBRARIES ninfer_core)
