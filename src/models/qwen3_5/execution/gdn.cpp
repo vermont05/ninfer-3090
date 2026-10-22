@@ -19,23 +19,20 @@ std::int32_t projection_input_rows(const ops::ProjectionWeights& projection) {
 }
 
 // The native overlap contract takes a disjoint span even for a zero-scratch fused route.
-std::size_t snapshot_scratch_bytes(const GdnParameters& parameters, const GdnConfig& config,
-                                   std::int32_t batch, std::int32_t first_width,
-                                   std::int32_t last_width) {
+std::size_t snapshot_scratch_bytes(const GdnParameters& parameters, std::int32_t batch,
+                                    std::int32_t first_width, std::int32_t last_width) {
     std::size_t bytes;
     if (const auto* pair = std::get_if<ops::PairedProjectionWeights>(&parameters.projection)) {
         bytes = ops::gdn_input_proj_split_conv_snapshot_workspace_capacity_bytes(
             pair->first.qtype, pair->second.qtype, pair->policy, batch, first_width, last_width);
-    } else if (const auto& single = std::get<LinearParameters>(parameters.projection);
-               single.weight.qtype != QType::Q8_G32_FP16) {
-        const auto& w = single.weight;
-        bytes         = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-            w.qtype, w.n, w.k, single.policy, batch, first_width, last_width);
     } else {
+        // The policy-bearing single-parent query admits every registered profile,
+        // Q8 included, and sizes the integer-activation scratch from the same
+        // policy the exec runs with.
+        const auto& single = std::get<LinearParameters>(parameters.projection);
+        const auto& w      = single.weight;
         bytes = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-            static_cast<std::int32_t>(config.key_width()),
-            static_cast<std::int32_t>(config.key_width()),
-            static_cast<std::int32_t>(config.value_width()), batch, first_width, last_width);
+            w.qtype, w.n, w.k, single.policy, batch, first_width, last_width);
     }
     return std::max(std::size_t{1}, bytes);
 }
@@ -89,7 +86,7 @@ std::size_t gdn_snapshot_workspace_bytes(const GdnParameters& parameters, const 
     return rotated_workspace_bytes(
         projection_signs(parameters.projection), projection_input_rows(parameters.projection),
         std::max(batch, 1) * last_width,
-        snapshot_scratch_bytes(parameters, config, batch, first_width, last_width));
+        snapshot_scratch_bytes(parameters, batch, first_width, last_width));
 }
 
 std::size_t gdn_record_workspace_bytes(const GdnParameters& parameters, const GdnConfig& config,
@@ -147,7 +144,7 @@ void gdn_projection_snapshot(const Tensor& hidden, const GdnParameters& paramete
     const Tensor x =
         rotated_input(hidden, projection_signs(parameters.projection), workspace, stream, basis);
     WorkspaceArena scratch(workspace.alloc_bytes(
-        snapshot_scratch_bytes(parameters, config, hidden.ne[2], hidden.ne[1], hidden.ne[1])));
+        snapshot_scratch_bytes(parameters, hidden.ne[2], hidden.ne[1], hidden.ne[1])));
     if (const auto* pair = std::get_if<ops::PairedProjectionWeights>(&parameters.projection)) {
         ops::gdn_input_proj_conv_snapshot(
             x, pair->first, pair->second, parameters.convolution, conv_states, valid_columns,

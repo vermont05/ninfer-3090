@@ -522,7 +522,16 @@ int main() {
     failures += run_q4_q5();
     failures += run_t2();
     failures += run_q8();
+#if !defined(NINFER_BACKEND_HIP)
+    // The record path's NVFP4 A16 schedules ask for >64 KiB of dynamic shared memory per
+    // block (up to 73 KiB); the HIP backend's per-block limit is 64 KiB, so the schedule's
+    // one-time cudaFuncSetAttribute fails there and CUDA_CHECK aborts the process before
+    // any case can report a skip. The snapshot variant has its own narrow kernels and is
+    // unaffected.
     failures += run_nvfp4();
+#else
+    std::cout << "SKIP gdn_input_proj_conv_record NVFP4: HIP backend\n";
+#endif
     failures += run_fp8();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_input_proj_conv_record\n";
     return failures == 0 ? 0 : 1;

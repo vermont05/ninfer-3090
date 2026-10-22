@@ -306,15 +306,29 @@ void validate_policy(LinearPolicy policy) {
     throw std::invalid_argument("gdn_input_proj: invalid compute policy");
 }
 
-// No single-parent qtype registers an integer-activation route, and their resolvers reject a
-// policy they do not know, so the integer policies read as A16Only here.
+// Folds the integer policies into A16Only for the resolvers that do not take a policy;
+// the Q8 byte-dot decode admission is computed from the original policy by the callers
+// before this normalisation.
 LinearPolicy without_integer(LinearPolicy policy) {
     return allows_a8_int(policy) ? LinearPolicy::A16Only : policy;
+}
+
+// The byte-dot decode scratch for a policy-bearing Q8 query: nonzero only when the
+// call's policy admits the integer-A8 route and that route is live in this build.
+// Declined calls run the A16 schedules and bump no scratch, and the decode launches
+// gate on exactly this conjunction, so the queries and execs stay contract-equal.
+std::size_t q8_dp4a_scratch_bytes(LinearPolicy policy) {
+    if (!allows_a8_int(policy) || !detail::q8_gdn_input_dp4a_route_live()) { return 0; }
+    return detail::q8_gdn_input_dp4a_scratch_bytes();
 }
 
 void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                             LinearPolicy policy, WorkspaceArena* workspace, cudaStream_t stream) {
     validate_policy(policy);
+    // The Q8 decode route's byte-dot path is an integer-A8 route: it is admitted or
+    // declined from the caller's policy before the normalisation below folds the
+    // integer policies into A16Only for the resolvers that do not take a policy.
+    const bool allow_integer_route = allows_a8_int(policy);
     policy = without_integer(policy);
     const std::int32_t cols = x.ne[1];
     if (cols <= 0) { throw std::invalid_argument("gdn_input_proj: T must be positive"); }
@@ -362,7 +376,7 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& qkv, 
     require_matrix(z, kZRows, cols, "z");
     require_single_parent_nonoverlap(x, qkv, z);
     require_q8_rowsplit(weight, kRows, "query/key/value/z weight");
-    detail::q8_gdn_input_dispatch(x, weight, qkv, z, workspace, stream);
+    detail::q8_gdn_input_dispatch(x, weight, qkv, z, allow_integer_route, workspace, stream);
 }
 
 // The Q4/Q5 conv forms always materialize the projection through gdn_input_proj() and run the conv
@@ -574,7 +588,8 @@ void dispatch_single_parent_snapshot(const Tensor& x, const Weight& weight,
     if (plan.schedule == detail::Q8GdnInputConvScheduleId::DecodeFused) {
         detail::q8_gdn_input_decode_conv_snapshot_launch(
             x, weight, conv_weight, conv_states, valid_columns, initial_state_slots,
-            snapshot_base_slots, query, key, value, z, &workspace, stream);
+            snapshot_base_slots, query, key, value, z, allows_a8_int(policy), &workspace,
+            stream);
         return;
     }
     if (plan.schedule == detail::Q8GdnInputConvScheduleId::SplitKMmaFused) {
@@ -976,9 +991,12 @@ std::size_t gdn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int
             {input_rows, 8192, 4096, parent_rows, input_rows, min_tokens});
         (void)detail::q8_gdn_input_resolve_plan(
             {input_rows, 8192, 4096, parent_rows, input_rows, max_tokens});
-        // The T=1 leg of the interval takes the byte-dot decode route, which bumps its
-        // quantised x plane from this call's arena scope.
-        return detail::q8_gdn_input_dp4a_scratch_bytes();
+        // Only the T=1 leg of the interval can bump the byte-dot route's quantised
+        // x plane from this call's arena scope, and only when the policy admits the
+        // route and the route is live in this build; declined calls and intervals
+        // that start above 1 run the wider A16 schedules, which take no transient.
+        if (min_tokens > 1) { return 0; }
+        return q8_dp4a_scratch_bytes(policy);
     }
     throw std::invalid_argument("gdn_input_proj workspace: unsupported parent profile");
 }
@@ -1025,9 +1043,10 @@ std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
         (void)resolve_q8_conv_plan(max_width, 1);
         if (max_width >= 17) { largest_materialized_width = max_width; }
     }
-    // The DecodeFused leg (width 1) bumps its quantised x plane from this call's arena
-    // scope; the materialized legs above already carry their projected plane.
-    if (largest_materialized_width == 0) { return detail::q8_gdn_input_dp4a_scratch_bytes(); }
+    // The Q8 fused routes (decode and split-K) take no transient at this profile's
+    // policy: the byte-dot scratch belongs to the policy-bearing query, and the
+    // materialized legs above already carry their projected plane.
+    if (largest_materialized_width == 0) { return 0; }
     WorkspaceLayoutBuilder layout;
     (void)allocate_projected_workspace(layout, channels, largest_materialized_width);
     return layout.peak_bytes(1);
@@ -1038,6 +1057,24 @@ std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
     std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width) {
     validate_policy(policy);
     require_snapshot_capacity_domain(batch_size, min_width, max_width);
+    if (parent_qtype == QType::Q8_G32_FP16 && parent_rows == 12288 && input_rows == 2048) {
+        // Mirrors the shape-only Q8 query: B=2..8 is always composed and takes no
+        // extra scratch (its projection runs the A16 convenience route); B=1 adds
+        // the byte-dot decode scratch only when the policy admits that route and
+        // the interval reaches width 1, the only width whose route bumps it.
+        if (batch_size > 1) {
+            (void)resolve_q8_conv_plan(min_width, batch_size);
+            (void)resolve_q8_conv_plan(max_width, batch_size);
+            return composed_snapshot_capacity(8192, batch_size * max_width, 0);
+        }
+        (void)resolve_q8_conv_plan(min_width, 1);
+        (void)resolve_q8_conv_plan(max_width, 1);
+        const std::size_t scratch = min_width <= 1 ? q8_dp4a_scratch_bytes(policy) : 0;
+        if (max_width < 17) { return scratch; }
+        WorkspaceLayoutBuilder layout;
+        (void)allocate_projected_workspace(layout, 8192, max_width);
+        return std::max(scratch, layout.peak_bytes(1));
+    }
     if (parent_qtype == QType::FP8_E4M3FN_ROW_BF16 &&
         parent_rows == detail::Fp8N16384K5120::kOutputRows &&
         input_rows == detail::Fp8N16384K5120::kInputRows) {

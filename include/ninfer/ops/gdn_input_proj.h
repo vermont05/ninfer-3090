@@ -69,7 +69,10 @@ gdn_input_proj_split_workspace_capacity_bytes(QType qk_qtype, std::int32_t qk_ro
  *   [2048,2048,6144,6144].
  *
  * The first three ranges are written contiguously to qkv and the final range is written to z.
- * Q8 uses A16 under every policy. NVFP4 uses A16 under A16Only/AllowA8; AllowA4 permits
+ * Q8 runs the A16 schedules under A16Only; under an integer-A8 policy (AllowA8Int,
+ * AllowA8IntDecode or AllowPrefillCublas) its single-token route may quantize the activation
+ * into a private scratch plane carved from the call workspace (ROCm builds; the byte-dot
+ * route declines when NINFER_Q8_DP4A=off). NVFP4 uses A16 under A16Only/AllowA8; AllowA4 permits
  * private activation quantization at every positive T. FP8 accepts all policies; AllowA8/AllowA4
  * selects A16 through T=7 and private activation quantization followed by A8 Tensor Core
  * contraction at every T>=8. Every route writes the two independent final allocations directly.
@@ -101,7 +104,9 @@ void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Ten
  * snapshot profile. `batch_size` is exact and the query covers every W in the inclusive width
  * interval. B=1 preserves the format-specific fused/composed resolver. B=2..8 uses aggregate
  * projection plus one BF16 [C,B*W] projected plane. The query throws for an unregistered row
- * profile or unsupported B/W domain.
+ * profile or unsupported B/W domain. It sizes the A16-only convenience execs: the Q8 answer
+ * carries no byte-dot scratch (an integer-policy caller asks the policy-bearing overload
+ * below instead).
  */
 [[nodiscard]] std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
     std::int32_t query_rows, std::int32_t key_rows, std::int32_t value_rows,
@@ -126,10 +131,13 @@ void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Ten
     std::int32_t min_width, std::int32_t max_width);
 
 /**
- * Returns the transient capacity for a registered [16384,5120] NVFP4 or row-scaled FP8 snapshot
- * profile. `batch_size` is exact and the query covers every W in the inclusive width interval.
- * B=1 preserves the format-specific fused/materialized resolver; B=2..8 covers its aggregate
- * projection mechanism plus any projected BF16 plane selected by the complete-Op plan.
+ * Returns the transient capacity for a registered [16384,5120] NVFP4, row-scaled FP8, or Q8
+ * [12288,2048] snapshot profile. `batch_size` is exact and the query covers every W in the
+ * inclusive width interval. B=1 preserves the format-specific fused/materialized resolver;
+ * B=2..8 covers its aggregate projection mechanism plus any projected BF16 plane selected by
+ * the complete-Op plan. For Q8 the answer additionally carries the byte-dot decode scratch
+ * when `policy` admits the integer-A8 route (and that route is live in this build); the B=1
+ * fused leg of an interval reaching width 1 can bump it.
  */
 [[nodiscard]] std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
     QType parent_qtype, std::int32_t parent_rows, std::int32_t input_rows, LinearPolicy policy,

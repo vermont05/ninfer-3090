@@ -174,13 +174,25 @@ std::size_t q8_gdn_input_dp4a_scratch_bytes() noexcept { return kDp4aScratchByte
 std::size_t q8_gdn_input_dp4a_scratch_bytes() noexcept { return 0; }
 #endif
 
+// Whether this build's decode launches can take the byte-dot route at all: the
+// HIP build with NINFER_Q8_DP4A not "off". Capacity queries read the same predicate
+// the launches gate on, so they size the scratch exactly when the route is live.
+bool q8_gdn_input_dp4a_route_live() noexcept {
+#ifdef NINFER_BACKEND_HIP
+    return dp4a_decode_enabled();
+#else
+    return false;
+#endif
+}
+
 void q8_gdn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
-                                 WorkspaceArena* workspace, cudaStream_t stream) {
+                                 bool allow_integer_route, WorkspaceArena* workspace,
+                                 cudaStream_t stream) {
     constexpr int kRowsPerCta = 8;
     static_assert((8192 % kRowsPerCta) == 0 && (4096 % kRowsPerCta) == 0);
     const Output output{static_cast<__nv_bfloat16*>(qkv.data), static_cast<__nv_bfloat16*>(z.data)};
 #ifdef NINFER_BACKEND_HIP
-    if (workspace != nullptr && dp4a_decode_enabled()) {
+    if (allow_integer_route && workspace != nullptr && dp4a_decode_enabled()) {
         const auto scope = workspace->scope();
         launch_dp4a_gemv(x, weight, output, LinearIdentityEpilogue{},
                          make_dp4a_scratch(workspace->alloc_bytes(kDp4aScratchBytes).data),
@@ -188,6 +200,7 @@ void q8_gdn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor& q
         return;
     }
 #else
+    static_cast<void>(allow_integer_route);
     static_cast<void>(workspace);
 #endif
     launch_q8_a16_gemv<Q8A16GemvSchedule<kRowsPerCta, 1, 2, 2048>>(
@@ -198,8 +211,8 @@ void q8_gdn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor& q
 void q8_gdn_input_decode_conv_snapshot_launch(
     const Tensor& x, const Weight& weight, const Tensor& conv_weight, Tensor& conv_states,
     const Tensor& valid_columns, const Tensor& initial_slot, const Tensor& snapshot_base_slot,
-    Tensor& query, Tensor& key, Tensor& value, Tensor& z, WorkspaceArena* workspace,
-    cudaStream_t stream) {
+    Tensor& query, Tensor& key, Tensor& value, Tensor& z, bool allow_integer_route,
+    WorkspaceArena* workspace, cudaStream_t stream) {
     constexpr int kRowsPerCta = 8;
     const Output ignored_output{static_cast<__nv_bfloat16*>(query.data),
                                 static_cast<__nv_bfloat16*>(z.data)};
@@ -209,7 +222,7 @@ void q8_gdn_input_decode_conv_snapshot_launch(
         static_cast<__nv_bfloat16*>(z.data),
     };
 #ifdef NINFER_BACKEND_HIP
-    if (workspace != nullptr && dp4a_decode_enabled()) {
+    if (allow_integer_route && workspace != nullptr && dp4a_decode_enabled()) {
         const auto scope = workspace->scope();
         launch_dp4a_gemv(x, weight, ignored_output, epilogue,
                          make_dp4a_scratch(workspace->alloc_bytes(kDp4aScratchBytes).data),
@@ -217,6 +230,7 @@ void q8_gdn_input_decode_conv_snapshot_launch(
         return;
     }
 #else
+    static_cast<void>(allow_integer_route);
     static_cast<void>(workspace);
 #endif
     launch_q8_a16_gemv<Q8A16GemvSchedule<kRowsPerCta, 1, 2, 2048>>(

@@ -290,7 +290,9 @@ struct Geometry {
     ColumnDomain domain = ColumnDomain::Text;
 };
 
-constexpr std::array kNewGeometries{
+// Not constexpr: clang rejects an std::initializer_list member inside a constant
+// expression (a pointer to a subobject of a temporary), and nothing here constant-evaluates.
+const std::array kNewGeometries{
     Geometry{48, 2560, {1, 8, 12, 16, 128}},
     Geometry{96, 2560, {1, 4, 16, 128, 512}},
     Geometry{1664, 2560, {1, 16, 48, 64, 96, 128, 512}},
