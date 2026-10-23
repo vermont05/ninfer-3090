@@ -308,8 +308,9 @@ reference.
   through LDS, the sweep does **not** establish whether a *cooperative* LDS-staged loader
   (one block loads a tile into LDS once, all warps read it) would win — that is still open.
   What is settled is only that the tested variants of the *existing per-warp loader* lose.
-- **Lever 1 (GEMM) is characterized and is a NO-GO: the kernel is DRAM-bandwidth-bound at
-  ~80% of the physical ceiling, so there is no meaningful TTFT headroom here**
+- **Lever 1 (GEMM): the int8 GEMM *kernel* is DRAM-bandwidth-bound at ~80% of the ceiling —
+  so speeding up the int8 kernel is not the lever; the int8 *weight stream* is what caps
+  NInfer's prefill**
   (2026-10-22, `.qual/wmma/cal38.cu`; battery bit-exact vs the i8 anchor, cold-L2 medians).
   The device is an **RX 7600M XT: 16 CUs, 2 MB L2, 64 KiB LDS/block, 8 GB** — not the 28 CUs
   the handoff assumed. A raw triad over 256 MB (≫ L2) measures the achievable **DRAM BW
@@ -333,19 +334,39 @@ reference.
   L2 (2 MB), so it cannot be kept resident, and a weight-stationary layout would still be
   capped at the same 237.6 GB/s DRAM ceiling. **Do not pursue the activation/weight-staging
   redesign.**
-  **Whole-prefill consequence:** the chunk is ~90% GEMM-class work (MLP stages 66%, mixer
-  projections the bulk of the rest — those are GEMM-heavy too; see the wmma bucket split above),
-  with attention the *smallest* bucket and the GDN recurrence ~6%. So the non-GEMM remainder is
-  both small and largely GEMM-dominated, and it cannot close a 2.2 s gap. **On the RX 7600M XT
-  the prefill is DRAM-bandwidth-bound on weight streaming at ~80% of the card's 237.6 GB/s
-  ceiling, and the 250 t/s target (~33% more prefill throughput) is not reachable by kernel-level
-  optimization on this hardware.** Reaching it would require a wider/faster DRAM bus, a more
-  compressed weight stream, or a lower target for this card.
+  **What this does and does not say.** It means the *int8* GEMM kernel has no headroom (making
+  it faster buys ~11.6 ms/chunk), and weight staging/persistence cannot help. It does **not**
+  mean the card cannot do fast prefill. **Correction to the earlier "250 t/s not reachable on
+  this hardware" claim — that was over-generalized and is retracted.** The **same RX 7600M XT**
+  runs the Prism `llama-server` service (`bonsai-egpu`, port 8090) at **296 t/s prefill**
+  (4069-tok prompt → 296.2 t/s; decode **22.2 t/s** with ngram spec off, 21.0 with it — the
+  ngram drafts were barely accepted at 18.75%, a mild net loss) on **Swift-Bonsai-2-PQ2_0**, a
+  **2.13-bpw** product-quantized 27B (7.2 GB). A DRAM-bound prefill scales as
+  ≈ (tokens/block) × DRAM_BW / weight_bytes: the card streams the same 237.6 GB/s either way,
+  so the ~1.8x prefill gap (NInfer-int8 ~165 t/s vs Prism-PQ2_0 ~296 t/s) is set mostly by
+  **weight bytes per token** — int8 (≈8 bpw) streams ~4x the bytes of 2.13-bpq PQ. **The card is
+  not the wall; the int8 weight stream is.** The lever for 300+ t/s prefill on NInfer is a
+  **lower-bit (≈2-bit-class) weight stream**, not more DRAM and not a faster int8 kernel.
 - **Raster A/B is inconclusive** (2026-10-22, `NINFER_T2_A8_RASTER`, W=1024 cold-boot, 3
   reps): default `cols`-fast (x=columns) median **165.2 tok/s** vs `rows`-fast (x=rows)
   **163.7 tok/s** — a ~1% delta. Two 3-run sets do not by themselves establish a noise
   distribution, so this is treated as "no dispatch change warranted," not as proof the block
   raster is inert; the block-raster is not a lever worth further A/B on this card.
+
+## Goal (set 2026-10-22)
+
+Targets for the NInfer 27B stack on the **RX 7600M XT** (gfx1102, 16 CUs, 237.6 GB/s DRAM):
+
+- **Prefill (PP): 300+ t/s.** Reachable on this card — the Prism PQ2_0 (2.13-bpw) service
+  already does 296 t/s here. The NInfer-side path is a **lower-bit (≈2-bit-class) weight
+  stream** so the DRAM-bound GEMM streams far fewer bytes/token (int8 → ~2-bit is ~4x fewer
+  weight bytes, the dominant prefill cost). This is the primary lever; it is real quantization
+  work with a perplexity-quality gate, not a kernel tweak.
+- **Decode (TS): 25–30 t/s.** No-spec Prism baseline on this card is 22.2 t/s; closing the gap
+  to 25–30 is the decode-side lever (separate from prefill).
+
+Baseline to beat (NInfer int8, 1,065-tok prompt): **~165 t/s prefill**. The gap to 300+ t/s is
+~1.8x, to be closed mostly by the weight-stream compression above.
 
 ## 4. Decode backlog (only if decode is resumed — parked for now)
 
