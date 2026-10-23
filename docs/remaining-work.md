@@ -272,6 +272,40 @@ note's 87.2 tok/s (12.2 s) and the other widths 5–10% above it — until that 
 re-checked under matched conditions, treat this table as the current shipped-route
 reference.
 
+### Baseline resolved + GEMM tile ceiling (2026-10-22)
+
+- **Baseline re-checked under matched conditions.** A fresh base cold-boot battery
+  (`.qual/prefill_ab.sh base 1024`, 3 reps, no raster override, recipe env) reads
+  **166.0 / 165.2 / 165.1 tok/s** → median **~165 tok/s** at W=1024, matching the 162.6
+  above. The ship-time A/B note's 87.2 tok/s (12.2 s) is **not reproducible** under these
+  conditions — treat **~165 tok/s as THE shipped-route baseline at W=1024**. The gap to the
+  250 tok/s target is **~1.52x**.
+- **GEMM tile/warp-shape optimization is EXHAUSTED** (`.qual/wmma/cal36.cu`,
+  `cal37.cu`; full battery bit-exact vs the i8 anchor, cold-L2 medians on the three engine
+  shapes). cal36 swept the one-warp family — `(1,2)@8` (shipped), `(1,2)@16`, `(1,4)@8/16`,
+  `(2,2)@8`, `(2,4)@8` — plus the batched-loader `wp` family (all loads hoisted per group,
+  vector 16 B xs): the shipped `w1(1,2)@8` is the fastest on all three shapes; every other
+  one-warp config is slower (fatter-N tiles ~1.9–3.3x, MINB-16 ~2.6–3x) and `wp` is
+  ~2–2.4x slower (hoisting all `av[8][NF]` fragments blows the register budget). cal37 swept
+  multi-warp block loaders — 2/4/8 warps per block, each a `(1,2)` warp tile, block tile
+  `(16·WM)x(32·WN)` — and **every** multi-warp variant loses to the one-warp route by
+  1.4–2.3x on all three shapes (best: 8-warp `wb(2,4)`). No LDS staging in cal37 (each warp
+  loads its own weight lines); the plain wider-block coupling alone is a net loss on this
+  card, so a staged-LDS multi-warp loader is not expected to recover it.
+  **Conclusion:** the one-warp `(16x32)` `(1,2)@8` tile is the ceiling of the loader family;
+  do not re-litigate tile/warp shape. The residual gap to cal16's ~58 TOPS mma-issue ceiling
+  is **structural, not tile-shape**: the dominant traffic is cross-block activation
+  re-reads (~11 GB on gate_up — each of the 1024 activation cols is re-read by all 2176
+  row-blocks) plus the on-the-fly T2 weight decode. Closing it needs a **traffic-reduction
+  redesign** (activation-stationary / LDS-staged B with persistent-CTA grid-stride over N),
+  which is a major kernel rewrite with occupancy headwinds on a 28-CU card — the primary
+  remaining GEMM lever. The other lever is the non-GEMM floor (attn_mixer ~980 ms,
+  gdn_mixer ~0.9 s at W=1024).
+- **Raster A/B is a no-op** (2026-10-22, `NINFER_T2_A8_RASTER`, W=1024 cold-boot, 3 reps):
+  default `cols`-fast (x=columns) median **165.2 tok/s** vs `rows`-fast (x=rows) **163.7
+  tok/s** — a ~1% delta inside the run-to-run noise band, so the default block order is kept
+  and no dispatch change is made. The block-raster is not a lever on this card.
+
 ## 4. Decode backlog (only if decode is resumed — parked for now)
 
 - §1's mma.cuh helper bug means every Phase-4 decode bucket is pre-fix evidence. Fix it,
