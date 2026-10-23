@@ -1106,3 +1106,37 @@ time (2026-10-22) — that was on the reference (3090) machine; the T≡1 mod 16
 regression and/or gfx1102-specific on this card. Treat the PASS claim as stale for gfx1102.
 The handoff's "pre-existing failures" framing is confirmed here **by evidence** (baseline-binary
 diff), not assumed — per the standing "verify, don't trust the handoff" rule.
+
+## 2026-10-23 GDN correction and probe review
+
+On gfx1102, the native-WMMA GDN recurrence now keeps the output accumulator live across
+its conversion and uses BF16 high-plus-residual products for the FP32 control matrices,
+residuals, and scaled state update. The existing production GDN test passes all 57 cases
+against its independent FP64 oracle, including normalized/raw outputs, per-head state,
+continuations and partial chunks. With only the accumulator barrier, catastrophic output
+errors disappeared but that same test still failed the per-head accuracy criteria. The
+underlying reason for the output barrier's code-generation sensitivity is not established.
+
+On RX 7600M XT, public running GDN, QK/value heads 16/48, T=1024, fused normalization,
+cold-L2 graph replay, warmup 3 and 10 samples per run, two ABBA runs gave median times
+4.490/4.504 ms before the precision corrections and 4.654/4.664 ms after (+3.6%). The
+comparison baseline includes the output barrier but fails the numerical test. One same-shape
+SIMT-fallback run measured 22.780 ms. This is an Op measurement, not an end-to-end prefill
+claim; other shapes and full-model performance have not been measured for this change.
+A broader candidate including extra prediction/history correction timed out on this workload
+and was discarded; its cause was not isolated. Correcting the state update alone cost about
+4% but still failed output and state criteria, and was also discarded.
+
+The cal69 fragment diagnostic had an out-of-bounds write and used the wrong wave lanes; its
+phase difference figures are invalid. Its corrected reconstruction uses only the active
+16 lanes per wave; its aggregate oracle checks are not substitutes for the production test's
+per-head and gross-error checks. The cal67 register-fed loop's 1.72x measurement reproduces,
+but its dependent chains and host timing do not establish an instruction issue peak; the
+98%-of-peak and exhausted-bit-exact-GEMM conclusions above are unproven. Cal42 uses 8192
+MACs per 16x16x16 instruction instead of 4096, so its reported MAC rates are twice the
+correct count and its constant-input loops also need compiler validation. Cal43 times
+pre-expanded weights and pre-quantized activations with all i8 samples followed by all i4
+samples, not ABBA; the 2.25-2.76x kernel-only figures exclude preparation and do not prove
+end-to-end speed or model quality. Its packed representation does not establish the later
+1.06-bpw projection, nor does four-bit arithmetic halve the mathematical MAC count.
+

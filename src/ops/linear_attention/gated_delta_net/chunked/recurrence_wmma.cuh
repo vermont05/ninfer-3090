@@ -28,10 +28,10 @@
 // solve/mqk) equal the probe-pinned loader layouts, so operands are read in
 // place. Narrow (8-column) F windows use the cal35 H map j = (lane & 15) >> 1.
 //
-// Results are not bit-identical to the emulation: deterministic 1-3 ULP
-// instruction noise plus TF32 -> BF16 on the prediction dot (cal25/cal26/cal33/
-// cal34/cal35 batteries: 0 mismatches vs the dot models with tolerance; the
-// emulation itself is exact TF32). Gate: NINFER_GDN_REC_WMMANATIVE.
+// FP32 operands in the control-matrix and state-update products are split into
+// BF16 high and residual parts. The extra products preserve enough precision
+// for the public output and FP32 state criteria across long continuations.
+// Results need not be bit-identical to the emulation. Gate: NINFER_GDN_REC_WMMANATIVE.
 
 #if defined(__HIPCC__)
 
@@ -100,6 +100,17 @@ __device__ __forceinline__ i16v16 s_window_sq(const float* p, int rowbase, int l
     for (int e = 0; e < 16; ++e) h[e] = load_bits(p, LaySq::index(rowbase + (lane & 15), e));
     return out;
 }
+__device__ __forceinline__ i16v16 s_window_sq_residual(const float* p, int rowbase, int lane) {
+    i16v16 out;
+    auto* h = reinterpret_cast<unsigned short*>(&out);
+#pragma unroll
+    for (int e = 0; e < 16; ++e) {
+        const float v = p[LaySq::index(rowbase + (lane & 15), e)];
+        const float hi = __bfloat162float(__float2bfloat16_rn(v));
+        h[e] = __builtin_bit_cast(std::uint16_t, __float2bfloat16_rn(v - hi));
+    }
+    return out;
+}
 // S-side column gather (cal34 D): slot l holds column (colbase + (lane & 15)) rows
 // [rowbase, rowbase + 16), i.e. the TRANSPOSED left matrix (block^T slice).
 __device__ __forceinline__ i16v16 s_colongather(const __nv_bfloat16* p, int rowbase, int colbase,
@@ -133,6 +144,20 @@ __device__ __forceinline__ i16v16 f_narrow(const float* p, int rowbase, int colb
     for (int r = 0; r < 16; ++r) h[r] = load_bits(p, Lay::index(rowbase + r, colbase + j));
     return out;
 }
+template <class Lay>
+__device__ __forceinline__ i16v16 f_narrow_residual(const float* p, int rowbase, int colbase,
+                                                    int lane) {
+    i16v16 out;
+    auto* h = reinterpret_cast<unsigned short*>(&out);
+    const int j = narrow_j(lane);
+#pragma unroll
+    for (int r = 0; r < 16; ++r) {
+        const float v = p[Lay::index(rowbase + r, colbase + j)];
+        const float hi = __bfloat162float(__float2bfloat16_rn(v));
+        h[r] = __builtin_bit_cast(std::uint16_t, __float2bfloat16_rn(v - hi));
+    }
+    return out;
+}
 // Site-3 right operand: the delta stripe column scaled rowwise by row_scale[row]
 // (diag(suffix) Delta -- the SIMT path's delta_b packing, moved into the loader).
 template <class Lay>
@@ -146,6 +171,20 @@ __device__ __forceinline__ i16v16 f_narrow_scaled(const float* p, int colbase, i
         h[r] = __builtin_bit_cast(
             std::uint16_t,
             __float2bfloat16_rn(row_scale[r] * p[Lay::index(r, colbase + j)]));
+    return out;
+}
+template <class Lay>
+__device__ __forceinline__ i16v16 f_narrow_scaled_residual(const float* p, int colbase, int lane,
+                                                           const float* row_scale) {
+    i16v16 out;
+    auto* h = reinterpret_cast<unsigned short*>(&out);
+    const int j = narrow_j(lane);
+#pragma unroll
+    for (int r = 0; r < 16; ++r) {
+        const float v = row_scale[r] * p[Lay::index(r, colbase + j)];
+        const float hi = __bfloat162float(__float2bfloat16_rn(v));
+        h[r] = __builtin_bit_cast(std::uint16_t, __float2bfloat16_rn(v - hi));
+    }
     return out;
 }
 
@@ -275,7 +314,12 @@ __device__ __forceinline__ void store_residual_wmma(float* delta, const __nv_bfl
 template <class Lay>
 __device__ __forceinline__ f8v32 dot_square(const float* square, const float* stripe,
                                             int colbase, int lane, const f8v32& acc) {
-    return mma_bf16(f_narrow<Lay>(stripe, 0, colbase, lane), s_window_sq(square, 0, lane), acc);
+    // (a_hi + a_lo) * (b_hi + b_lo), omitting only the small lo*lo term.
+    const auto a = f_narrow<Lay>(stripe, 0, colbase, lane);
+    const auto b = s_window_sq(square, 0, lane);
+    auto result = mma_bf16(a, b, acc);
+    result = mma_bf16(f_narrow_residual<Lay>(stripe, 0, colbase, lane), b, result);
+    return mma_bf16(a, s_window_sq_residual(square, 0, lane), result);
 }
 
 // matrix_delta's WMMA shape for an F-side matrix laid out in Lay (square_index for
@@ -297,8 +341,10 @@ template <class Lay>
 __device__ __forceinline__ f8v32 state_tile(const __nv_bfloat16* k, int keybase,
                                              const float* delta, int colbase, int lane,
                                              const float* suffix, const f8v32& acc) {
-    return mma_bf16(f_narrow_scaled<Lay>(delta, colbase, lane, suffix),
-                    s_colongather(k, 0, keybase, lane), acc);
+    // K is already BF16; recover the low bits of the scaled FP32 delta.
+    const auto keys = s_colongather(k, 0, keybase, lane);
+    auto result = mma_bf16(f_narrow_scaled<Lay>(delta, colbase, lane, suffix), keys, acc);
+    return mma_bf16(f_narrow_scaled_residual<Lay>(delta, colbase, lane, suffix), keys, result);
 }
 
 // Output store, the block-shape mirror of store_output: lane owns the row

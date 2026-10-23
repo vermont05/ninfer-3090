@@ -245,6 +245,15 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
                 op[q] = hp[q] * scale;
         }
         out = wmma_detail::dot_square<Lay>(p.mqk, sm.delta, colbase, lane, out);
+        // Keep the WMMA accumulator live across the output conversion. On gfx1102,
+        // removing this compiler barrier caused catastrophic output errors on partial
+        // chunks. The precise compiler or code-generation cause is not established.
+        {
+            uint32_t* ox = reinterpret_cast<uint32_t*>(&out);
+            asm volatile(""
+                         : "+v"(ox[0]), "+v"(ox[1]), "+v"(ox[2]), "+v"(ox[3]),
+                           "+v"(ox[4]), "+v"(ox[5]), "+v"(ox[6]), "+v"(ox[7]));
+        }
         wmma_detail::store_chunk_row(args, out, chunk, head, value_start, colbase, lane);
 
         // Site 3: S^T = gamma S^T + K^T diag(suffix) Delta. The snapshot row IS
