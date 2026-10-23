@@ -308,20 +308,32 @@ reference.
   through LDS, the sweep does **not** establish whether a *cooperative* LDS-staged loader
   (one block loads a tile into LDS once, all warps read it) would win — that is still open.
   What is settled is only that the tested variants of the *existing per-warp loader* lose.
-- **The residual GEMM gap is not yet characterized as traffic-bound.** The one-warp `(1,2)@8`
-  tile is the fastest tested loader variant, and the gap to cal16's ~58 TOPS mma-issue
-  ceiling is structural rather than a tile-shape matter. A natural hypothesis is cross-block
-  activation re-reads (each of the 1024 activation cols is logically re-read by all 2176
-  row-blocks on gate_up — ~11 GB of *logical* load traffic, i.e. what the loads address, not
-  measured external fetches; some of it may be served by L2/UB) plus the on-the-fly T2 weight
-  decode. **This is a hypothesis, not a measurement.** The next step is to characterize the
-  actual bottleneck — memory traffic vs T2 weight decode vs instruction issue vs occupancy —
-  with targeted experiments before committing to a traffic-reduction redesign
-  (activation-stationary / LDS-staged B with a persistent-CTA grid-stride over N). That
-  redesign is a major kernel rewrite with occupancy headwinds on a 28-CU card, so it should
-  only be undertaken if the bottleneck measurement and a bounded prototype show enough
-  end-to-end headroom against the 2.2 s TTFT budget. The other lever is the non-GEMM floor
-  (attn_mixer ~980 ms, gdn_mixer ~0.9 s at W=1024).
+- **Lever 1 (GEMM) is characterized and is a NO-GO: the kernel is DRAM-bandwidth-bound at
+  ~80% of the physical ceiling, so there is no meaningful TTFT headroom here**
+  (2026-10-22, `.qual/wmma/cal38.cu`; battery bit-exact vs the i8 anchor, cold-L2 medians).
+  The device is an **RX 7600M XT: 16 CUs, 2 MB L2, 64 KiB LDS/block, 8 GB** — not the 28 CUs
+  the handoff assumed. A raw triad over 256 MB (≫ L2) measures the achievable **DRAM BW
+  ceiling at 237.6 GB/s** (the naive `memoryClockRate` estimate of ~36 GB/s is far below this
+  and is unreliable for GDDR6 — do not use it). The shipped `w1(1,2)@8` tile streams its
+  dominant traffic — weight re-reads (W is N×K int8, re-read by all T/32=32 token-blocks since
+  W ≫ 2 MB L2) — at:
+    | shape | weight-code traffic | shipped time | eff weight BW | % of 237.6 GB/s |
+    | gate_up 34816×5120×1024 | 5.70 GB | 30.6 ms | 186 GB/s | 78% |
+    | mlp_down 5120×17408×1024 | 2.85 GB | 15.1 ms | 189 GB/s | 80% |
+    | gdn_valuez 12288×5120×1024 | 2.01 GB | 10.4 ms | 194 GB/s | 82% |
+  Two targeted ablations settle the two remaining questions: (a) the **no-epilogue** variant
+  (identical loads + WMMA burst, per-group fold/store removed) runs *slower* (97–139 GB/s),
+  so the per-group fold ALU and store epilogue are **not** the bottleneck — they are off the
+  critical path; (b) the fatter-N tiles are ~1.9–3.3x slower (cal36), so the tile is not the
+  lever either. The kernel is bound by weight-traffic throughput and already sits at
+  ~80% of the DRAM ceiling. **Max achievable savings** if it hit the full 237.6 GB/s ceiling:
+  gate_up 30.6→24.0 ms, mlp_down 15.1→12.0 ms, gdn_valuez 10.4→8.5 ms ≈ **~11.6 ms per
+  1024-token chunk**, i.e. ~0.5% of the 2.2 s TTFT budget — far below the bar for a major
+  rewrite. Weight staging/persistence cannot help: W (178 MB gate_up) exceeds LDS (64 KiB) and
+  L2 (2 MB), so it cannot be kept resident, and a weight-stationary layout would still be
+  capped at the same 237.6 GB/s DRAM ceiling. **Do not pursue the activation/weight-staging
+  redesign.** The remaining levers are the non-GEMM floors (attn_mixer ~980 ms, gdn_mixer
+  ~0.9 s at W=1024).
 - **Raster A/B is inconclusive** (2026-10-22, `NINFER_T2_A8_RASTER`, W=1024 cold-boot, 3
   reps): default `cols`-fast (x=columns) median **165.2 tok/s** vs `rows`-fast (x=rows)
   **163.7 tok/s** — a ~1% delta. Two 3-run sets do not by themselves establish a noise
