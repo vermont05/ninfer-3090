@@ -475,6 +475,44 @@ reference.
   shapes are bit-identical by construction (same per-block computation as the shipped tile;
   cal57 kernel bodies are verbatim copies), so any shipped change needs only engine-level
   end-to-end verification.
+- **Panel battery: L2 blocking works, requests are unchanged — panel is a DRAM lever, not a
+  request lever (2026-10-23, `cal58`, panel-mode battery, gate_up shape, cold-L2 timed launches,
+  same counters/asm protocol as cal57).** Panel geometry = shipped (`col0 = y·16NF`,
+  `row0 = (z·P + x)·16MF`, grid `(P, column blocks, row blocks/P)`; x-fastest scheduling),
+  cold best-of-5, with the `.amdhsa` spill identical to cal57 for every shape (panel geometry
+  costs zero registers — confirmed a second time):
+
+  | shape (MF,NF,P) | ms | reqs M | DRAM GB | spill B | binding |
+  | --- | --- | --- | --- | --- | --- |
+  | (1,2,32) engine default | 30.2 | 156 | **1.46** | 36 | requests |
+  | (1,2,8) | 28.2 | 182 | 4.2 | 36 | requests (amplified) |
+  | (2,2,16) | 26.9 | 253 | 1.9 | 44 | requests (2.9× amplified) |
+  | (2,2,8) | 29.7 | 313 | 4.7 | 44 | requests (3.5× amplified) |
+  | (1,4,8) | 51.6 | 536 | 26.3 | 432 | spill traffic (17.0 GB wr) |
+  | (1,4,16) | 50.6 | 536 | 25.6 | 432 | spill traffic |
+  | (2,4,8) | 45.5 | 526 | 21.5 | 492 | spill traffic (10.1 GB wr) |
+  | (4,2,8) | 44.1 | 462 | 19.0 | 460 | spill traffic (9.6 GB wr) |
+
+  **Panel mode drives DRAM to the theoretical floor and time does not move.** (1,2,32) reads
+  1.46 GB — the weights-once + x-once ideal (5.4× below schedule B's 7.85 GB, 12.2 M L2 misses
+  ≈ 1.56 GB at 92 % L2 hit) — and takes 30.2 ms, identical to schedule B's 29.9 ms: **L2 hits do
+  not reduce the GL2C request stream** (156 M, the (1,2) geometry floor), which is the binding
+  term at 6.7 Greq/s. The cal57 consequence (iii) prediction ("panel NF=4 ⇒ 92 M reqs ⇒ 14 ms")
+  is **refuted**: (1,4) panel shapes carry the same 432–492 B spill as their schedule-B twins,
+  so the 10–17 GB scratch write stream dominates; the (2,2) in-flight panel overshoots L2 and
+  amplifies requests 2.9–3.5×. The warm-context panel gain stays explained by cross-kernel L2
+  persistence (cal41 +6–8 %, engine +2.3 %), not by within-launch request cuts.
+  **The (2,2) panel failure is an ordering artifact, and it points at the remaining lever:**
+  x-fastest raster puts ≈512 concurrent blocks spanning many z-slices in flight, so the
+  in-flight x set (P·16MF columns × 16NF·k_cols) exceeds 2 MB L2 for MF=2 (5.2 MB at P=8) —
+  requests amplify 2.9–3.5×. Swapping grid.y↔grid.z (**y-fastest panel**: concurrent blocks
+  share the *same* 16NF-column x window, in-flight 32 windows × 8.2 KB·16MF ≈ 1.31 MB ≤ L2)
+  makes per-launch traffic ideal for (2,2): x-once 5.24 GB + weights-once 1.43 GB + writes 0.2
+  ≈ 6.9 GB ⇒ 13.5 ms DRAM-term, and the 88 M request floor ⇒ 13.1 ms — **both terms land at
+  ~13–14 ms = 2.3×** if (2,2)@8 is made spill-free (its 44 B × 430 GB/launch spill stream is
+  exactly what keeps cal57's (2,2) at 29.4 ms). The critical path is therefore a **register diet
+  fitting (2,2)@8 in 64 VGPR** (natural 128: 48 accf + 16 acc leaves ~64 loop-state regs where
+  16 are available) — cal59 probes y-fastest geometry + diet variants.
 - **Raster A/B is inconclusive** (2026-10-22, `NINFER_T2_A8_RASTER`, W=1024 cold-boot, 3
   reps): default `cols`-fast (x=columns) median **165.2 tok/s** vs `rows`-fast (x=rows)
   **163.7 tok/s** — a ~1% delta. Two 3-run sets do not by themselves establish a noise
