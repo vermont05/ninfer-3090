@@ -304,10 +304,11 @@ reference.
   `(1,2)` warp tile, block tile `(16·WM)x(32·WN)`, **no LDS operand sharing** (each warp
   loads its own weight lines) — and every multi-warp variant loses to the one-warp route by
   1.4–2.3x (best: 8-warp `wb(2,4)`).
-  **Scope of that conclusion:** because cal37's multi-warp blocks do *not* share operands
-  through LDS, the sweep does **not** establish whether a *cooperative* LDS-staged loader
-  (one block loads a tile into LDS once, all warps read it) would win — that is still open.
-  What is settled is only that the tested variants of the *existing per-warp loader* lose.
+  **Scope of that conclusion:** cal37's multi-warp blocks do *not* share operands through LDS, so
+  that sweep alone does not cover a *cooperative* LDS-staged loader. That design was since built
+  and measured as `wcoop` in cal38 (see the Lever-1 root-cause note): bit-exact, register-clean,
+  and it **loses modestly (+3.5–8.2%)** to the one-warp `w1(1,2)@8`. So the cooperative LDS
+  loader is now settled too — it does not win on this card.
 - **Lever 1 (GEMM): the T2 prefill GEMM runs at ~19% of the DRAM ceiling in logical
   packed-code terms — there is large headroom; the earlier "tapped out / ~80% of ceiling"
   conclusion is WITHDRAWN (factor-of-4 bandwidth error, corrected 2026-10-22)**
@@ -381,14 +382,26 @@ reference.
   163 ms vs `w1`'s 30.0 ms (12.4 / 12.4 / 8.7 GB/s logical vs `w1`'s 47.5). The cause is the
   opposite of a traffic problem: folding `R` token blocks into one warp cuts the in-flight warp
   count `R`-fold (w1 launches ~69,632 one-warp blocks for gate_up; wlds R4 launches ~17,408),
-  starving the 16 CUs of the occupancy that hides memory/issue latency. **Together the two
-  results localize the GEMM's limit: it is latency/occupancy-bound, not DRAM-traffic-bound.**
-  Sits at ~20% of the DRAM *ceiling* precisely because it cannot keep the CUs fed — reducing
-  bytes (coalesced, LDS-stationary) removes the parallelism that was feeding them. The remaining
-  GEMM lever is therefore **more effective parallelism / latency-hiding** (a cooperative
-  multi-warp LDS loader that shares operands *without* the per-warp reload cal37 penalized, or a
-  better-occupancy schedule) — **not** traffic reduction. That cooperative multi-warp loader is
-  the one GEMM design not yet tested (cal37's multi-warp blocks did not share through LDS).
+  starving the 16 CUs of the occupancy that hides memory/issue latency. **A third design — the
+  cooperative multi-warp LDS loader `wcoop` — was then built and measured** (`cal38`, now
+  bit-exact bitdiff=0 after fixing a per-slice `__syncthreads` read/write race on the shared LDS
+  panel): a block of `NWARP` warps shares one 1024-K weight panel in LDS (loaded cooperatively
+  once), each warp runs one token block — so it keeps `w1`'s full warp count *and* cuts weight
+  DRAM traffic `NWARP`-fold. **It loses modestly to the shipped `w1(1,2)@8`:** W4 +3.5% gate_up
+  / +8.2% mlp_down / +3.6% gdn_valuez, W8 +6.9/+8.9/+6.2% (46.2/44.3/45.5 GB/s vs `w1`'s
+  47.8/48.0/47.2). Compiler resources (device-asm `.amdhsa_*`): `wcoop` is **register-clean —
+  zero scratch spill, 8–12 KB LDS, 14 SGPR** — unlike `w1c` (320 B spill) and `wlds` (288 B
+  spill). So `wcoop`'s small loss is **not** a register/occupancy collapse (that is why `w1c`/
+  `wlds` lost 1.7–4×); it is the per-slice `__syncthreads` barriers (5 slices for gate_up)
+  serializing the block's warps plus the LDS round-trip. **Conclusion, scoped narrowly:** the
+  *cooperative LDS-staged loader* is ruled out as a win on this card. What the three results
+  *together* support — and what they do not *prove* from timing alone — is that the GEMM sits at
+  ~20% of the DRAM ceiling because it cannot keep the CUs fully fed; reducing bytes (coalesced,
+  LDS-stationary) and staging through LDS each remove or serialize the warp parallelism that was
+  feeding them. Register pressure vs occupancy vs LDS-staging vs barrier cost are not separated by
+  timing; the spill counts above show the two big losses (`w1c`,`wlds`) were spill-driven, while
+  `wcoop`'s small loss is barrier/staging-driven. GEMM optimization as a whole is **not** closed
+  by this — only this loader family is.
 - **Raster A/B is inconclusive** (2026-10-22, `NINFER_T2_A8_RASTER`, W=1024 cold-boot, 3
   reps): default `cols`-fast (x=columns) median **165.2 tok/s** vs `rows`-fast (x=rows)
   **163.7 tok/s** — a ~1% delta. Two 3-run sets do not by themselves establish a noise
@@ -405,20 +418,24 @@ Targets for the NInfer 27B stack (T2 ternary, **2.125 bpw** weights) on the **RX
   The card demonstrably does 296 t/s here (Prism's 2.13-bpw PQ2_0 service, same ~2.1 bpw as
   NInfer's T2 2.125 bpw). Corrected `cal38` measurement: the NInfer T2 prefill GEMM streams its
   **logical** packed codes at **~20% of the ~240 GB/s DRAM ceiling** (~47 GB/s). Two traffic-
-  reduction designs were built and both **lost** (coalesced `int32v` full-line read ~70% slower;
-  weight-stationary LDS-staged `wlds` ~4× slower) — each by removing the warp parallelism that
-  feeds the CUs, which **localizes the GEMM's limit to latency/occupancy, not DRAM traffic.**
-  Weights are already at the 2-bit floor (sub-2-bit GGML formats have no in-tree kernels, no
-  PQ/VQ path), so bit-rate is off the table. The untested GEMM lever is a **cooperative
-  multi-warp LDS loader** (share operands through LDS so extra warps add parallelism without the
-  per-warp reload cal37 penalized); if that also loses, the GEMM is at its practical limit for
-  this kernel family and the main remaining lever is the **45% mixer/attention time**. Prefill-
-  bucket profile
-  at W=1024 (`NINFER_PREFILL_PROFILE=1`, single 1024-tok chunk, total 5084 ms): MLP GEMMs
+  reduction designs were built and both **lost** (coalesced `int32v` full-line read ~70% slower
+  with 320 B scratch spill; weight-stationary LDS-staged `wlds` ~4× slower with 288 B spill),
+  and the **cooperative multi-warp LDS loader `wcoop` was also built and loses modestly
+  (+3.5–8.2%)** while staying register-clean (zero spill, 8–12 KB LDS). The two big losses were
+  spill-driven; `wcoop`'s small loss is barrier/LDS-staging-driven. Weights are already at the
+  2-bit floor (sub-2-bit GGML formats have no in-tree kernels, no PQ/VQ path), so bit-rate is off
+  the table. **The GEMM traffic/parallelism lever is still open** — these three designs rule out
+  *those* implementations (traffic reduction and the LDS-staged loaders), not GEMM optimization
+  as a whole; the ~80% headroom to the DRAM ceiling on logical packed-code traffic is real. The
+  other major lever is the **mixer/attention time** — with the correction that this bucket
+  **includes the mixer projection GEMMs**, so a faster GEMM *can* help it (the earlier "no GEMM
+  change touches the 45%" framing was wrong). Prefill-bucket profile at W=1024
+  (`NINFER_PREFILL_PROFILE=1`, single 1024-tok chunk, total 5084 ms): MLP GEMMs
   (gdn_mlp 2137 ms + attn_mlp 682 ms) ≈ 55%; mixers/attention (gdn_mixer 1279 ms + attn_mixer
-  985 ms, incl. the GDN recurrent scan, attention, and their projection GEMMs) ≈ 45%. The bucket
-  split shifts with context (in the same run attention grew ~0.99 s → 4.41 s across the four
-  chunks), so it is one-chunk evidence, not a fixed ceiling.
+  985 ms, incl. the GDN recurrent scan, attention, and their projection GEMMs) ≈ 45%. This 55/45
+  split is **first-chunk-only**: in the same run attention grew ~0.99 s → 4.41 s across the four
+  chunks, so on the 4,000-tok Prism reference the mixer/attention share is materially larger and
+  the attention path is the higher-priority thing to profile next.
 - **Decode (TS): 25–30 t/s.** No-spec Prism baseline on this card is 22.2 t/s; closing the gap
   to 25–30 is the decode-side lever (separate from prefill).
 
