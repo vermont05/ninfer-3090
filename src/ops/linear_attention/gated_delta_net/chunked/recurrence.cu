@@ -152,8 +152,9 @@ __device__ __forceinline__ void store_output(const Arguments& args, float (&acc)
 // (l & 15) of a 16-row x 8-column block, so every phase feeds the next phase's
 // loader without shuffles. Warp w owns the stripe column block w * 8 and the
 // block phases touch only their own stripe, so the SIMT path's block-wide
-// matrix_delta barriers shrink to __syncwarp() here; the stage and snapshot
-// __syncthreads() stay. Not bit-identical to the emulation: deterministic 1-3 ULP
+// matrix_delta and snapshot barriers shrink to __syncwarp() here (cal68:
+// hash-identical output and state, ~5% faster at engine geometry); only the
+// cp.async stage barriers stay block-wide. Not bit-identical to the emulation: deterministic 1-3 ULP
 // instruction noise plus TF32 -> BF16 on the prediction dot. Selected by the
 // NINFER_GDN_REC_WMMANATIVE gate (host, below).
 template <int DV>
@@ -211,7 +212,9 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
 #pragma unroll
         for (int mi = 0; mi < MPW; ++mi)
             wmma_detail::store_chunk8<Lay>(sm.snapshot, mi * 16, colbase, lane, state[mi]);
-        __syncthreads();
+        // cal68: the snapshot writes and site-2 reads are both confined to this warp's
+        // colbase stripe, so a warp barrier scopes them (bit-exact; cal68 hash-verified).
+        __syncwarp();
 
         const auto& stage     = sm.stage[chunk & 1];
         const ControlChunk& p = stage.control;
@@ -223,7 +226,8 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
         wmma_detail::site2_pred_history<DV>(qk, sm.snapshot, colbase, lane, prediction, history);
         wmma_detail::store_residual_wmma<Lay, DV>(sm.delta, stage.value, prediction, colbase,
                                                      lane, p.prefix);
-        __syncthreads();
+        // cal68: store_residual writes and the dot_square read stay on this warp's stripe.
+        __syncwarp();
 
         // matrix_delta chain on this warp's stripe block; the block is
         // warp-private, so warp barriers scope it.
