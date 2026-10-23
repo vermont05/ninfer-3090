@@ -407,6 +407,43 @@ reference.
   **163.7 tok/s** — a ~1% delta. Two 3-run sets do not by themselves establish a noise
   distribution, so this is treated as "no dispatch change warranted," not as proof the block
   raster is inert; the block-raster is not a lever worth further A/B on this card.
+- **WMMA compute roofline measured** (2026-10-23, `.qual/wmma/cal42.cu` — pure compute loops,
+  independent accumulator sets, median of 7, RX 7600M XT @ 2.33 GHz, 16 CUs):
+
+  | instruction | peak warp-ops/s | peak MAC rate | cycles/op/wave |
+  | --- | --- | --- | --- |
+  | `wmma_i32_16x16x16_iu8_w32` (shipped) | **4.787 G** | 19.6 T MAC/s (39.2 "TMAC" 2-op) | 16 |
+  | `wmma_i32_16x16x16_iu4_w32` | **9.419 G** | 38.6 T MAC/s (77.2) — **exactly 2× iu8** | 8 |
+  | `wmma_f32_16x16x16_f16_w32` | 4.796 G | 19.6 T MAC/s — same op rate as iu8 | 16 |
+
+  Control: a pure fma loop issues **75.8 G warp-instr/s ≈ 101%** of the 74.7 G instr/s issue
+  capacity (16 CUs × 2 × 2.33 GHz, one wavefront per cycle per scheduler), validating the
+  counting model (the earlier `lds` control was invalidated by dead-store elimination and is
+  not used). **Consequence:** the shipped G32-scheduled gate_up (25.7 ms, 182.5 G useful MAC,
+  ~2× fragment waste ⇒ 14.2 TMAC/s issued) sits at **~37% of the iu8 compute peak** — the GEMM
+  is compute-issue-schedule-limited with **~2.7× scheduling headroom**, not DRAM-limited (it
+  streams at ~55 GB/s of the 237 GB/s ceiling). The roofline answers the handoff's open
+  "what is the WMMA peak" question.
+  **iu4 caveat:** the 2×-rate `iu4` builtin takes an **i4 activation fragment**, so it needs
+  genuine 4-bit activations. A bit-exact decomposition `x = 16·hi4 + lo4` (two wmmas per tile)
+  exactly cancels the 2× rate — net zero. Reaching iu4 speed is a **numerics change**
+  (4-bit-activation quantization, perplexity/coherence-gated), not a bit-exact rewire.
+- **G32 panel raster integrated into the shipped tile; default ON** (2026-10-23):
+  `t2_prefill_wmma1_kernel` gains a `Panel` template parameter (Panel>0 ⇒ grid
+  `(P, column blocks, row blocks/P)`, `row0 = (z*P + x)·16`); `t2_a8.cu` launches it when
+  `wrow_blocks % 32 == 0` (all engine shapes qualify: gate_up 2176, mlp_down 320, gdn 768
+  tiles), **default panel=32**, disabled by `NINFER_T2_A8_WMMAPANEL=0`. GEMM-level (cal41,
+  cold-L2, bit-exact): gate_up **25.7 ms vs 27.9**, mlp_down **13.3 vs 15.9**, gdn_valuez
+  **9.1 vs 9.7** (+6–8% every shape). Device-asm resources for all six Panel=0/32
+  instantiations are **identical to HEAD** — 128 VGPR, 38–43 SGPR, 36 B private segment (the
+  pre-existing 9-dword spill), so panel mode costs zero registers. Engine ABBA (cold-boot,
+  W=4210, 3 alternating legs in one lock, panel off vs G32): medians **142.6 vs 139.4
+  tok/s** (TTFT 29.7 vs 30.4 s), every G32 leg strictly above every off leg — **+2.3%
+  prefill** at 4,210 tokens, and the bit-exactness gate (`wmma_bitexact.sh`, 128-token
+  greedy lighthouse prompt) gives **TEXT MATCH** on the panel path. Baseline reference at
+  this width was ~144 t/s (TTFT 29.2 s); the panel raster recovers ~3 t/s of cold-boot
+  prefill and moves the 300 t/s target's remaining gap onto the other levers (attention
+  39.5% of prefill at 4096-ctx; iu4 numerics).
 
 ## Goal (set 2026-10-22)
 
