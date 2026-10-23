@@ -1042,3 +1042,67 @@ free win.**
 hardware basis: 1.72×, certified fragment semantics, ~+9% GEMM-side ceiling at 4-bit. Files:
 `.qual/wmma/cal67.cu`, `/tmp/cal67/cal67`, device asm in project root (`.amdhsa_next_free_vgpr`
 72/60, no spills).
+
+## 2026-10-23 cal68 (GDN wmma recurrence: two block barriers shrink to warp scope, −5.15% rec kernel; committed 75eb1b3d — plus the #129 failure record: pre-existing, attributed, characterized)
+
+**Barrier shrink (shipped, bit-exact).** In `chunk_recurrence_wmma_kernel<64>` warp w owns the
+stripe at colbase = w*8. The snapshot writes (`store_chunk8` → `sm.snapshot`) feed only this
+warp's site-2 reads (`site2_pred_history`), and the `store_residual_wmma` writes feed only this
+warp's `dot_square` — every producer/consumer pair is stripe-local, so the two block-wide
+`__syncthreads()` shrink to `__syncwarp()`. Only the cp.async stage barriers stay block-wide
+(cross-warp stage visibility at loop head and stage reuse at chunk tail).
+
+- cal68 probe at engine geometry (qwen-27b H=16/48, DV=64, 96 blocks, T=1024): **output and state
+  hashes identical**, rec kernel **1.593 → 1.511 ms (−5.15%)**.
+- Engine ABBA (RX 7600M XT, 4,232-token prompt, cold boot per leg, 3 reps base/new interleaved):
+  prefill medians **143.0 vs 142.8 t/s** — the expected end-to-end impact is
+  −0.082 ms × 48 layers ≈ −3.9 ms per 1024-token chunk ≈ **−0.07% of TTFT**, far below per-leg
+  noise (~±2%), so ABBA's role was certification, not detection. Greedy 64-token completions
+  (temp 0) are **byte-identical** (sha 0f42d7d4, 283 chars, coherent text).
+- `ninfer_gated_delta_net_test`: 57-case log **byte-identical** between baseline and changed
+  binaries (see failure record below).
+- Committed as 75eb1b3d. Files: `.qual/gdn/cal68.cu`, `build_cal68.sh`, `ab68.sh`, `/tmp/cal68/`.
+
+**launch_bounds refuted.** `__launch_bounds__(256, 1)` → `minBlocksPerMultiprocessor=2` is
+inert here: device asm is **identical** across variants (256 VGPR, 120 B privseg, 38 scratch).
+The binding constraint is LDS: `RecurrenceShared` stages + snapshot + delta = **60.6 KB**, so
+occupancy is 1 block/CU regardless of the bounds hint (64 KB/CU is the LDS limit; 2 blocks
+would need ≤32 KB). No register headroom to win — the kernel already uses exactly 256.
+
+**Measured tile costs (fills the "not measured latency" gap in the value_tile heuristic):** at
+engine recurrence geometry, wmma DV=64 = 1.59 ms; the SIMT path at DV=32 = **25.86 ms** and at
+DV=16 = **24.74 ms** — ~16× the wmma cost. Any heuristic that picks a smaller DV for the
+recurrence to save workspace trades 1.5 ms for ~25 ms per layer-chunk; the wmma-64 path is the
+only viable tile. **Numerics caveat:** the wmma path is not bit-identical to the SIMT emulation
+(deterministic 1–3 ULP TF32 instruction noise plus TF32→BF16 on the prediction dot) — gate
+`NINFER_GDN_REC_WMMANATIVE` is default ON; SIMT stays as the `off` reference.
+
+**#129 failure record (pre-existing on d5214b7e — attributed, NOT caused by cal68).**
+`ninfer_gated_delta_net_test` fails 18 of 57 cases on this card. Attribution: the test binary
+built from clean stashed HEAD (`/tmp/cal68/ninfer_tests.base`) and the binary with the barrier
+change (`ninfer_tests.new`) produce **byte-identical logs** (empty diff, 57 GDN_CASE lines each,
+identical GDN_PROFILE tail). The two failure clusters:
+
+1. **Catastrophic** — `out` rel_l2 ~1e35–1e36 (garbage, not noise), on **every shape with
+   `tokens % 16 == 1`**: qwen-27b 16/48 T=1025 (normalized + raw), qwen-35b-a3b 16/32 T=1025,
+   kimi-k3 96/96 T=1025, glm5.3-flash 64/64 T=1025, 35b weak-decay and zero-decay T=4097,
+   generic-grouped-map 5/15 T=65 (both profiles), unit-beta 1/3 T=257, raw prefill boundary
+   5/15 T=17, raw uneven continuation 5/15 T=1025. The `state` checks stay mild in the same
+   cases — the delta chain feeding the state is fine; the garbage is confined to the
+   **output/history path**. Suppression pattern supports this: strong-decay T=65 cases are only
+   mild (decay coefficients `exp(g_last−g_k)` suppress intra-chunk garbage rows) while
+   ordinary/weak/zero-decay cases explode — the garbage multiplies through intra-chunk history.
+   Leading hypothesis: **tail-chunk padding** — for the last chunk (`length = min(16,
+   tokens − start)` = 1), prepare.cu writes a full `ControlChunk`/`QkChunk` workspace chunk and
+   `load_stage` stages it verbatim via unconditional `cp_async<16,cg>`; rows 1..15 of the tail
+   chunk are suspect. Next probe (cal69): smallest catastrophic case H=5/15 T=17 raw, dump the
+   tail chunk's Qk/Control bytes and the out row for token 16 against reference.
+2. **Mild** — state rel_l2 0.0030–0.0037 vs the 0.003 limit at prefix=1025 (≤1.23× limit;
+   TF32 accumulation margin at the 64-chunk prefix) plus the raw prefill-boundary T=16 gross
+   ratio 1.15. These are accumulation-margin overshoots, not garbage.
+
+**Docs staleness:** line 252 of this file records `ninfer_gated_delta_net_test` PASS at wmma-ship
+time (2026-10-22) — that was on the reference (3090) machine; the T≡1 mod 16 cluster is a
+regression and/or gfx1102-specific on this card. Treat the PASS claim as stale for gfx1102.
+The handoff's "pre-existing failures" framing is confirmed here **by evidence** (baseline-binary
+diff), not assumed — per the standing "verify, don't trust the handoff" rule.
