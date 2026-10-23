@@ -142,6 +142,7 @@ __device__ __forceinline__ void store_output(const Arguments& args, float (&acc)
     }
 }
 
+#if defined(__HIPCC__)
 // ---------- hardware-WMMA variant (gfx1102; probes cal25/26/30/32/33/34/35) ----
 //
 // Variant of chunk_recurrence_kernel below running the NT >= kWarps shape's MMA
@@ -281,6 +282,7 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
                              row] = chunk_p[e];
     }
 }
+#endif // defined(__HIPCC__)
 
 template <int DV>
 __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurrence_kernel(
@@ -494,6 +496,7 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
     }
 }
 
+#if defined(__HIPCC__)
 // Hardware-WMMA variant gate for the DV=64 shape (t2_a8's idiom; read once).
 inline bool rec_wmma_native() {
     static const bool enabled = [] {
@@ -502,11 +505,13 @@ inline bool rec_wmma_native() {
     }();
     return enabled;
 }
+#endif // defined(__HIPCC__)
 
 template <int DV>
 void launch(const Arguments& args, const QkChunk* qk, const ControlChunk* control,
             cudaStream_t stream) {
     constexpr int shared_bytes = sizeof(RecurrenceShared<DV>);
+#if defined(__HIPCC__)
     if constexpr (DV == 64) {
         if (rec_wmma_native()) {
             CUDA_CHECK(cudaFuncSetAttribute(chunk_recurrence_wmma_kernel<DV>,
@@ -520,6 +525,7 @@ void launch(const Arguments& args, const QkChunk* qk, const ControlChunk* contro
             return;
         }
     }
+#endif // defined(__HIPCC__)
     CUDA_CHECK(cudaFuncSetAttribute(chunk_recurrence_kernel<DV>,
                                     cudaFuncAttributeMaxDynamicSharedMemorySize, shared_bytes));
     chunk_recurrence_kernel<DV>
