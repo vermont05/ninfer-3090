@@ -334,19 +334,23 @@ reference.
   L2 (2 MB), so it cannot be kept resident, and a weight-stationary layout would still be
   capped at the same 237.6 GB/s DRAM ceiling. **Do not pursue the activation/weight-staging
   redesign.**
-  **What this does and does not say.** It means the *int8* GEMM kernel has no headroom (making
-  it faster buys ~11.6 ms/chunk), and weight staging/persistence cannot help. It does **not**
-  mean the card cannot do fast prefill. **Correction to the earlier "250 t/s not reachable on
-  this hardware" claim — that was over-generalized and is retracted.** The **same RX 7600M XT**
-  runs the Prism `llama-server` service (`bonsai-egpu`, port 8090) at **296 t/s prefill**
-  (4069-tok prompt → 296.2 t/s; decode **22.2 t/s** with ngram spec off, 21.0 with it — the
-  ngram drafts were barely accepted at 18.75%, a mild net loss) on **Swift-Bonsai-2-PQ2_0**, a
-  **2.13-bpw** product-quantized 27B (7.2 GB). A DRAM-bound prefill scales as
-  ≈ (tokens/block) × DRAM_BW / weight_bytes: the card streams the same 237.6 GB/s either way,
-  so the ~1.8x prefill gap (NInfer-int8 ~165 t/s vs Prism-PQ2_0 ~296 t/s) is set mostly by
-  **weight bytes per token** — int8 (≈8 bpw) streams ~4x the bytes of 2.13-bpq PQ. **The card is
-  not the wall; the int8 weight stream is.** The lever for 300+ t/s prefill on NInfer is a
-  **lower-bit (≈2-bit-class) weight stream**, not more DRAM and not a faster int8 kernel.
+  **What this does and does not say — and a second correction.** The *weight-bit* lever I
+  proposed earlier ("compress int8 → 2-bit") is a **non-goal: NInfer's T2 weights are already
+  2-bit-class.** T2 = ternary codes {-1,0,+1}, two bits each, four per byte, one fp16 scale per
+  128 → **2.125 bpw** (`src/core/weight.h:36-38`). The `a8`/`int8` in the kernel names is the
+  **activation** dtype, not the weights. So NInfer (T2, 2.125 bpw) and Prism (PQ2_0, 2.13 bpw)
+  stream the **same weight bit-rate** — the earlier "int8 streams ~4x the bytes" line was wrong.
+  The **same RX 7600M XT** runs the Prism `llama-server` service (`bonsai-egpu`, port 8090) at
+  **296 t/s prefill** (4069-tok prompt → 296.2 t/s; decode **22.2 t/s** with ngram spec off,
+  21.0 with it — ngram drafts barely accepted at 18.75%, a mild net loss) on that 2.13-bpw 27B.
+  **At equal weight bit-rate, the ~1.8x prefill gap (NInfer ~165 t/s vs Prism ~296 t/s) is a
+  kernel/access-efficiency gap, not a bit-rate gap:** NInfer's T2 prefill GEMM runs at ~80% of
+  the DRAM ceiling with a 32x weight re-read access pattern (cal38), whereas Prism's tuned
+  PQ2_0 mmq kernels reach a higher effective throughput on the same bytes. **The lever for 300+
+  t/s is closing that efficiency/traffic gap** — DRAM utilization (80% → near-peak) plus
+  reducing *effective* weight re-read traffic via L2-aware tiling / a weight-stationary panel
+  layout that matches Prism's access pattern — and cutting non-GEMM (attention/GDN) overhead.
+  It is **not** weight-bit reduction (already at the 2-bit floor) and **not** more DRAM.
 - **Raster A/B is inconclusive** (2026-10-22, `NINFER_T2_A8_RASTER`, W=1024 cold-boot, 3
   reps): default `cols`-fast (x=columns) median **165.2 tok/s** vs `rows`-fast (x=rows)
   **163.7 tok/s** — a ~1% delta. Two 3-run sets do not by themselves establish a noise
@@ -355,18 +359,22 @@ reference.
 
 ## Goal (set 2026-10-22)
 
-Targets for the NInfer 27B stack on the **RX 7600M XT** (gfx1102, 16 CUs, 237.6 GB/s DRAM):
+Targets for the NInfer 27B stack (T2 ternary, **2.125 bpw** weights) on the **RX 7600M XT**
+(gfx1102, 16 CUs, 237.6 GB/s DRAM):
 
-- **Prefill (PP): 300+ t/s.** Reachable on this card — the Prism PQ2_0 (2.13-bpw) service
-  already does 296 t/s here. The NInfer-side path is a **lower-bit (≈2-bit-class) weight
-  stream** so the DRAM-bound GEMM streams far fewer bytes/token (int8 → ~2-bit is ~4x fewer
-  weight bytes, the dominant prefill cost). This is the primary lever; it is real quantization
-  work with a perplexity-quality gate, not a kernel tweak.
+- **Prefill (PP): 300+ t/s.** Reachable on this card at the *current* weight bit-rate — Prism's
+  2.13-bpq PQ2_0 service already does 296 t/s here, and NInfer's T2 weights are the same
+  2.125 bpw. The path is **closing the T2 prefill GEMM efficiency gap**, not a new quant format:
+  (a) lift DRAM utilization from ~80% toward the 237.6 GB/s ceiling, and (b) cut *effective*
+  weight re-read traffic with an L2-aware / weight-stationary tiling that matches Prism's mmq
+  access pattern. Plus cutting non-GEMM (attention/GDN) overhead. Weights are already at the
+  2-bit floor; the sub-2-bit GGML formats (IQ2_XXS/IQ2_S/IQ1_M) have no in-tree kernels and there
+  is no PQ/VQ path, so going below 2.125 bpw would be a from-scratch format build — not the path.
 - **Decode (TS): 25–30 t/s.** No-spec Prism baseline on this card is 22.2 t/s; closing the gap
   to 25–30 is the decode-side lever (separate from prefill).
 
-Baseline to beat (NInfer int8, 1,065-tok prompt): **~165 t/s prefill**. The gap to 300+ t/s is
-~1.8x, to be closed mostly by the weight-stream compression above.
+Baseline to beat (NInfer T2, 1,065-tok prompt): **~165 t/s prefill**. The gap to 300+ t/s is
+~1.8x at equal weight bit-rate, to be closed by the GEMM efficiency/traffic work above.
 
 ## 4. Decode backlog (only if decode is resumed — parked for now)
 
