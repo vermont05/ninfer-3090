@@ -433,6 +433,48 @@ reference.
   (`cal57`) is the next probe. Separately, **B is a bit-exact, zero-kernel-change knob** (the
   per-block computation is identical; only the blockIdx mapping changes) worth an engine-level
   A/B — its DRAM halving also relieves cross-kernel L2 pressure in the warm multi-GEMM context.
+- **Shape battery: the request model is exact; register spill — not shape — kills big tiles
+  (2026-10-23, `cal57`, MF/NF/MINB battery on schedule B, gate_up shape, cold-L2 timed launches,
+  timings + GL2C counters + `.amdhsa` metadata).** Cold best-of-5 (ms) with measured requests,
+  DRAM reads, scratch, and the time model `t = max(reqs/6.6 Greq/s, DRAM/510 GB/s, wr/225 GB/s)`:
+
+  | shape (MF,NF,MINB) | ms | reqs M | DRAM GB | wr GB | spill B | model ms | binding |
+  | --- | --- | --- | --- | --- | --- | --- | --- |
+  | (1,2,8) control | 29.9 | 176 | 7.85 | 0.214 | 36 | 26.7 | requests |
+  | **(2,2,8)** | **29.4** | 197 | 15.0 | 0.187 | 44 | 29.8 | requests≈DRAM |
+  | (1,2,16) | 67.5 | 741 | 38.5 | 22.0 | 304 | 97.8 | spill traffic |
+  | (2,2,16) | 91.8 | 1080 | 50.6 | 34.3 | 440 | 152.6 | spill traffic |
+  | (4,2,8) | 49.3 | 434 | 26.9 | 9.57 | 460 | 65.7 | spill traffic |
+  | (2,4,8) | 44.6 | 454 | 19.6 | 10.1 | 492 | 45.0 | spill traffic |
+  | (4,4,8) | 104.7 | 1095 | 48.6 | 43.0 | 1272 | 191 | spill traffic |
+  | (1,4,8) | 49.7 | 526 | 25.4 | 17.0 | 432 | 79.7 | spill traffic |
+
+  **The request model validates exactly.** x-panel requests ∝ 1/(MF·NF) as predicted: (1,2) 155 M
+  → (2,2) 88 M → (4,2)/(2,4) 44 M of x traffic; weight requests ∝ 32/NF per launch
+  (32 token-block rows × 4.28 M weight reqs: 143 M at NF=2, 71 M at NF=4), which is exactly the
+  DRAM growth (weights re-read 32/NF times: 1.43 → 2.9 → 7.2 GB). The 2896-reqs/block sector
+  model carries through every spill-free shape.
+  **The return-path ceilings are confirmed:** (2,2,8) at 197 M reqs runs 29.4 ms = 6.70 Greq/s
+  **and** 15.0 GB = 512 GB/s simultaneously — both ceilings reached, matching cal55/56's
+  independent numbers (≈6.6 Greq/s, ≈510 GB/s pure read). The three-way model predicts **all 8
+  shapes within ±10 %**; every loser is bound by **spill write traffic**, not by shape:
+  MINB=16 forces 64 VGPR (the code's natural allocation is 128) → 304–440 B scratch → 22–34 GB
+  of write traffic per launch (150–240× the output array); the big MINB=8 tiles spill 432–1272 B
+  for the same reason (`accf[MF][NF][8]` = 12·MF·NF of the 64 VGPR budget, leaving too few for
+  loop state — spill bytes ≈ 4·(VGPRs needed above 64) − 12, exact across all shapes).
+  **Consequences:** (i) **(2,2)@8 is a real, bit-exact −4 %** on schedule B (29.4 vs 29.9 ms;
+  nearly spill-free at 44 B); (ii) the request-floor arithmetic says the **target shape is
+  (1,4)@8** — 79 M reqs (44 M x + 32/NF·4.28 M weights) + 7.15 GB ⇒ model **13.2 ms, ~3× the
+  control** — and it is *register-bound*, not algorithmically dead: 48 accf VGPRs leave 16 for
+  loop state where ~48 are needed. The path is a register diet (hoisted single-pointer walks,
+  LDS-staged x panel to kill address registers, `xs`-style scale hoisting) to fit (1,4) in the
+  64-VGPR/8-blocks budget spill-free; (iii) weight traffic ∝ 32/NF means panel-style L2 blocking
+  (the engine's `Panel` mode) is the complement: at NF=4 with the in-flight set kept ≈1.4 MB
+  (≤2 MB L2), DRAM falls to x-once + weights-once ≈ 6.7 GB ⇒ 13 ms stays DRAM-legal, and
+  92 M reqs ⇒ **~14 ms/launch ≈ 2.1× — the full 300 t/s GEMM budget on this card**. (iv) All
+  shapes are bit-identical by construction (same per-block computation as the shipped tile;
+  cal57 kernel bodies are verbatim copies), so any shipped change needs only engine-level
+  end-to-end verification.
 - **Raster A/B is inconclusive** (2026-10-22, `NINFER_T2_A8_RASTER`, W=1024 cold-boot, 3
   reps): default `cols`-fast (x=columns) median **165.2 tok/s** vs `rows`-fast (x=rows)
   **163.7 tok/s** — a ~1% delta. Two 3-run sets do not by themselves establish a noise
