@@ -362,14 +362,12 @@ reference.
   full **128-byte** DRAM line (`GL2C_EA_RDREQ_128B`); with 2 MB L2 against a 44.5 MB working set
   the lines evict between the 4 sub-reads of one line and across the 32 token-block re-reads, so
   each 128B line is fetched from DRAM multiple times. (gfx1102 exposes GL2C PMC counters in the
-  TheRock rocprofv3 1.4.1; no system rocprof/nsys.) **Counter caveat (unreconciled):** taken
-  literally the reported **22.1 GB in a ~30.6 ms gate_up launch implies ~720 GB/s — far above the
-  ~240 GB/s triad ceiling** — so the counter's units, dispatch aggregation, replay/accumulation
-  behavior, and its matching to a single *timed* (cold-L2) launch are **not yet reconciled** and
-  the 15–63× magnitude is **not trustworthy as stated**. The *direction* (physical DRAM traffic
-  well above the logical 1.43 GB) is consistent with the corrected ~19% logical utilization and
-  the 32× re-read pattern, but the number must be re-derived against a matched launch before it
-  is used for any roofline. **The proposed fix — read each 128B line once and derive all four
+  TheRock rocprofv3 1.4.1; no system rocprof/nsys.) **Counter caveat (RECONCILED 2026-10-23 by
+  `cal55`/`cal56` — see the reconciliation block below):** the per-dispatch DRAM counters are
+  exact, the 22.1 GB warm figure is real traffic, and the "implies ~720 GB/s, impossible" verdict
+  was based on the wrong ceiling (the ~240 GB/s number is the mixed read+write triad rate; pure
+  read streams sustain ~460 GB/s on this card). The traffic magnitude stands; its interpretation
+  changed — the kernel is not DRAM-bound. **The proposed fix — read each 128B line once and derive all four
   32-byte fragments from it (a coalesced `int32v` 128-byte load) — was implemented and measured
   (`cal38` `w1c` vs shipped `w1`, bit-exact bitdiff=0), and that *variant* loses:** it is ~70%
   slower (gate_up 52.5 ms vs 30.6 ms), because the persistent 128-byte register line + the
@@ -402,6 +400,39 @@ reference.
   timing; the spill counts above show the two big losses (`w1c`,`wlds`) were spill-driven, while
   `wcoop`'s small loss is barrier/staging-driven. GEMM optimization as a whole is **not** closed
   by this — only this loader family is.
+
+- **DRAM-traffic reconciliation and the real bound (2026-10-23, `cal55`/`cal56`, rocprofv3 GL2C
+  counters, shipped `w1(1,2)@8`, gate_up 34816×5120×1024, L2 flushed per timed launch).**
+  **The counters are exact.** Calibration kernels with known traffic reproduce to ±5 counts:
+  a 44,564,480 B array read exactly once → 348,161–348,165 × `GL2C_EA_RDREQ_128B` (expected
+  348,160); a 512 MB pure read → 4,194,305 (expected 4,194,304). The counter unit is the 128-byte
+  DRAM read request (gfx11 exposes no `GL2C_EA_WRREQ_128B`; writes count in 64 B units).
+  **Cold-L2 w1 = 13.7–13.8 GB reads per launch in 30.4 ms ≈ 450–460 GB/s** — at the card's
+  **pure-read** stream ceiling, ≈ the worst-case logical re-read bound (x panels re-read by all
+  2176 weight blocks = 11.4 GB + weights re-read by all 32 token blocks = 1.43 GB = 12.83 GB)
+  ⇒ **L2 reuse between blocks ≈ 0**: the shipped schedule varies the token dim fastest, so
+  co-resident blocks (512 = 16 CU × 8 blocks/SIMD × 4 SIMD) thrash up to 5.2 MB of 163 KB x
+  panels through the 2 MB L2. The 22.1 GB warm figure scales with T (the engine prompt runs
+  T = 4210, where the x re-read bound is ~52.8 GB) and is real; it looked impossible only
+  against the **mixed R+W triad rate (~225 GB/s measured here)** — the ~240 GB/s ceiling the
+  caveat used is not the read ceiling (256-bit GDDR6 @ 18 Gbps = 576 GB/s theoretical).
+  **Schedule A/B (`cal56`): halving DRAM traffic buys ~4%.** B = `rows_fast=true`, grid
+  (2176, 32): consecutive block ids share ONE x panel (fits L2) and stream weights. DRAM reads
+  13.7 → 7.2–7.5 GB (−47%; MISS 108 M → 63 M, HIT 85–102 M → 110–119 M) but time moves
+  30.4 → 29.7 ms cold (31.3 → 30.1 ms warm). **So the GEMM is not DRAM-bound.** The binding
+  resource is the **GL2C request/sector-return path (~850 GB/s of combined return measured here;
+  ~6.6 Greq/s)**: total requests (HIT+MISS) 202 M/launch at A, 176 M at B. Per-block sector
+  model: x-panel loads = 16 B/lane from 16 rows (`colWin = lane>>1` ⇒ lane pairs broadcast, each
+  32 B sector half-used — 50 % waste) → 2560 reqs + weights 320 + out ~32 = **2896 predicted vs
+  2898 measured** requests/block; **x loads are 88 % of all requests** (writes show ~1.5×
+  amplification: 213.8 MB measured vs the 142.6 MB output array).
+  **The lever is therefore requests/block, not DRAM bytes:** requests ∝ 1/MF (x-panel traffic per
+  block is fixed, block count ∝ 1/MF) and the 50 % sector waste is removable by LDS staging;
+  register pressure (`accf[MF][NF][8]` + int8v accs = 64 i32 at MF1/NF2) trades against
+  occupancy (launch_bounds(32, MINB); 8 blocks/SIMD ⇒ ≤64 VGPR). A MF/NF/MINB shape battery
+  (`cal57`) is the next probe. Separately, **B is a bit-exact, zero-kernel-change knob** (the
+  per-block computation is identical; only the blockIdx mapping changes) worth an engine-level
+  A/B — its DRAM halving also relieves cross-kernel L2 pressure in the warm multi-GEMM context.
 - **Raster A/B is inconclusive** (2026-10-22, `NINFER_T2_A8_RASTER`, W=1024 cold-boot, 3
   reps): default `cols`-fast (x=columns) median **165.2 tok/s** vs `rows`-fast (x=rows)
   **163.7 tok/s** — a ~1% delta. Two 3-run sets do not by themselves establish a noise
