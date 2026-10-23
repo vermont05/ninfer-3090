@@ -429,13 +429,24 @@ Targets for the NInfer 27B stack (T2 ternary, **2.125 bpw** weights) on the **RX
   as a whole; the ~80% headroom to the DRAM ceiling on logical packed-code traffic is real. The
   other major lever is the **mixer/attention time** — with the correction that this bucket
   **includes the mixer projection GEMMs**, so a faster GEMM *can* help it (the earlier "no GEMM
-  change touches the 45%" framing was wrong). Prefill-bucket profile at W=1024
-  (`NINFER_PREFILL_PROFILE=1`, single 1024-tok chunk, total 5084 ms): MLP GEMMs
-  (gdn_mlp 2137 ms + attn_mlp 682 ms) ≈ 55%; mixers/attention (gdn_mixer 1279 ms + attn_mixer
-  985 ms, incl. the GDN recurrent scan, attention, and their projection GEMMs) ≈ 45%. This 55/45
-  split is **first-chunk-only**: in the same run attention grew ~0.99 s → 4.41 s across the four
-  chunks, so on the 4,000-tok Prism reference the mixer/attention share is materially larger and
-  the attention path is the higher-priority thing to profile next.
+  change touches the 45%" framing was wrong). **Long-prompt bucket profile (measured 2026-10-22,
+  `NINFER_PREFILL_PROFILE=1`, 4,210-tok prompt → four 1024-tok prefill chunks, TTFT 29.2 s =
+  144 t/s):** every GEMM bucket is *flat* across chunks while the attention path *grows linearly*:
+    | chunk (ctx) | gdn_mixer | gdn_mlp | attn_mixer | attn_mlp | total |
+    | ~1024 | 1274 | 2140 | 982 | 677 | 5074 |
+    | ~2048 | 1275 | 2135 | 2114 | 678 | 6203 |
+    | ~3072 | 1282 | 2147 | 3232 | 680 | 7341 |
+    | ~4096 | 1284 | 2142 | 4379 | 683 | 8488 |
+    | **Σ** | 5115 | 8564 | **10707** | 2718 | **27104** |
+  (ms, per chunk). **At 4,096 context the attention path (`attn_mixer`) is 4,379 ms = 52% of that
+  chunk and 10,707 ms = 39.5% of the whole 27.1 s prefill** — it is the single largest and only
+  growing cost. The GEMM-dominated buckets (gdn_mlp 8564 + attn_mlp 2718 + gdn_mixer's projection
+  share) are the flat ~60%. **So 300+ t/s at long context needs BOTH levers, each roughly 2×:**
+  the flat GEMM work (~2× → −8 s) *and* the growing attention path (~2× → −5 s) together take
+  27.1 s → ~14 s ≈ 300 t/s. Neither lever alone gets there. This is the "real longer-prompt
+  attention path" the plan called for profiling — it is now characterized: attention is ~40% of
+  long-context prefill and scales linearly with context, so it is a first-class lever alongside
+  GEMM, not a residual.
 - **Decode (TS): 25–30 t/s.** No-spec Prism baseline on this card is 22.2 t/s; closing the gap
   to 25–30 is the decode-side lever (separate from prefill).
 
