@@ -1140,3 +1140,70 @@ samples, not ABBA; the 2.25-2.76x kernel-only figures exclude preparation and do
 end-to-end speed or model quality. Its packed representation does not establish the later
 1.06-bpw projection, nor does four-bit arithmetic halve the mathematical MAC count.
 
+
+## The BF16 prompt-attention candidate now has a multi-token ABBA: +25.9 % prefill, decode unchanged, output coherent
+
+**What is in this commit** (`src/ops/softmax_attention/dense/causal_cache/`): the native BF16 WMMA QK
+path for the 64-query-row prompt schedule (`bf16/tiled_mma.cuh`: `__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32`
+replaces the ldmatrix+mma sequence for that shape on HIP); the diet-path 4-warp QK changes and the LDS
+64 KiB static_assert in `prompt_i8_fa2.cuh`; split plans keeping their key splits at the warp count the
+shape fit to, with only the fitted stage count instantiated (`prompt_i8_fa2.cu`, `prompt_i8_fa2_plan.h`,
+`small_t_i8_launch.cuh`, `bf16/template_launch.cuh`); and the test-side coverage in
+`tests/ops/softmax_attention/causal_cache.cpp`. The i8 fan-out packed-select stays **production
+default-off**: the diet loop keeps the original form and `-DNINFER_FA2_QK_PACK_ON` selects the packed
+form for isolated experiments only.
+
+The pre-existing ordinary causal-attention CTest abort in NVFP4 decode (`hipErrorInvalidValue`) is
+**not** from this change: `/tmp/cal68/ninfer_tests.base` reproduces the identical failure on the base
+tree.
+
+
+Measured 14:56–15:00 on 2026-10-23, four legs inside **one** `flock /tmp/ninfer-gpu.lock` hold
+(`/tmp/queue-bf16-mt.sh` → `/tmp/attn-bf16-abba-mt.sh` → `/tmp/bf16-mt-abba.log`, `rc=0`, lock
+released 15:00:31). `ROCR_VISIBLE_DEVICES=1`, `ROCBLAS_TENSILE_LIBPATH=$HOME/opt/rocblas-gfx1102/library`,
+`NINFER_T2_DECODE=simt`, `NINFER_T2_I8_SMALL=off`, model `bonsai2_27b_text_swift.ninfer`.
+Arms `/tmp/codex-attn-serve-base` (sha `e67625fc…`) vs `/tmp/codex-attn-serve-new` (sha `2c4176bc…`);
+the queue asserts the two are **not the same bytes** (`exit 23`) before the card is touched — a null pair
+would produce a "win" out of nothing, so that check gates every rate number below.
+
+The prior evidence for this pair was a server ABBA at a ~4,210-token BF16-KV prompt with
+**`max_tokens=1`** (145.75 → 166.75 tok/s). That form proves the launch and the first token agree; it
+cannot support a claim about model output, and the requirement was a real multi-token completion.
+This run is `max_tokens=96`, `temperature=0`, prompt **5,106 tokens** (measured from the server's own
+`req#1 done | … | prompt 5,106` line, not from the generator), KV cache reported by the server as
+`KV 8,192 tokens, bf16, explicit`, legs base/cand/cand/base.
+
+| leg | arm | prefill tok/s | decode tok/s | TTFT | output text sha1 | chars |
+|---|---|---|---|---|---|---|
+| 1 | base | **137.1** | 12.1 | 37.3 s | `50299a415d67` | 451 |
+| 2 | cand | **171.6** | 12.0 | 29.8 s | `a20ac8c9052a` | 447 |
+| 3 | cand | **170.8** | 12.0 | 29.9 s | `a20ac8c9052a` | 447 |
+| 4 | base | **134.9** | 12.0 | 37.8 s | `50299a415d67` | 451 |
+
+- **Prefill: base mean 136.0, cand mean 171.2 → +35.2 tok/s = +25.9 %.** The off-leg spread is 2.2 tok/s
+  within base (1.6 %) and 0.8 within cand (0.5 %); the delta is ~16× the larger spread, so it is not
+  inside noise, and the ABBA order is what licenses the comparison. TTFT moves 37.55 s → 29.85 s (−20.5 %),
+  the same effect seen from the other side.
+- **Decode: 12.1 / 12.0 / 12.0 / 12.0 tok/s — flat.** Expected: the change is in the prompt-attention
+  path only, and this is the check that the win is not being paid for by a slower decode.
+- **Determinism per arm: base1 == base2 and cand1 == cand2 by output sha1.** At `temperature=0` each arm
+  reproduces its own 96-token completion byte-for-byte across a restart.
+- **The arms are not token-identical, and that is the honest outcome.** They share a 415-character prefix
+  (93 % of the shorter completion) and then differ by a lexical choice: base writes "…serves as a reliable
+  **course marker** for sailors.\" Title: ", cand writes "…serves as a reliable **beacon** for sailors.\"
+  Title: \"The". A BF16 WMMA path that changes the accumulation order is *expected* to land on a different
+  synonym around token 90; it is not expected to be bit-exact, and bit-exactness against baseline is not
+  what this candidate is being judged on. The standalone FP64/bitwise evidence stays as the numerics
+  evidence; this ABBA is the serving evidence.
+- **Coherence, checked not assumed:** both completions are well-formed two-sentence summaries of the
+  (deliberately 156-times-repeated) lighthouse paragraph with a title starting, cut off only by the 96-token
+  limit. Repetition probe: max 8-gram repeats **1**, distinct words 82 % on both arms — the model is
+  summarising a repetitive prompt, not degenerating into it, which is the correct behaviour and the thing
+  a 1-token completion cannot show.
+
+Two limits to keep attached to the +25.9 %: it is measured at 5,106 prompt tokens, a longer prompt than
+the 4,210-token shape of the earlier pair, so it is not a like-for-like repeat of the 145.75 → 166.75
+figure (the direction agrees, the size does not transfer); and every leg ran while the census compile
+(`/tmp/qfrag-census5.sh`, `nice -n 12`, single TU) was on the CPU — small, symmetric across arms, and it
+inflates nothing on the candidate's side.
+

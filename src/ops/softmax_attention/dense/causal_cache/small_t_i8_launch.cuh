@@ -81,8 +81,19 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
             launch.template operator()<24, 1, 32, false>();
         } else if (implementation_window <= 2054) {
             launch.template operator()<12, 1, 32, false>();
+#if defined(__HIPCC__)
+        } else if (implementation_window <= 8198) {
+            // RDNA3 gives a thread group at most 64 KiB of LDS, and ROCr counts the kernel's
+            // static arrays against it. The Bc=64 arena asks 4 * 64 * 256 = 65,536 dynamic on top
+            // of the ~19 KiB static it leaves behind, so its max-dynamic request is refused and
+            // the launch would need 84,928. Dropping the arena for Bc=32 (48,832 static on the
+            // 27B slice) is the largest legal shape on this tier; 2K to 8K pays the extra key
+            // loop iterations that Bc=64 would have saved.
+            launch.template operator()<12, 1, 32, false>();
+#else
         } else if (implementation_window <= 8198) {
             launch.template operator()<12, 1, 64, true>();
+#endif
         } else {
             launch.template operator()<6, 2, 32, false>();
         }

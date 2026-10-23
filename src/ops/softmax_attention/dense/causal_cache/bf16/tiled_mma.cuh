@@ -158,6 +158,43 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
         for (int nt = 0; nt < QKNt; ++nt) {
             score[nt][0] = score[nt][1] = score[nt][2] = score[nt][3] = 0.0f;
         }
+#if defined(__HIPCC__)
+        if constexpr (Schedule::kQueryRows == 64) {
+        using Bf16Fragment = short __attribute__((vector_size(32)));
+        using FloatFragment = float __attribute__((vector_size(32)));
+#pragma unroll
+        for (int nt16 = 0; nt16 < Bc / 16; ++nt16) {
+            FloatFragment dots{};
+            const int key_row = nt16 * 16 + (lane < 16 ? lane / 2 : 8 + (lane - 17) / 2);
+            const int query_row = warp_row0 + (lane & 15);
+#pragma unroll
+            for (int kk = 0; kk < QKKs; ++kk) {
+                Bf16Fragment keys, query;
+                auto* kp = reinterpret_cast<int4*>(&keys);
+                auto* qp = reinterpret_cast<int4*>(&query);
+                kp[0] = *reinterpret_cast<const int4*>(&k_s[key_row * D + causal_swizzle(key_row, kk * 16)]);
+                kp[1] = *reinterpret_cast<const int4*>(&k_s[key_row * D + causal_swizzle(key_row, kk * 16 + 8)]);
+                qp[0] = *reinterpret_cast<const int4*>(&q_s[query_row * D + causal_swizzle(query_row, kk * 16)]);
+                qp[1] = *reinterpret_cast<const int4*>(&q_s[query_row * D + causal_swizzle(query_row, kk * 16 + 8)]);
+                dots = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(keys, query, dots);
+            }
+            float rows0[8], rows1[8], rows2[8], rows3[8];
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                rows0[e] = __shfl(dots[e], gid);
+                rows1[e] = __shfl(dots[e], gid + 8);
+                rows2[e] = __shfl(dots[e], gid + 16);
+                rows3[e] = __shfl(dots[e], gid + 24);
+            }
+            const int j = 2 * lid;
+            score[2 * nt16][0] = rows0[j]; score[2 * nt16][1] = rows0[j + 1];
+            score[2 * nt16][2] = rows1[j]; score[2 * nt16][3] = rows1[j + 1];
+            score[2 * nt16 + 1][0] = rows2[j]; score[2 * nt16 + 1][1] = rows2[j + 1];
+            score[2 * nt16 + 1][2] = rows3[j]; score[2 * nt16 + 1][3] = rows3[j + 1];
+        }
+} else
+#endif
+        {
         // Swizzled ldmatrix addresses via precomputed per-lane bases + immediates.
         unsigned af[2][4];
         unsigned bf[2][QKNt][2];
@@ -193,6 +230,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
                 mma_bf16(score[nt][0], score[nt][1], score[nt][2], score[nt][3], af[cur][0],
                          af[cur][1], af[cur][2], af[cur][3], bf[cur][nt][0], bf[cur][nt][1]);
             }
+        }
         }
 
         ninfer::ops::cp_wait<0>(); // V(kb) landed; QK done reading k_s.

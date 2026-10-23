@@ -42,9 +42,11 @@
 //     that bound past the FP16 range decodes V with its scales divided by an exact power of two
 //     and multiplies the partial back at promotion.
 //   * CTAs issue longest-first, so a causal prompt's heaviest row blocks do not form the tail.
-//   * A split launch (gridDim.z > 1, eight-warp CTAs only) gives each CTA a contiguous run of key
-//     pages; each CTA publishes its normalized FP32 rows and their (max, sum), and
-//     causal_attention_prompt_i8_fa2_merge_kernel combines the splits in FP32.
+//   * A split launch (gridDim.z > 1) gives each CTA a contiguous run of key pages; each CTA
+//     publishes its normalized FP32 rows and their (max, sum), and
+//     causal_attention_prompt_i8_fa2_merge_kernel combines the splits in FP32. A partial row
+//     belongs to exactly one warp at either CTA width (Br == Warps * 16, eight row-pairs per
+//     warp), so splits are legal for four-warp CTAs as well as eight-warp ones.
 //
 // This kernel replaced the sixteen-warp tiled prompt kernel (FP32 PV accumulation, P staged through
 // shared memory) for every INT8-family launch. Measured against it on the RTX 3090 (2026-10-10,
@@ -65,6 +67,14 @@
 #include <type_traits>
 
 namespace ninfer::ops {
+
+// The wave32 QK^T path below is A/B-able by compiling it out with
+// -DNINFER_FA2_IU8_W32_OFF: both arms then run the same source tree, differing only in how the
+// G64 score block is issued, which is what an ABBA on this diet needs.
+#if defined(__HIPCC__) && !defined(NINFER_FA2_IU8_W32_OFF)
+using CausalPromptI8Fragment = int __attribute__((vector_size(16)));
+using CausalPromptI32Fragment = int __attribute__((vector_size(32)));
+#endif
 
 inline constexpr int kCausalPromptFa2Bc     = 64;
 inline constexpr int kCausalPromptFa2Groups = kCausalPromptHeadDim / kKVCacheInt8Group;
@@ -133,9 +143,19 @@ static_assert(CausalPromptFa2Shape<4, true, true, 1>::SmemBytes <= 65536);
 // already do for unpacked keys, so no 2-stage shape can be configured on this device family. An
 // over-ceiling shape is rebuilt smaller before the launch configures it: drop to one stage first,
 // and only then to four warps. A one-stage four-warp shape fits every INT8 geometry, so the
-// descent always terminates there. (A descended 8-warp split shape falls to four warps and runs
-// unsplit; the four-warp shape sweeps the same keys, so the result is unchanged.)
+// descent always terminates there. (A descended 8-warp split shape keeps its plan splits at four
+// warps: the partial layout and the merge name no warp count, so the query's split bytes are the
+// bytes the launch allocates, and four-warp CTAs sweep the same keys as narrower row blocks.)
 inline constexpr int kCausalPromptFa2LdsCeilingBytes = 64 * 1024;
+// The descent's trigger, pinned to the byte law: unpacked K and V (int8-g64) exceed the ceiling
+// even at one stage with eight warps, so int8-g64 is the only storage the fit pushes to four warps,
+// and both packed codings keep the eight-warp shape the plan asked for.
+static_assert(CausalPromptFa2Shape<8, false, false, 1>::SmemBytes > kCausalPromptFa2LdsCeilingBytes,
+              "int8-g64 needs four warps: one stage at eight warps exceeds the RDNA3 LDS ceiling");
+static_assert(CausalPromptFa2Shape<8, true, false, 1>::SmemBytes <= kCausalPromptFa2LdsCeilingBytes,
+              "packed-value one-stage eight-warp must fit the RDNA3 LDS ceiling");
+static_assert(CausalPromptFa2Shape<8, true, true, 1>::SmemBytes <= kCausalPromptFa2LdsCeilingBytes,
+              "packed one-stage eight-warp must fit the RDNA3 LDS ceiling");
 
 template <typename Shape>
 struct CausalPromptFa2LdsFit {
@@ -246,7 +266,7 @@ causal_attention_prompt_i8_fa2_kernel(const __nv_bfloat16* __restrict__ q,
     static_assert(GroupKc == 2);
     static_assert(GroupDBlocks == 4);
     static_assert(AccBlocks * AccTiles == 32);
-    static_assert(!Split || Warps == 8, "only eight-warp CTAs split");
+    static_assert(!Split || Warps == 4 || Warps == 8, "four- and eight-warp CTAs split");
 
     extern __shared__ __align__(16) unsigned char smem_raw[];
     std::int8_t* q_i8    = reinterpret_cast<std::int8_t*>(smem_raw);
@@ -558,6 +578,101 @@ causal_attention_prompt_i8_fa2_kernel(const __nv_bfloat16* __restrict__ q,
         }
 #pragma unroll
         for (int grp = 0; grp < Groups; ++grp) {
+#if defined(__HIPCC__) && !defined(NINFER_FA2_IU8_W32_OFF)
+            if constexpr (!PackedValues && !PackedKeys && Warps == 4 && Stages == 1) {
+            // Native wave32 fragments: one lane supplies a query row and the
+            // paired slots supply 16 key rows. Four instructions cover G64.
+#pragma unroll
+            for (int nt16 = 0; nt16 < Bc / 16; ++nt16) {
+                CausalPromptI32Fragment dots{};
+                const int key_row = nt16 * 16 + (lane < 16 ? lane / 2 : 8 + (lane - 17) / 2);
+                const int query_row = row_base + (lane & 15);
+#pragma unroll
+                for (int kk = 0; kk < 4; ++kk) {
+                    const int col = grp * 32 + kk * 8;
+                    const auto keys = *reinterpret_cast<const CausalPromptI8Fragment*>(
+                        &k_b16[key_row * DB16 + causal_prompt_swz(key_row, col)]);
+                    const auto query = *reinterpret_cast<const CausalPromptI8Fragment*>(
+                        &q_b16[query_row * DB16 + causal_prompt_swz(query_row, col)]);
+                    dots = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(
+                        true, keys, true, query, dots, false);
+                }
+                // Convert native [query row][8 keys] ownership to the existing
+                // four-lane row layout used by softmax and PV.
+                //
+                // The consumer (lane gid) needs only words {2*lid, 2*lid+1} of the accumulator from each
+                // of source lanes gid, gid+8, gid+16, gid+24; all 32 shuffles are required (the slot a
+                // shuffle carries is lane-uniform, the needed word index is not - proven by the cal72
+                // probe, docs/remaining-work.md item (iv)). What is avoidable is HOW they are read out:
+                // materialising all 8 words from all 4 sources (32 live values) and then indexing them
+                // with the DYNAMIC j = 2*lid forces that array through scratch, which the tile loop
+                // reloads every iteration. The packed form below fetches one source group at a time and
+                // picks R[2*lid], R[2*lid+1] with a compare-and-select tree: same 32 shuffles, same
+                // values, peak 8 live values per group, no dynamic index.
+                // .qual/wmma/cal73.cu certifies it bit-exact (0 mismatches of 32768 vs the form below,
+                // 64 random-i8 seeds; and 0 vs the independent host dot product over the proven map).
+                // The packed form lost its server ABBA (176.35 vs 177.0 tok/s, within the fan-out
+                // arm's 2.8 tok/s spread), so the direct fan-out remains the production form.
+                // -DNINFER_FA2_QK_PACK_ON selects the packed form for a future isolated experiment.
+#if !defined(NINFER_FA2_QK_PACK_ON)
+                const int j = 2 * lid;
+                int rows0[8], rows1[8], rows2[8], rows3[8];
+#pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    rows0[e] = __shfl(dots[e], gid);
+                    rows1[e] = __shfl(dots[e], gid + 8);
+                    rows2[e] = __shfl(dots[e], gid + 16);
+                    rows3[e] = __shfl(dots[e], gid + 24);
+                }
+                const int c00 = rows0[j], c01 = rows0[j + 1];
+                const int c10 = rows1[j], c11 = rows1[j + 1];
+                const int d00 = rows2[j], d01 = rows2[j + 1];
+                const int d10 = rows3[j], d11 = rows3[j + 1];
+                const float qs0 = q_scale_r[0][grp];
+                const float qs1 = q_scale_r[1][grp];
+#pragma unroll
+                for (int half = 0; half < 2; ++half) {
+                    const int nt = 2 * nt16 + half;
+                    const int keya = nt * 8 + 2 * lid;
+                    const float ks0 = __half2float(ks_s[keya * Groups + grp]);
+                    const float ks1 = __half2float(ks_s[(keya + 1) * Groups + grp]);
+                    score[nt][0] = __fmaf_rn(qs0 * ks0, float(half ? d00 : c00), score[nt][0]);
+                    score[nt][1] = __fmaf_rn(qs0 * ks1, float(half ? d01 : c01), score[nt][1]);
+                    score[nt][2] = __fmaf_rn(qs1 * ks0, float(half ? d10 : c10), score[nt][2]);
+                    score[nt][3] = __fmaf_rn(qs1 * ks1, float(half ? d11 : c11), score[nt][3]);
+                }
+#else
+                const float qs0 = q_scale_r[0][grp];
+                const float qs1 = q_scale_r[1][grp];
+#pragma unroll
+                for (int half = 0; half < 2; ++half) {
+                    int v[2][2];  // [source row][word]: source lane = gid + 8*row + 16*half
+#pragma unroll
+                    for (int r = 0; r < 2; ++r) {
+                        int R[8];
+#pragma unroll
+                        for (int e = 0; e < 8; ++e) R[e] = __shfl(dots[e], gid + 8 * r + 16 * half);
+                        const int a0 = (lid & 1) ? R[2] : R[0];
+                        const int a1 = (lid & 1) ? R[3] : R[1];
+                        const int b0 = (lid & 1) ? R[6] : R[4];
+                        const int b1 = (lid & 1) ? R[7] : R[5];
+                        v[r][0] = (lid & 2) ? b0 : a0;  // R[2*lid]
+                        v[r][1] = (lid & 2) ? b1 : a1;  // R[2*lid+1]
+                    }
+                    const int nt = 2 * nt16 + half;
+                    const int keya = nt * 8 + 2 * lid;
+                    const float ks0 = __half2float(ks_s[keya * Groups + grp]);
+                    const float ks1 = __half2float(ks_s[(keya + 1) * Groups + grp]);
+                    score[nt][0] = __fmaf_rn(qs0 * ks0, float(v[0][0]), score[nt][0]);
+                    score[nt][1] = __fmaf_rn(qs0 * ks1, float(v[0][1]), score[nt][1]);
+                    score[nt][2] = __fmaf_rn(qs1 * ks0, float(v[1][0]), score[nt][2]);
+                    score[nt][3] = __fmaf_rn(qs1 * ks1, float(v[1][1]), score[nt][3]);
+                }
+#endif
+            }
+            } else
+#endif
+            {
             unsigned af[GroupKc][4];
 #pragma unroll
             for (int kk = 0; kk < GroupKc; ++kk) {
@@ -588,6 +703,7 @@ causal_attention_prompt_i8_fa2_kernel(const __nv_bfloat16* __restrict__ q,
                 score[nt][1]    = __fmaf_rn(qs0 * ks1, static_cast<float>(c1), score[nt][1]);
                 score[nt][2]    = __fmaf_rn(qs1 * ks0, static_cast<float>(c2), score[nt][2]);
                 score[nt][3]    = __fmaf_rn(qs1 * ks1, static_cast<float>(c3), score[nt][3]);
+            }
             }
         }
 

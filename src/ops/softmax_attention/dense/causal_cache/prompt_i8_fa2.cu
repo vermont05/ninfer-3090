@@ -16,8 +16,10 @@ namespace ninfer::ops::detail {
 namespace {
 
 // Launches attention for a concrete (compile-time) fitted shape: the warps/stages the shape names
-// and, when the shape is an eight-warp split, the FP32 merge. A split plan whose shape descended to
-// four warps runs unsplit here (the four-warp shape sweeps the same keys).
+// and, when the plan splits, the FP32 merge. A split plan keeps its key splits at the warp count the
+// shape fit to - on RDNA3 the four-warp shape the 64 KiB LDS ceiling forces. Only the stages the
+// fitted shape names are instantiated: a runtime stage branch would build both stages of every
+// geometry, and RDNA3 never runs the 2-stage ones.
 template <typename Geometry, typename Metadata, bool PackedValues, bool PackedKeys, typename Fit>
 void launch_fitted(const Tensor& q, const Tensor& positions, float scale, const Tensor& k_pages,
                    const Tensor& v_pages, const Tensor& k_scale_pages, const Tensor& v_scale_pages,
@@ -26,8 +28,7 @@ void launch_fitted(const Tensor& q, const Tensor& positions, float scale, const 
                    cudaStream_t stream) {
     const auto width       = static_cast<std::int32_t>(q.ne[2]);
     const int fit_warps    = Fit::WarpCount;
-    const int fit_stages   = Fit::StageCount;
-    const bool fit_split   = plan.splits > 1 && fit_warps == 8;
+    const bool fit_split   = plan.splits > 1;
 
     CausalPromptFa2Partials partials{};
     if (fit_split) {
@@ -60,12 +61,27 @@ void launch_fitted(const Tensor& q, const Tensor& positions, float scale, const 
         CUDA_CHECK(cudaGetLastError());
     };
 
-    if (fit_split) {
-        if (fit_stages == 1) {
-            launch.template operator()<8, 1, true>();
+    const auto run = [&]<int Warps>() {
+        if constexpr (Fit::StageCount == 1) {
+            if (fit_split) {
+                launch.template operator()<Warps, 1, true>();
+            } else {
+                launch.template operator()<Warps, 1, false>();
+            }
         } else {
-            launch.template operator()<8, 2, true>();
+            if (fit_split) {
+                launch.template operator()<Warps, 2, true>();
+            } else {
+                launch.template operator()<Warps, 2, false>();
+            }
         }
+    };
+    if (fit_warps == 4) {
+        run.template operator()<4>();
+    } else {
+        run.template operator()<8>();
+    }
+    if (fit_split) {
         constexpr float Log2E = 1.4426950408889634074f;
         causal_attention_prompt_i8_fa2_merge_kernel<Geometry, Metadata>
             <<<dim3(static_cast<unsigned>(width), static_cast<unsigned>(Geometry::QHeads)),
@@ -74,20 +90,6 @@ void launch_fitted(const Tensor& q, const Tensor& positions, float scale, const 
                 static_cast<const float2*>(partials.stats.data), metadata, width, plan.splits,
                 scale * Log2E, static_cast<__nv_bfloat16*>(out.data));
         CUDA_CHECK(cudaGetLastError());
-        return;
-    }
-    if (fit_warps == 4) {
-        if (fit_stages == 1) {
-            launch.template operator()<4, 1, false>();
-        } else {
-            launch.template operator()<4, 2, false>();
-        }
-    } else {
-        if (fit_stages == 1) {
-            launch.template operator()<8, 1, false>();
-        } else {
-            launch.template operator()<8, 2, false>();
-        }
     }
 }
 

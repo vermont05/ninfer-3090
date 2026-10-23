@@ -15,6 +15,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 
 namespace ninfer::ops::detail {
 
@@ -88,6 +89,25 @@ inline std::int32_t causal_prompt_fa2_pages(std::uint32_t visible_keys) {
         (static_cast<std::uint64_t>(visible_keys) + kPagedKVPageSize - 1) / kPagedKVPageSize);
 }
 
+// Probe knob, not a shipped tuning surface: NINFER_FA2_SPLITS=n forces the plan to n key splits so a
+// sweep can read a split count against measured time instead of against the cost model below, which is
+// the thing the sweep is testing. It lives here, not in the launcher, because the launch, the workspace
+// capacity query and the launch-shape query all call causal_prompt_fa2_plan; a knob in one of them is
+// Defect A in a new hat - a query that prices partials the launch never allocates, or a launch that
+// allocates what no query priced. Read once per process, so every consumer sees one value. Unset,
+// empty, unparseable, and anything outside 1..kCausalPromptFa2MaxSplits mean "no override".
+inline std::int32_t causal_prompt_fa2_forced_splits() {
+    static const std::int32_t forced = []() -> std::int32_t {
+        const char* raw = std::getenv("NINFER_FA2_SPLITS");
+        if (raw == nullptr || *raw == '\0') return 0;
+        char* end  = nullptr;
+        const long value = std::strtol(raw, &end, 10);
+        if (end == raw || *end != '\0' || value < 1 || value > kCausalPromptFa2MaxSplits) return 0;
+        return static_cast<std::int32_t>(value);
+    }();
+    return forced;
+}
+
 // Plan for one launch of `width` columns whose last row sweeps `visible_keys` keys. Every candidate
 // cost is linear in the key count, with a constant term (the split merge) that grows with the split
 // count, so fewer keys never select more splits; the plan at an envelope's maximum therefore bounds
@@ -103,6 +123,26 @@ inline CausalPromptFa2Plan causal_prompt_fa2_plan(std::int32_t q_heads, std::int
     };
     const double keys        = static_cast<double>(visible_keys);
     const std::int32_t pages = causal_prompt_fa2_pages(visible_keys);
+
+    // A forced count skips the cost model and keeps the rest of the plan's route facts: the baseline
+    // shape at 1, the eight-warp split shape the candidate loop returns for a split launch. The
+    // candidate loop's own limits apply, so a forced leg can never ask for a page range that does not
+    // exist or partials past the split budget; the count walks down to the largest one that fits.
+    if (const std::int32_t forced = causal_prompt_fa2_forced_splits(); forced > 0) {
+        std::int32_t splits = forced;
+        if (width < kCausalPromptFa2MinSplitWidth) {
+            splits = 1;
+        } else {
+            while (splits > 1 &&
+                   (pages < splits * kCausalPromptFa2MinPagesPerSplit ||
+                    causal_prompt_fa2_split_bytes(q_heads, width, splits) >
+                        kCausalPromptFa2SplitBudgetBytes)) {
+                --splits;
+            }
+        }
+        return splits > 1 ? CausalPromptFa2Plan{8, splits}
+                          : CausalPromptFa2Plan{width <= 64 ? 8 : 4, 1};
+    }
 
     // Up to 64 columns both CTA shapes launch the same CTAs at the same rate, and the eight-warp
     // one spreads the Q encoding over twice the warps. Measured 2026-10-10 on rk4v4: 64 columns

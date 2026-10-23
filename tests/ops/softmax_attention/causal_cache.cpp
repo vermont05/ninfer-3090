@@ -2410,7 +2410,9 @@ int run_a1_case(const Geometry& geometry, const CachePlan& plan, const Attention
     failures += dout.verify_guards((label + " output").c_str());
     failures += workspace_buffer.verify_guards((label + " workspace").c_str());
     if (workspace.used() != 0 || workspace.peak_used() != workspace_bytes) {
-        std::cerr << label << ": workspace query/execution high-water mismatch\n";
+        std::cerr << label << ": workspace query/execution high-water mismatch queried="
+                  << workspace_bytes << " executed_peak=" << workspace.peak_used()
+                  << " executed_used=" << workspace.used() << "\n";
         ++failures;
     }
     failures += cache.verify_guards(label);
@@ -2556,7 +2558,9 @@ int run_a1_case(const Geometry& geometry, KvCacheStorage storage, const Attentio
     failures += dout.verify_guards((label + " output").c_str());
     failures += workspace_buffer.verify_guards((label + " workspace").c_str());
     if (workspace.used() != 0 || workspace.peak_used() != workspace_bytes) {
-        std::cerr << label << ": workspace query/execution high-water mismatch\n";
+        std::cerr << label << ": workspace query/execution high-water mismatch queried="
+                  << workspace_bytes << " executed_peak=" << workspace.peak_used()
+                  << " executed_used=" << workspace.used() << "\n";
         ++failures;
     }
     failures += cache.verify_guards(label);
@@ -2622,7 +2626,9 @@ int run_a3_case(const Geometry& geometry, const CachePlan& plan, const Attention
     failures += dout.verify_guards((label + " output").c_str());
     failures += workspace_buffer.verify_guards((label + " workspace").c_str());
     if (workspace.used() != 0 || workspace.peak_used() != workspace_bytes) {
-        std::cerr << label << ": workspace query/execution high-water mismatch\n";
+        std::cerr << label << ": workspace query/execution high-water mismatch queried="
+                  << workspace_bytes << " executed_peak=" << workspace.peak_used()
+                  << " executed_used=" << workspace.used() << "\n";
         ++failures;
     }
     failures += cache.verify_guards(label);
@@ -2693,7 +2699,9 @@ int run_a3_case(const Geometry& geometry, KvCacheStorage storage, const Attentio
     failures += dout.verify_guards((label + " output").c_str());
     failures += workspace_buffer.verify_guards((label + " workspace").c_str());
     if (workspace.used() != 0 || workspace.peak_used() != workspace_bytes) {
-        std::cerr << label << ": workspace query/execution high-water mismatch\n";
+        std::cerr << label << ": workspace query/execution high-water mismatch queried="
+                  << workspace_bytes << " executed_peak=" << workspace.peak_used()
+                  << " executed_used=" << workspace.used() << "\n";
         ++failures;
     }
     failures += cache.verify_guards(label);
@@ -2966,7 +2974,9 @@ int run_batch_case(const Geometry& geometry, const CachePlan& plan, const BatchA
     failures += dout.verify_guards((label + " output").c_str());
     failures += workspace_buffer.verify_guards((label + " workspace").c_str());
     if (workspace.used() != 0 || workspace.peak_used() != workspace_bytes) {
-        std::cerr << label << ": workspace query/execution high-water mismatch\n";
+        std::cerr << label << ": workspace query/execution high-water mismatch queried="
+                  << workspace_bytes << " executed_peak=" << workspace.peak_used()
+                  << " executed_used=" << workspace.used() << "\n";
         ++failures;
     }
     return failures;
@@ -3108,7 +3118,9 @@ int run_batch_case(const Geometry& geometry, KvCacheStorage storage,
     failures += dout.verify_guards((label + " output").c_str());
     failures += workspace_buffer.verify_guards((label + " workspace").c_str());
     if (workspace.used() != 0 || workspace.peak_used() != workspace_bytes) {
-        std::cerr << label << ": workspace query/execution high-water mismatch\n";
+        std::cerr << label << ": workspace query/execution high-water mismatch queried="
+                  << workspace_bytes << " executed_peak=" << workspace.peak_used()
+                  << " executed_used=" << workspace.used() << "\n";
         ++failures;
     }
     return failures;
