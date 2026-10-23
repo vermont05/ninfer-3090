@@ -332,8 +332,15 @@ reference.
   rewrite. Weight staging/persistence cannot help: W (178 MB gate_up) exceeds LDS (64 KiB) and
   L2 (2 MB), so it cannot be kept resident, and a weight-stationary layout would still be
   capped at the same 237.6 GB/s DRAM ceiling. **Do not pursue the activation/weight-staging
-  redesign.** The remaining levers are the non-GEMM floors (attn_mixer ~980 ms, gdn_mixer
-  ~0.9 s at W=1024).
+  redesign.**
+  **Whole-prefill consequence:** the chunk is ~90% GEMM-class work (MLP stages 66%, mixer
+  projections the bulk of the rest — those are GEMM-heavy too; see the wmma bucket split above),
+  with attention the *smallest* bucket and the GDN recurrence ~6%. So the non-GEMM remainder is
+  both small and largely GEMM-dominated, and it cannot close a 2.2 s gap. **On the RX 7600M XT
+  the prefill is DRAM-bandwidth-bound on weight streaming at ~80% of the card's 237.6 GB/s
+  ceiling, and the 250 t/s target (~33% more prefill throughput) is not reachable by kernel-level
+  optimization on this hardware.** Reaching it would require a wider/faster DRAM bus, a more
+  compressed weight stream, or a lower target for this card.
 - **Raster A/B is inconclusive** (2026-10-22, `NINFER_T2_A8_RASTER`, W=1024 cold-boot, 3
   reps): default `cols`-fast (x=columns) median **165.2 tok/s** vs `rows`-fast (x=rows)
   **163.7 tok/s** — a ~1% delta. Two 3-run sets do not by themselves establish a noise
