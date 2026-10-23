@@ -779,3 +779,142 @@ Diet note for any future integration: `D22`-style walked pointers alone are a **
 below the shipped G32 panel's 30.2 ms cold, so not a ship candidate by itself; it is the
 proof that the spill law is beatable at 128 VGPR. Files: `.qual/wmma/cal59.cu`,
 `roc59/` counter CSVs, `parse59.py`.
+
+## 2026-10-23 cal60 (wide-load granularity battery): requests are SECTOR-bound — granularity is not the lever
+
+cal59's consequence said the 13–14 ms target needs ≤ ~90 M requests and suggested loading x at
+full-sector (32 B/lane `int8v`) granularity, amortized across the eight `s`-steps. cal60 built
+exactly that: same shipped body semantics, one 32 B/lane `int8v` load feeding two `s`-steps
+(`av[n][0/1]` = the load's two halves — byte-identical per-lane to the engine's two 16 B loads,
+so pairing is preserved), sweeping MF/NF at panel 8. Result: **wide loads halve the instruction
+count, not the request count.** Requests ≈ 190 → 185 M and time did not move:
+
+| shape | best/avg ms | note |
+|---|---|---|
+| X42_p8 (4,2) | 33.92 / 34.48 | vs D22_p8 control 27.99 — **worse** |
+| X41_p8 (4,1) | 46.20 / 46.89 | |
+| X81_p8 (8,1) | 61.82 / 62.31 | |
+| X82_p8 (8,2) | 61.05 / 61.53 | |
+| X44_p8 (4,4) | 49.30 / 49.46 | |
+
+Sector arithmetic fit: R ≈ 356.5/MF + 89.1/NF M reqs, measured ≈ 0.83 × the sum. The request
+stream charges per **sector touched**, not per instruction: widening the load changes instruction
+mix, not sectors. Granularity is not the lever — **layout** (who touches which sectors, and how
+often) is. Files: `.qual/wmma/cal60.cu`, `roc62-stdout.txt`.
+
+## 2026-10-23 cal61 (launch_bounds VGPR cap): at occupancy 8, MF>2 payloads spill — and spill is geometric
+
+`__launch_bounds__(32,8)` caps the allocator at 128 VGPR. Everything above the (2,·) payload
+lands in scratch, and the cal60 payload sizes turn time into a spill tax table:
+
+| shape | scratch B | time ms |
+|---|---|---|
+| (4,2) | 552 | 46 |
+| (8,1) | 660 | 78 |
+| (8,2) | 1760 | 113 |
+
+(The cal60 X-shapes above are exactly these spills: X42 = (4,2)+wide loads 34 ms beats the
+naked-spill 46; X81/X82 ≈ 61 beat 78/113 — wide loads soften spill traffic, they don't beat the
+(2,·) class.) Conclusion: at occupancy 8 the register wall is (MF≤2, NF≤2). Files:
+`.qual/wmma/cal61.cu` (device-asm `.amdhsa_private_segment_fixed_size` records).
+
+## 2026-10-23 cal62 (occupancy 4, spill-free high MF): the issue rate halves — occupancy is not negotiable
+
+The escape hatch from cal61: drop `__launch_bounds__` to (32,4), let MF=4/8 live spill-free
+(233–251 VGPR, 0 scratch), keep the wide loads. It removed every scratch byte and **lost**:
+
+| shape | best/avg ms (per pass) |
+|---|---|
+| Z22_p8 (2,2) | 28.47 / 29.47, 28.42 / 29.08 |
+| Z22_p4 (P=4) | 27.22 / 28.80, 26.55 / 28.23 |
+| Z42_p8 (4,2) | 47.52 / 47.96 |
+| Z24_p8 (2,4) | 41.91 / 42.08 |
+| Z44_p4 (4,4) | 94.30 / 94.89 |
+
+Z42_p8 is spill-free at 47 ms vs the spilled (4,2) at 46 — spill-free buys nothing when the
+in-flight wave count drops 8→4 per SIMD: the measured request issue rate collapses ~6.6 →
+~3.2 Greq/s. **Occupancy is not negotiable**; the request stream needs 8 waves/SIMD to saturate.
+Files: `.qual/wmma/cal62.cu`, `roc63-stdout.txt`, `roc63/` CSVs.
+
+## 2026-10-23 cal63 (two-warp row-split blocks): null — the warps read the identical x
+
+Premise: if each warp of a 64-thread block owns a **row** tile (row-split), the x panel is read
+once per block and R ≈ 356.5/(2·MFw) + 89.1/NFw. Measured: **requests do not fall** — the two
+warps read the identical x window (same tokens, same rows), so the sectors touched are the
+same; splitting rows only halves weight-side traffic, which was never the binding term:
+
+| shape | best/avg ms (per pass) |
+|---|---|
+| W22_p8 | 29.38 / 29.50, 29.19 / 29.41 |
+| W22_p4 | 28.36 / 28.55, 28.05 / 28.31 |
+| W12_p8 | 28.76 / 29.12, 28.27 / 29.01 |
+| W14_p8 | 54.67 / 54.82, 54.67 / 54.76 |
+
+Row-split lands within noise of the D22 control (27.99). Files: `.qual/wmma/cal63.cu`,
+`roc60-stdout.txt` (W-family lines).
+
+## 2026-10-23 cal64 (column-split blocks): apparent 23 ms win — VOID, coverage audit
+
+The symmetric idea: 64-thread blocks whose warps split **columns** (`col0 = blockIdx.y·16NF·2 +
+warp·16NF`), sharing one row panel and the epilogue x-scale reads. The recorded sweep looked like
+the breakthrough cal59 asked for — U21_p16 22.82, U41_p8 23.61, U21_p8 25.75, U21_p4 24.64.
+It was **measuring less than half the outputs**. The launches used tile stride `16·MF·2` across
+panels, but a column-split block covers `16·MF` rows, so rows past panel-max were never
+computed: coverage p8 22.8%, p4 27.2%, U41_p8 33.1%, **p16 50.4%**. All cal64 U timings are
+VOID (best case 50% of the true row work). Files: `.qual/wmma/cal64.cu`, `roc64/` CSVs.
+(The direction survived: cal64b below is the corrected, certified measurement.)
+
+## 2026-10-23 cal64b (verify gate = engine kernel on identical buffers; column-split CERTIFIED, −25%)
+
+Two things had to be learned before any column-split shape could be trusted.
+
+**1. The verification gate is the engine kernel, not a scalar reference.** The first verify
+attempt (scalar identity-pairing reference, unsigned `(by>>2j)&3` codes) mismatched
+35,651,583/35,651,584 — and the investigation showed why: T2 activations are stored in
+**quantiser-permuted order** (`t2_prefill_i8.cuh` contract, the permutation compensating the wmma
+fragment byte order). Random synthetic x is unpermuted, so an identity-pairing scalar reference
+diverges from **both** the engine kernel and the probe by design. The ship gate is
+**probe kernel vs shipped `t2_prefill_wmma1_kernel` on identical buffers** — the pairing cancels,
+isolating the geometry change. (Scalar reference kept as a diagnostic only.)
+
+**2. Row-coverage law (pinned by two verify runs):** a column-split block covers **16·MF rows,
+not 16·MF·2**. Correct tiling: `row0 = (blockIdx.z·gridDim.x + blockIdx.x)·16·MF`, grid.x =
+`N/(16·MF·P)`. The intermediate form (stride gridDim.x, tile 16·MF·2) computed every tile's
+first 32 rows only — 50% of outputs never written (verify: 17,825,792/35,651,584 mismatch, first
+at row 32/64, sentinel 0x7F).
+
+Certified result (gate_up 34816×5120×1024, probe `cal64b`):
+
+- **ALL FIVE column-split shapes are BIT-EXACT vs the shipped engine kernel — 35,651,584 /
+  35,651,584, both passes.**
+- Engine ground truth in the same probe: **30.7–30.9 ms** (1,2,G32 panel, shipped routing).
+
+| shape | best/avg ms (per pass) | VGPR/spill | 128B RD | MISS | HIT |
+|---|---|---|---|---|---|
+| **V21_p32 (2,1) col-split P=32** | **22.99 / 23.18, 23.01 / 23.14** | 86 / 0 | 17.4M | 24.0M | 974.7M |
+| V21_p16 | 23.85 / 24.13, 23.84 / 24.05 | 86 / 0 | 41.2M | 49.4M | 811.0M |
+| V21_p8 | 24.91 / 25.15, 24.64 / 24.96 | 86 / 0 | 99.9M | 107.8M | 674.3M |
+| V41_p16 | 20.99 / 23.81, 21.92 / 23.81 | 128 / 112 B | 225.5M | 241.2M | 673.5M (59.6M wr) |
+| V41_p8 | 23.14 / 24.86, 20.95 / 24.23 | 128 / 112 B | 353.1M | 359.7M | 503.9M (59.5M wr) |
+
+- **Winner: column-split (2,1) at Panel=32 — 23.14 ms avg full coverage: −25% vs the engine
+  ground truth, −17% vs the best control ever measured (D22_p8 27.99).** First probe shape
+  below the 27.5–30.5 ms band that every row-split geometry landed in through cal59.
+- The panel law is monotone for the spill-free V21 family: P=8 → 16 → 32 = 24.96 → 24.05 →
+  23.14 ms; misses (≈ DRAM) fall 107.8 → 49.4 → 24.0M (P=32 ≈ 3.1 GB ≈ 134 GB/s at 23 ms —
+  headroom under the card's ~288 GB/s, so requests, not DRAM, still bind).
+- Column-split beats row-split (cal63) because the two warps read **disjoint** token windows
+  (columns = tokens), halving per-block x sectors, and the y-fastest panel (P=32) keeps that
+  window hot — 975M hits against 24M misses.
+- V41 (MF=4) shapes are noisy and carry a 112 B spill (59.6M wr64 + 63M MC_WRREQ of scratch
+  traffic) — same cal61 wall, do not pursue.
+- Device asm (V21): 86 VGPR, SGPR 32, LDS 4096 B, private segment **0** — occupancy 8, the cal61
+  and cal62 laws both satisfied simultaneously. (Dumped pre-geometry-fix; the fix is index-math
+  only — re-dump to confirm is open.)
+
+**Integration path (next step, bit-exact gate PASSED in probe):** column-split is a new kernel
+variant — the engine's `t2_prefill_wmma.cuh` routing has only row-split panel grids; it needs a
+column-split grid (`grid = (N/(16·MF·P), T/(16·NF·2), P)`, tile stride 16·MF) behind an env
+gate, then the engine-level end-to-end A/B at the 4,210-token prompt (baseline 144–148 t/s,
+TTFT 29.2 s) with coherent-text check under the GPU lock. Probe files: `.qual/wmma/cal64b.cu`,
+`run65.sh`, `roc65/` CSVs, `roc65-stdout.txt`.
