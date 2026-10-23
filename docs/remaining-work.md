@@ -373,11 +373,22 @@ reference.
   (`cal38` `w1c` vs shipped `w1`, bit-exact bitdiff=0), and that *variant* loses:** it is ~70%
   slower (gate_up 52.5 ms vs 30.6 ms), because the persistent 128-byte register line + the
   quarter-extraction cost VGPRs and occupancy and drag the tuned `(1,2)@8` tile down to the level
-  the other variants sit at. **That is evidence about *that* variant only** — a slower full-line
-  register load does **not** prove weight traffic cannot be reduced, or that a different design
-  (LDS-staged panel load, a higher-occupancy tile that hides re-fetch latency, a weight-stationary
-  schedule) would also lose. The GEMM's ~19%-of-ceiling logical utilization means the traffic
-  lever remains open.
+  the other variants sit at. **A second, independent design was also built and measured — the
+  weight-stationary, LDS-staged tile `wlds`** (`cal38`, bit-exact bitdiff=0): one block owns a
+  16-row weight panel *and* a chunk of `R` token blocks, stages a 1024-K weight slice into LDS
+  once, and runs all `R` token blocks off LDS so a weight byte hits DRAM once per slice instead
+  of once per token block. It **also loses, badly**: gate_up R4/R8 114.8/115.2 ms and R4@16occ
+  163 ms vs `w1`'s 30.0 ms (12.4 / 12.4 / 8.7 GB/s logical vs `w1`'s 47.5). The cause is the
+  opposite of a traffic problem: folding `R` token blocks into one warp cuts the in-flight warp
+  count `R`-fold (w1 launches ~69,632 one-warp blocks for gate_up; wlds R4 launches ~17,408),
+  starving the 16 CUs of the occupancy that hides memory/issue latency. **Together the two
+  results localize the GEMM's limit: it is latency/occupancy-bound, not DRAM-traffic-bound.**
+  Sits at ~20% of the DRAM *ceiling* precisely because it cannot keep the CUs fed — reducing
+  bytes (coalesced, LDS-stationary) removes the parallelism that was feeding them. The remaining
+  GEMM lever is therefore **more effective parallelism / latency-hiding** (a cooperative
+  multi-warp LDS loader that shares operands *without* the per-warp reload cal37 penalized, or a
+  better-occupancy schedule) — **not** traffic reduction. That cooperative multi-warp loader is
+  the one GEMM design not yet tested (cal37's multi-warp blocks did not share through LDS).
 - **Raster A/B is inconclusive** (2026-10-22, `NINFER_T2_A8_RASTER`, W=1024 cold-boot, 3
   reps): default `cols`-fast (x=columns) median **165.2 tok/s** vs `rows`-fast (x=rows)
   **163.7 tok/s** — a ~1% delta. Two 3-run sets do not by themselves establish a noise
@@ -393,14 +404,16 @@ Targets for the NInfer 27B stack (T2 ternary, **2.125 bpw** weights) on the **RX
   "190–200 cap / GEMM tapped out" conclusion WITHDRAWN after a factor-of-4 bandwidth correction).**
   The card demonstrably does 296 t/s here (Prism's 2.13-bpw PQ2_0 service, same ~2.1 bpw as
   NInfer's T2 2.125 bpw). Corrected `cal38` measurement: the NInfer T2 prefill GEMM streams its
-  **logical** packed codes at **~19% of the ~240 GB/s DRAM ceiling** (~46 GB/s; a single
-  ceiling-rate pass of the gate_up logical data would be ~5.9 ms vs the measured 30.6 ms → ~5×
-  headroom). It is **not** bandwidth-saturated, so lifting DRAM utilization / cutting the 32×
-  weight re-read traffic is a live lever toward 300+. Weights are already at the 2-bit floor
-  (sub-2-bit GGML formats IQ2_XXS/IQ2_S/IQ1_M have no in-tree kernels, no PQ/VQ path), so the
-  lever is traffic/efficiency, not bit-rate. The coalesced `int32v` full-line variant is a NO-GO
-  *as that variant* (register/occupancy cost) and does not close the lever — the next design to
-  try is an LDS-staged, higher-occupancy, weight-stationary panel loader. Prefill-bucket profile
+  **logical** packed codes at **~20% of the ~240 GB/s DRAM ceiling** (~47 GB/s). Two traffic-
+  reduction designs were built and both **lost** (coalesced `int32v` full-line read ~70% slower;
+  weight-stationary LDS-staged `wlds` ~4× slower) — each by removing the warp parallelism that
+  feeds the CUs, which **localizes the GEMM's limit to latency/occupancy, not DRAM traffic.**
+  Weights are already at the 2-bit floor (sub-2-bit GGML formats have no in-tree kernels, no
+  PQ/VQ path), so bit-rate is off the table. The untested GEMM lever is a **cooperative
+  multi-warp LDS loader** (share operands through LDS so extra warps add parallelism without the
+  per-warp reload cal37 penalized); if that also loses, the GEMM is at its practical limit for
+  this kernel family and the main remaining lever is the **45% mixer/attention time**. Prefill-
+  bucket profile
   at W=1024 (`NINFER_PREFILL_PROFILE=1`, single 1024-tok chunk, total 5084 ms): MLP GEMMs
   (gdn_mlp 2137 ms + attn_mlp 682 ms) ≈ 55%; mixers/attention (gdn_mixer 1279 ms + attn_mixer
   985 ms, incl. the GDN recurrent scan, attention, and their projection GEMMs) ≈ 45%. The bucket
