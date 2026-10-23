@@ -528,3 +528,64 @@ random/identity cases, and the fragment loader is pinned byte-exactly
 byte k = B[k][col]; results land at `(A·B)(l&15, (l>=16?8:0)+w)`). Instruction-bound ceiling
 measured ~58 TOPS (cal16 peak loop). The hand-filled-WMMA GEMM path is now unblocked for
 roadmap items 1/2.
+
+## 2026-10-23 iu4 GEMM prototype (cal43–cal54): numerics proven, 2.25–2.76× on the dominant GEMMs — **quality-gated, do NOT ship without the user**
+
+**What.** Prototype GEMM `u4g` (`.qual/wmma/cal43.cu`) runs **4-bit signed activations** through
+`__builtin_amdgcn_wmma_i32_16x16x16_iu4_w32` (wave32) with the shipped T2 weight layout (4 codes/byte,
+fp16 scale per 128-col group), the shipped G32 panel grid (`(32, T/32, (N/16)/32)`), and the shipped
+magic-bits i32 epilogue (seed `0x4B400000` = float `1.5·2^23`; `dot = __int_as_float(v) − kMagic`).
+The hardware reads BOTH operands as signed i4, so weights bias-pack code+8 (signed read = u−8; the
+semantic (u−1) is restored by a per-group rowsum term `rs` in the epilogue: `dot = dot_hw − rs`).
+Fragments are 8 B per lane per side vs 16 B for iu8 — half the fragment bytes and half the load
+instructions per WMMA.
+
+**Layout decode chain** (the iu4 fragment layout is undocumented on this ISA — measured, not assumed):
+- cal53: single-1×single-1 pairing probes decode it: k-pairing is identity, nibbles PLAIN both sides,
+  only rows permute — `rowA(i) = ((i&3)<<2)|(i>>2)` (A side), `rowB(j) = ((j&7)<<1)|(j>>3)` (B side),
+  both self-inverse; lane→row `widx(s) = ((s&1)<<3)|(s>>1)` (its inverse is `rowB`).
+- cal51: dense 16×16 end-to-end model PASS on that decode.
+- cal52: explains cal51's earlier dense failure and the cal50/48 "nibble-perm" artifacts (spread vs
+  interleaved 8-byte pack orders — shifting B nibbles within a word is invisible).
+- cal54: kernel-shaped exhaustive routing sweep (real kernel shape MF=1/NF=2/P=32, every candidate
+  mapping a runtime knob; 416 combos, dataset engineered so ONLY routing matters): the canonical
+  PASS `role=0 am=widx bm=id ship sw=0 st=0` is exactly cal43's loader mapping. Layout proven twice
+  over; cal43's initial battery FAILs were numerics in the reference, not routing (see below).
+
+**Battery (numerics).** cal43 vs a double-precision CPU reference **on the u4 grid**: maxRel
+**6.5e-4 / 6.6e-4** (gate 1e-3) on shapes 512×5120×1024 and 512×17408×1024. The kernel was correct
+on first try with the cal54-validated mapping; all three battery failures were harness artifacts:
+(1) reference used the i8 engine grid (`xc = 16·c`) instead of decoding signed c from x4 (16× scale
+mismatch, maxRel 6210 → 1); (2) reference compared tokens the launch deliberately masks (`t ≥ T−3`,
+kernel skips storing them); (3) battery shape N=768 violates the G32 guard `N % 512 == 0` and
+silently drops rows ≥512 (the same guard proven on the engine path). The gate denominator is
+`max(1e-3, |ref|, 1e-4·Σ|group terms|)` to absorb fp32 fmaf-chain cancellation noise at near-zero
+cells (136-group sums of O(100) terms); the worst |ref|>10 cell shows rel ~1e-5, ratio 1.0.
+
+**Timing** (RX 7600M XT, lock verified, ABBA, median of 11, 96 MB L2 flush between launches):
+
+| shape (N×K×T) | shipped i8 (µs) | u4g (µs) | speedup |
+|---|---|---|---|
+| gate_up 34816×1024×5120 | 29675.8 | 10766.2 | **2.76×** |
+| mlp_down 5120×1024×17408 | 15455.6 | 6855.7 | **2.25×** |
+| gdn_valuez 12288×1024×5120 | 10427.2 | 4075.3 | **2.56×** |
+
+cal42 roofline: iu4 peak = 9.419 G warp-ops/s = **exactly 2.00×** the iu8 peak (4.787 G) at 2.33 GHz —
+hardware gives the 2× for free at 4-bit. u4g hits 4.13 G warp-ops/s on gate_up = **44% of iu4 peak**
+(shipped i8: 37% of iu8 peak): the ceiling converts into real GEMM time, not just paper headroom.
+
+**Resources** (same TU, `-O3`, gfx1102, `llvm-readelf -n` on the device object; full notes in
+`.qual/wmma/cal43_resources.txt`): u4g **106 VGPR / 41 SGPR, 0 spills, 0 private, 0 LDS**, 753 asm
+lines, 14 b128 loads — vs shipped i8 128 VGPR / 41 SGPR / **8 spills** / 36 B private / 1 KB LDS,
+1244 lines, 19 b128 loads. `__launch_bounds__(32,8)` fully satisfied with headroom (granularity 112).
+
+**Gate.** The kernel is exact *for its grid* (battery proves it), but it quantizes activations to 16
+levels (i4) where the i8 engine grid has 256: this is a **model-quality decision, not a bit-exact
+optimization**. Before any adoption: end-to-end quality A/B (perplexity + coherent text on production
+prompts) with the real model, and the user's explicit decision. If accepted, the GEMM-dominated
+prefill buckets gain 2.2–2.8×; combined with the attention lever (39.5% of 4096-ctx prefill, §3
+split) the 142 t/s baseline moves into 300+ t/s range at long context — GEMM alone is not enough.
+
+**Integration path** (only after the user decides): i4 quantize + per-group rowsum kernels producing
+`x4`/`xs`/`rs`, wire `u4g` in behind an env gate, engine shapes already satisfy the G32 guard
+(34816/5120/12288 all N%512==0), then the full quality suite.
