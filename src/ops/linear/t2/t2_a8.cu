@@ -79,6 +79,21 @@ bool prefill_wmma_native() {
     }();
     return enabled;
 }
+
+// NINFER_T2_A8_WMMAPANEL=32 switches the WMMA tile to cal41's G32 panel raster: blocks
+// launch so that consecutive ones share a token block and sweep one 1024-row weight panel,
+// keeping the panel + hot activations (~1.47 MB) inside the 2 MB L2. +6-8% on all three
+// engine shapes at bit-identical outputs (cal41: gate_up 25.7 ms vs 27.9, mlp_down 13.3 vs
+// 15.9, gdn_valuez 9.1 vs 9.7), spill-free at 97 VGPRs. Default off; needs
+// (w.n / 16) % 32 == 0, which every engine shape satisfies (gate_up 2176, mlp_down 320,
+// gdn 768 tiles). Any other value keeps the plain raster.
+int wmma_panel() {
+    static const int panel = [] {
+        const char* value = std::getenv("NINFER_T2_A8_WMMAPANEL");
+        return value != nullptr && std::string(value) == "32" ? 32 : 0;
+    }();
+    return panel;
+}
 #endif
 
 std::int32_t tile_columns(std::int32_t tokens) {
@@ -328,11 +343,20 @@ void tile_gemm(const T2A8Activations& x, const Weight& w, Epilogue epilogue, cud
         constexpr int kTileRows    = 16;
         const unsigned wcolumn_blocks = static_cast<unsigned>(columns) / kTileColumns;
         const unsigned wrow_blocks    = static_cast<unsigned>(w.n) / kTileRows;
-        const dim3 wgrid = rows_fast ? dim3(wrow_blocks, wcolumn_blocks)
-                                       : dim3(wcolumn_blocks, wrow_blocks);
-        t2_prefill_wmma1_kernel<1, 2, Epilogue><<<wgrid, 32, 0, stream>>>(
-            static_cast<const std::uint8_t*>(w.qdata), static_cast<const __half*>(w.scales),
-            x.codes, x.scales, kCols, columns, x.tokens, rows_fast, epilogue);
+        const bool panel = wmma_panel() == 32 && wrow_blocks % 32u == 0u;
+        const dim3 wgrid = panel   ? dim3(32u, wcolumn_blocks, wrow_blocks / 32u)
+                       : rows_fast ? dim3(wrow_blocks, wcolumn_blocks)
+                                   : dim3(wcolumn_blocks, wrow_blocks);
+        const auto launch = [&]<int P>() {
+            t2_prefill_wmma1_kernel<1, 2, P, Epilogue><<<wgrid, 32, 0, stream>>>(
+                static_cast<const std::uint8_t*>(w.qdata), static_cast<const __half*>(w.scales),
+                x.codes, x.scales, kCols, columns, x.tokens, rows_fast, epilogue);
+        };
+        if (panel) {
+            launch.template operator()<32>();
+        } else {
+            launch.template operator()<0>();
+        }
         CUDA_CHECK(cudaGetLastError());
         return;
     }

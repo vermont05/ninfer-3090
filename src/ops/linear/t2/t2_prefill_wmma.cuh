@@ -74,7 +74,16 @@ __device__ __forceinline__ int4v wmma_code_frag(unsigned word) {
 // follow t2_prefill_i8_kernel's convention: one block index per tile, (column blocks,
 // row blocks) or the reverse under rows_fast. Callers must size grids as
 // (columns / (16 * NF), rows / (16 * MF)) or the swapped pair.
-template <int MF, int NF, class Epilogue>
+//
+// Panel mode (Panel > 0) reorders the same tiles for L2 residency (cal41's G32, the
+// cal39/cal41 winner at +6-8% on every engine shape, bit-exact on all battery shapes):
+// grid = (Panel, column blocks, row blocks / Panel), token block = blockIdx.y, and the
+// fast axis walks `Panel` row tiles inside one panel, so row0 = (z*Panel + x) * 16 * MF.
+// Consecutive blocks then share a token block and sweep a Panel*16*MF-row weight panel:
+// at Panel=32/MF=1 the in-flight set is one 1024-row weight panel (1.31 MB at K=5120)
+// plus the hot 32-token activation block, ~1.47 MB inside the 2 MB L2. rows_fast is
+// unused in panel mode; geometry must satisfy rows % (16 * MF * Panel) == 0.
+template <int MF, int NF, int Panel, class Epilogue>
 __global__ __launch_bounds__(32, 8) void t2_prefill_wmma1_kernel(
     const std::uint8_t* __restrict__ w_codes, const __half* __restrict__ w_scales,
     const std::int8_t* __restrict__ x, const __half* __restrict__ xs, std::int32_t k_cols,
@@ -84,8 +93,12 @@ __global__ __launch_bounds__(32, 8) void t2_prefill_wmma1_kernel(
     constexpr float kMagic = 12582912.0F; // 1.5 * 2^23
 
     const int lane   = static_cast<int>(threadIdx.x) & 31;
-    const int col0   = static_cast<int>(rows_fast ? blockIdx.y : blockIdx.x) * (16 * NF);
-    const int row0   = static_cast<int>(rows_fast ? blockIdx.x : blockIdx.y) * (16 * MF);
+    const int col0 = Panel > 0
+                         ? static_cast<int>(blockIdx.y) * (16 * NF)
+                         : static_cast<int>(rows_fast ? blockIdx.y : blockIdx.x) * (16 * NF);
+    const int row0 = Panel > 0
+                         ? (static_cast<int>(blockIdx.z) * Panel + static_cast<int>(blockIdx.x)) * (16 * MF)
+                         : static_cast<int>(rows_fast ? blockIdx.x : blockIdx.y) * (16 * MF);
 
     const int colWin = lane >> 1; // Awin window column within the warp tile
     const int rowWin = lane & 15; // Bwin slot row within the warp tile
