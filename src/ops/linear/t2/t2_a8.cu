@@ -80,17 +80,19 @@ bool prefill_wmma_native() {
     return enabled;
 }
 
-// NINFER_T2_A8_WMMAPANEL=32 switches the WMMA tile to cal41's G32 panel raster: blocks
-// launch so that consecutive ones share a token block and sweep one 1024-row weight panel,
-// keeping the panel + hot activations (~1.47 MB) inside the 2 MB L2. +6-8% on all three
-// engine shapes at bit-identical outputs (cal41: gate_up 25.7 ms vs 27.9, mlp_down 13.3 vs
-// 15.9, gdn_valuez 9.1 vs 9.7), spill-free at 97 VGPRs. Default off; needs
+// NINFER_T2_A8_WMMAPANEL=0 disables cal41's G32 panel raster on the WMMA tile; the panel
+// raster (default) launches blocks so that consecutive ones share a token block and sweep
+// one 1024-row weight panel, keeping the panel + hot activations (~1.47 MB) inside the
+// 2 MB L2. +6-8% on all three engine shapes at bit-identical outputs (cal41: gate_up
+// 25.7 ms vs 27.9, mlp_down 13.3 vs 15.9, gdn_valuez 9.1 vs 9.7); engine ABBA at W=4210
+// medians 142.6 vs 139.4 tok/s. Shipped kernel resources are identical to the plain
+// raster (128 VGPR, 36 B private segment), so it costs zero registers. Needs
 // (w.n / 16) % 32 == 0, which every engine shape satisfies (gate_up 2176, mlp_down 320,
-// gdn 768 tiles). Any other value keeps the plain raster.
+// gdn 768 tiles); shapes that miss the divisibility keep the plain raster.
 int wmma_panel() {
     static const int panel = [] {
         const char* value = std::getenv("NINFER_T2_A8_WMMAPANEL");
-        return value != nullptr && std::string(value) == "32" ? 32 : 0;
+        return value != nullptr && std::string(value) == "0" ? 0 : 32;
     }();
     return panel;
 }
