@@ -589,3 +589,27 @@ split) the 142 t/s baseline moves into 300+ t/s range at long context — GEMM a
 **Integration path** (only after the user decides): i4 quantize + per-group rowsum kernels producing
 `x4`/`xs`/`rs`, wire `u4g` in behind an env gate, engine shapes already satisfy the G32 guard
 (34816/5120/12288 all N%512==0), then the full quality suite.
+
+## 2026-10-23 qwen4exp (Qwen3.8-Flash-Next) test pass on gfx1102 — full runnable surface green
+
+The handoff's lazy "pre-existing failures" claim does not cover the qwen4exp suite here: everything
+that can run on this machine (no Flash-Next artifact on disk) **passes, on `hip-port`, first try**.
+
+- **Build:** all 13 `ninfer_qwen4_exp_*` targets compile clean in `build-hip-test` (including the
+  engine/vision/MTP real tests — the `qwen4_exp_instance.cpp` engine path is in `build-hip` too).
+- **Host (cpu-labelled) 6/6 PASS** (`ctest -R 'ninfer_qwen4_exp_(ngram_hash|ngram_volume|
+  rope_positions|expert_cache|memory_plan|context_cache)_test'`, 2.3 s total): ngram hash fixture,
+  ngram volume reader, three-axis RoPE positions, expert cache LFRU/frames/controller, memory plans,
+  context-cache host tier + checkpoint images.
+- **GPU (lock held, single test): `ninfer_qwen4_exp_nvme_tier_test` PASS** (0.5 s) — NVMe tier
+  frames, write-through/eviction, direct captures, host I/O, failing disk, no frames.
+- **Python tool tests 18/18 PASS** (`tests/flash_next/test_tools.py`; no system pytest, so
+  `uv run --with pytest --with numpy --with torch==2.6.0+cpu` against the CPU wheel index):
+  `strata_compare.engine_rows` header validation, `compare` input refusal cases,
+  `reference.build_parser` boundary flags.
+- **Real-artifact tests (7) skip by design (rc 77):** forward/mtp/vision/vision_engine/engine/
+  lanes require `NINFER_TEST_QWEN4EXP_ARTIFACT`. This machine has no artifact and no source GGUF:
+  the model card manifest is `qwen4exp-iq2xs-mtp-vision.ninfer` 32.0 GB + 29.1 GB IQ4_NL n-gram
+  volume, from the 68.0 GB two-part `Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS` GGUF. Producing a local
+  artifact is a ~70 GB download + a ~15 min conversion — a user-side decision (disk, network),
+  not a code gap. Free disk here is 290 GB.
