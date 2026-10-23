@@ -990,3 +990,55 @@ unchanged. Column-split code stays in-tree behind `NINFER_T2_A8_COLSPLIT` as the
 bit-exact-certified geometry with this verdict documented; cal66 closes the column-split lane.
 Files: `.qual/wmma/cal66.cu`, `/tmp/cal66-out.txt`, `run66.sh`, `run67.sh`,
 `/tmp/cal65-abba.tsv`, `/tmp/cal65-profile.tsv`, engine asm dump.
+
+## 2026-10-23 cal67 (iu4 wmma on gfx1102: certified semantics, measured 1.72× i8 rate — the last hardware lever is the user-gated 4-bit-activation lane)
+
+cal66 closed the bit-exact GEMM lane by **saturation**: engine-faithful times give 12.7/12.5/12.8
+TMAC/s on gate_up/down/o_proj. cal67's register-fed rate probe (no loads, 16 chained wmma/group,
+400 groups, 112 blocks, ISA-certified 16 `v_wmma` in each loop body, 28672/28672 nonzero output
+checksums) measures the **pure hardware issue peak: dense iu8 = 12.95 TMAC/s** — the engine runs at
+**98% of it**. The shipped T2 prefill GEMM is at its hardware floor; no bit-exact geometry, tile,
+raster, or scheduling lever remains above ~143 t/s at this bpw.
+
+**The one lever above that floor is iu4 wmma — and it is a user-gated numerics decision, not a
+free win.**
+
+1. **Hardware fact:** clang for gfx1102 accepts `__builtin_amdgcn_wmma_i32_16x16x16_iu4_w32` and
+   legally emits `v_wmma_i32_16x16x16_iu4` (ISA verified). Frag sizes: a/b = 8 B/lane (2 ints =
+   16 nibbles), acc = 8 ints. **No mixed i8×iu4 wmma builtins exist** (probed `i8_iu4`, `i8u_i4u`,
+   `iu4_iu8` — absent), so an iu4 path needs BOTH operands 4-bit: **4-bit activations (iu4 x)** —
+   a quality-gated numerics change, NOT bit-exact, requires the user's decision, not shippable
+   without it.
+2. **Semantics certified (cal67 leg A): 0/256 mismatches.** One T2 code word (4 B = sixteen 2-bit
+   two's-complement codes) expands nibble-true into 8 bytes via `se4(c) = c>=2 ? c-4 : c`,
+   byte j = `se4(code 2j) | se4(code 2j+1)<<4`; the w32 layout law
+   `C(l,w) = dot(Awin[(l<16?0:17)+2w], Bwin[l])` holds for iu4 exactly as for iu8. Poison slots
+   (odd slots + slot 16 = all-0xF) prove the instruction never reads them. The fragment groundwork
+   for any future iu4 kernel is certified bit-exact.
+3. **Measured rate (leg B, ABBA bursts, warm clocks, medians of filled reps):**
+   u8 0.2266 ms = **12.95 TMAC/s**; u4 0.1321 ms = **22.22 TMAC/s**; **ratio 1.716×**. The RDNA3
+   nominal 2× for iu4-vs-dense-iu8 measures **1.72× on this card** — real, reproducible (rep
+   spread <0.5%), and less than nominal.
+4. **Projection for the full iu4 path** (nibble-packed weights 2.125→~1.06 bpw + 4-bit x): GEMM
+   MACs per token halve at a 1.72× rate → GEMM time × 0.86; GEMM is ~55% of a prefill chunk →
+   **end-to-end ≈ +8–9% (~155 t/s)** from the GEMM side, plus weight-traffic headroom for the
+   non-GEMM segments. **iu4 wmma alone does not reach 300 t/s** — the Prism-296 reference implies
+   a full 4-bit pipeline (activations, KV, attention all 4-bit), a far larger quality-gated change.
+
+**Probe-metrology laws (each bit cost a run):**
+- Constant-fragment wmma loops get **collapsed by LLVM** (invariant frags + per-group acc re-init ⇒
+  whole-timed-loop DCE). The fold must CONSUME every wmma's acc.
+- LLVM **merges ILP2 chains fed identical fragments** (8 wmmas survived, not 16). Chain 1 must
+  consume a permuted b frag.
+- Compiler unrolls the group loop ×8 while preserving semantics — **count wmma from the ISA**, not
+  the source; `#pragma unroll 1` makes the count exact.
+- Sub-ms probes run at **idle clocks**; warm ~2 s of continuous GPU work and time bursts ≥10 ms.
+- `hipEventElapsedTime` reads **0.0000 for burst windows on this runtime** — use host wall clock
+  around burst+sync, and gate every arm on a **nonzero output checksum** before believing a time.
+  (The first "u4 = 0.0000/inf" readings were host bugs: an unfilled median slot and event
+  quantization — the u4 leg was running the whole time.)
+
+**Gate (unchanged):** iu4 stays the user's quality decision. This probe gives it a measured
+hardware basis: 1.72×, certified fragment semantics, ~+9% GEMM-side ceiling at 4-bit. Files:
+`.qual/wmma/cal67.cu`, `/tmp/cal67/cal67`, device asm in project root (`.amdhsa_next_free_vgpr`
+72/60, no spills).
