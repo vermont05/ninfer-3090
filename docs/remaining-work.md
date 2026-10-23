@@ -351,6 +351,19 @@ reference.
   reducing *effective* weight re-read traffic via L2-aware tiling / a weight-stationary panel
   layout that matches Prism's access pattern — and cutting non-GEMM (attention/GDN) overhead.
   It is **not** weight-bit reduction (already at the 2-bit floor) and **not** more DRAM.
+  **Root cause measured (2026-10-22, `rocprofv3` GL2C DRAM counters on the shipped `w1(1,2)@8`
+  via `.qual/wmma/cal38.cu`):** the T2 prefill GEMM over-fetches DRAM by **15–63×** its logical
+  weight data. Per launch (warm L2): gate_up reads **22.1 GB** from DRAM to compute on **1.42 GB**
+  of logical T2 weight codes (44.5 MB × 32 re-reads) — **15.5×**; mlp_down 11.1 GB vs 0.176 GB =
+  **63×**; gdn_valuez 7.6 GB vs 0.51 GB = 15×. The kernel reads weight codes as 8-byte `int8v`
+  fragments at 32-byte strides (`line[m] = *(int8v*)(pA + gBase/4)`), so each 8-byte read pulls a
+  full **128-byte** DRAM line (`GL2C_EA_RDREQ_128B`); with 2 MB L2 against a 44.5 MB working set
+  the lines evict between the 4 sub-reads of one line and across the 32 token-block re-reads, so
+  each 128B line is fetched from DRAM multiple times. **The fix is to read each 128B weight line
+  once and derive all four 8-byte fragments from it** (full-line load into regs/LDS, not 4 separate
+  8B global reads), plus an L2-friendly raster so lines stay resident across token re-reads. Since
+  the GEMM is DRAM-bound, cutting the 15× amplification toward ~1–2× is the direct lever to 300+
+  t/s. (gfx1102 exposes GL2C PMC counters in the TheRock rocprofv3 1.4.1; no system rocprof/nsys.)
 - **Raster A/B is inconclusive** (2026-10-22, `NINFER_T2_A8_RASTER`, W=1024 cold-boot, 3
   reps): default `cols`-fast (x=columns) median **165.2 tok/s** vs `rows`-fast (x=rows)
   **163.7 tok/s** — a ~1% delta. Two 3-run sets do not by themselves establish a noise
@@ -365,9 +378,11 @@ Targets for the NInfer 27B stack (T2 ternary, **2.125 bpw** weights) on the **RX
 - **Prefill (PP): 300+ t/s.** Reachable on this card at the *current* weight bit-rate — Prism's
   2.13-bpq PQ2_0 service already does 296 t/s here, and NInfer's T2 weights are the same
   2.125 bpw. The path is **closing the T2 prefill GEMM efficiency gap**, not a new quant format:
-  (a) lift DRAM utilization from ~80% toward the 237.6 GB/s ceiling, and (b) cut *effective*
-  weight re-read traffic with an L2-aware / weight-stationary tiling that matches Prism's mmq
-  access pattern. Plus cutting non-GEMM (attention/GDN) overhead. Weights are already at the
+  (a) **cut the measured 15–63× DRAM over-fetch** — read each 128B T2 weight line once and
+  derive all four 8-byte fragments from it (full-line load, not 4 scattered 8B global reads), with
+  an L2-friendly raster so lines stay resident across the 32 token re-reads; and (b) lift DRAM
+  utilization toward the 237.6 GB/s ceiling. Plus cutting non-GEMM (attention/GDN) overhead.
+  Weights are already at the
   2-bit floor; the sub-2-bit GGML formats (IQ2_XXS/IQ2_S/IQ1_M) have no in-tree kernels and there
   is no PQ/VQ path, so going below 2.125 bpw would be a from-scratch format build — not the path.
 - **Decode (TS): 25–30 t/s.** No-spec Prism baseline on this card is 22.2 t/s; closing the gap
