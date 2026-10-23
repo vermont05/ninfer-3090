@@ -308,32 +308,32 @@ reference.
   through LDS, the sweep does **not** establish whether a *cooperative* LDS-staged loader
   (one block loads a tile into LDS once, all warps read it) would win — that is still open.
   What is settled is only that the tested variants of the *existing per-warp loader* lose.
-- **Lever 1 (GEMM): the int8 GEMM *kernel* is DRAM-bandwidth-bound at ~80% of the ceiling —
-  so speeding up the int8 kernel is not the lever; the int8 *weight stream* is what caps
-  NInfer's prefill**
-  (2026-10-22, `.qual/wmma/cal38.cu`; battery bit-exact vs the i8 anchor, cold-L2 medians).
-  The device is an **RX 7600M XT: 16 CUs, 2 MB L2, 64 KiB LDS/block, 8 GB** — not the 28 CUs
-  the handoff assumed. A raw triad over 256 MB (≫ L2) measures the achievable **DRAM BW
-  ceiling at 237.6 GB/s** (the naive `memoryClockRate` estimate of ~36 GB/s is far below this
-  and is unreliable for GDDR6 — do not use it). The shipped `w1(1,2)@8` tile streams its
-  dominant traffic — weight re-reads (W is N×K int8, re-read by all T/32=32 token-blocks since
-  W ≫ 2 MB L2) — at:
-    | shape | weight-code traffic | shipped time | eff weight BW | % of 237.6 GB/s |
-    | gate_up 34816×5120×1024 | 5.70 GB | 30.6 ms | 186 GB/s | 78% |
-    | mlp_down 5120×17408×1024 | 2.85 GB | 15.1 ms | 189 GB/s | 80% |
-    | gdn_valuez 12288×5120×1024 | 2.01 GB | 10.4 ms | 194 GB/s | 82% |
-  Two targeted ablations settle the two remaining questions: (a) the **no-epilogue** variant
-  (identical loads + WMMA burst, per-group fold/store removed) runs *slower* (97–139 GB/s),
-  so the per-group fold ALU and store epilogue are **not** the bottleneck — they are off the
-  critical path; (b) the fatter-N tiles are ~1.9–3.3x slower (cal36), so the tile is not the
-  lever either. The kernel is bound by weight-traffic throughput and already sits at
-  ~80% of the DRAM ceiling. **Max achievable savings** if it hit the full 237.6 GB/s ceiling:
-  gate_up 30.6→24.0 ms, mlp_down 15.1→12.0 ms, gdn_valuez 10.4→8.5 ms ≈ **~11.6 ms per
-  1024-token chunk**, i.e. ~0.5% of the 2.2 s TTFT budget — far below the bar for a major
-  rewrite. Weight staging/persistence cannot help: W (178 MB gate_up) exceeds LDS (64 KiB) and
-  L2 (2 MB), so it cannot be kept resident, and a weight-stationary layout would still be
-  capped at the same 237.6 GB/s DRAM ceiling. **Do not pursue the activation/weight-staging
-  redesign.**
+- **Lever 1 (GEMM): the T2 prefill GEMM runs at ~19% of the DRAM ceiling in logical
+  packed-code terms — there is large headroom; the earlier "tapped out / ~80% of ceiling"
+  conclusion is WITHDRAWN (factor-of-4 bandwidth error, corrected 2026-10-22)**
+  (`.qual/wmma/cal38.cu`; battery bit-exact vs the i8 anchor, cold-L2 medians).
+  The device is an **RX 7600M XT: 16 CUs, 2 MB L2, 64 KiB LDS/block, 8 GB**. A raw triad over
+  256 MB (≫ L2) measures the achievable **DRAM BW ceiling at ~240 GB/s** (the naive
+  `memoryClockRate` estimate of ~36 GB/s is far below this and is unreliable for GDDR6 — do not
+  use it).
+  **The error:** cal38 computed "weight traffic" as `N*K*(T/32)` — **one byte per weight**. T2
+  packs **four two-bit codes per byte**, so the packed buffer is `N*K/4` bytes, and the logical
+  (deduplicated) packed-code traffic is `N*K/4*(T/32)`, i.e. **4× less** than the value the
+  benchmark printed. The "186 GB/s / 78% of ceiling" figure was therefore 4× too high. Corrected:
+    | shape | logical packed-code traffic (N·K/4·T/32) | shipped time | eff logical BW | % of 240 GB/s |
+    | gate_up 34816×5120×1024 | 1.43 GB | 30.6 ms | ~46.6 GB/s | ~19% |
+    | mlp_down 5120×17408×1024 | 0.71 GB | 15.1 ms | ~47.3 GB/s | ~20% |
+    | gdn_valuez 12288×5120×1024 | 0.50 GB | 10.4 ms | ~48 GB/s | ~20% |
+  So the GEMM streams its logical weight codes at **~19% of the DRAM ceiling** — it is **not**
+  bandwidth-saturated. A single ceiling-rate pass of the gate_up logical data would be
+  1.43/240 ≈ **5.9 ms**, vs the measured 30.6 ms → up to **~5× headroom** on the GEMM, from the
+  32× token-block re-reads that L2 (2 MB) cannot absorb against the 44.5 MB gate_up working set,
+  plus any latency/occupancy limits. **The GEMM efficiency/traffic lever is OPEN, not exhausted.**
+  (The no-epilogue and fatter-tile ablations still show *those specific variants* lose — that is
+  evidence about those variants, not a proof the GEMM is at its limit.) Weight staging cannot
+  keep W resident (178 MB ≫ 64 KiB LDS, 2 MB L2), so the lever is **reducing the re-read
+  traffic / lifting DRAM utilization** (L2-aware panelization, a weight-stationary schedule, a
+  higher-occupancy tile that hides the re-fetch latency), not pinning weights in on-chip memory.
   **What this does and does not say — and a second correction.** The *weight-bit* lever I
   proposed earlier ("compress int8 → 2-bit") is a **non-goal: NInfer's T2 weights are already
   2-bit-class.** T2 = ternary codes {-1,0,+1}, two bits each, four per byte, one fp16 scale per
@@ -344,12 +344,13 @@ reference.
   **296 t/s prefill** (4069-tok prompt → 296.2 t/s; decode **22.2 t/s** with ngram spec off,
   21.0 with it — ngram drafts barely accepted at 18.75%, a mild net loss) on that 2.13-bpw 27B.
   **At equal weight bit-rate, the ~1.8x prefill gap (NInfer ~165 t/s vs Prism ~296 t/s) is a
-  kernel/access-efficiency gap, not a bit-rate gap:** NInfer's T2 prefill GEMM runs at ~80% of
-  the DRAM ceiling with a 32x weight re-read access pattern (cal38), whereas Prism's tuned
-  PQ2_0 mmq kernels reach a higher effective throughput on the same bytes. **The lever for 300+
-  t/s is closing that efficiency/traffic gap** — DRAM utilization (80% → near-peak) plus
-  reducing *effective* weight re-read traffic via L2-aware tiling / a weight-stationary panel
-  layout that matches Prism's access pattern — and cutting non-GEMM (attention/GDN) overhead.
+  kernel/access-efficiency gap, not a bit-rate gap:** NInfer's T2 prefill GEMM runs at only ~19%
+  of the DRAM ceiling in logical packed-code terms (cal38, corrected) with a 32× weight re-read
+  access pattern, whereas Prism's tuned PQ2_0 mmq kernels reach a higher effective throughput on
+  the same bytes. **The lever for 300+ t/s is closing that efficiency/traffic gap** — DRAM
+  utilization (~19% → near-peak) plus reducing *effective* weight re-read traffic via L2-aware
+  tiling / a weight-stationary panel layout that matches Prism's access pattern — and cutting
+  non-GEMM (attention/GDN) overhead.
   It is **not** weight-bit reduction (already at the 2-bit floor) and **not** more DRAM.
   **Root cause measured (2026-10-22, `rocprofv3` GL2C DRAM counters on the shipped `w1(1,2)@8`
   via `.qual/wmma/cal38.cu`):** the T2 prefill GEMM over-fetches DRAM by **15–63×** its logical
@@ -360,19 +361,23 @@ reference.
   full **128-byte** DRAM line (`GL2C_EA_RDREQ_128B`); with 2 MB L2 against a 44.5 MB working set
   the lines evict between the 4 sub-reads of one line and across the 32 token-block re-reads, so
   each 128B line is fetched from DRAM multiple times. (gfx1102 exposes GL2C PMC counters in the
-  TheRock rocprofv3 1.4.1; no system rocprof/nsys.) **The proposed fix — read each 128B line once
-  and derive all four 32-byte fragments from it (a coalesced `int32v` 128-byte load) — was
-  implemented and measured, and is a NO-GO (2026-10-22, `cal38` `w1c` vs shipped `w1`, bit-exact
-  bitdiff=0):** the coalesced variant is ~70% *slower*, not faster — gate_up 52.5 ms / 109 GB/s
-  vs the shipped 30.8 ms / **185 GB/s**; mlp_down 26.6 vs 15.1 ms; gdn_valuez 18.5 vs 10.5 ms.
-  The persistent 128-byte register line + the quarter-extraction costs VGPRs and occupancy,
-  dragging the tuned `(1,2)@8` tile down to the ~108 GB/s every other (non-`(1,2)`) variant
-  already sits at. **Conclusion: the warm-L2 15–63× over-fetch is not the actionable lever.** The
-  shipped `(1,2)@8` tile already streams weight codes at **~185 GB/s cold-L2 (L2-flushed), 77% of
-  the 240 GB/s triad ceiling** — it is *not* the DRAM-thrashing kernel the warm-L2 counter
-  implied, and coalescing its reads cannot improve it. The real prefill regime is cold-L2 (each
-  token block's weight panel is read once, then evicted), where the `(1,2)` tile is already near
-  the bandwidth ceiling.
+  TheRock rocprofv3 1.4.1; no system rocprof/nsys.) **Counter caveat (unreconciled):** taken
+  literally the reported **22.1 GB in a ~30.6 ms gate_up launch implies ~720 GB/s — far above the
+  ~240 GB/s triad ceiling** — so the counter's units, dispatch aggregation, replay/accumulation
+  behavior, and its matching to a single *timed* (cold-L2) launch are **not yet reconciled** and
+  the 15–63× magnitude is **not trustworthy as stated**. The *direction* (physical DRAM traffic
+  well above the logical 1.43 GB) is consistent with the corrected ~19% logical utilization and
+  the 32× re-read pattern, but the number must be re-derived against a matched launch before it
+  is used for any roofline. **The proposed fix — read each 128B line once and derive all four
+  32-byte fragments from it (a coalesced `int32v` 128-byte load) — was implemented and measured
+  (`cal38` `w1c` vs shipped `w1`, bit-exact bitdiff=0), and that *variant* loses:** it is ~70%
+  slower (gate_up 52.5 ms vs 30.6 ms), because the persistent 128-byte register line + the
+  quarter-extraction cost VGPRs and occupancy and drag the tuned `(1,2)@8` tile down to the level
+  the other variants sit at. **That is evidence about *that* variant only** — a slower full-line
+  register load does **not** prove weight traffic cannot be reduced, or that a different design
+  (LDS-staged panel load, a higher-occupancy tile that hides re-fetch latency, a weight-stationary
+  schedule) would also lose. The GEMM's ~19%-of-ceiling logical utilization means the traffic
+  lever remains open.
 - **Raster A/B is inconclusive** (2026-10-22, `NINFER_T2_A8_RASTER`, W=1024 cold-boot, 3
   reps): default `cols`-fast (x=columns) median **165.2 tok/s** vs `rows`-fast (x=rows)
   **163.7 tok/s** — a ~1% delta. Two 3-run sets do not by themselves establish a noise
@@ -384,33 +389,33 @@ reference.
 Targets for the NInfer 27B stack (T2 ternary, **2.125 bpw** weights) on the **RX 7600M XT**
 (gfx1102, 16 CUs, 237.6 GB/s DRAM):
 
-- **Prefill (PP): 300+ t/s — reachable on the *card*, not on the NInfer T2 stack via GEMM work.**
-  The card demonstrably does 296 t/s here (Prism's 2.13-bpq PQ2_0 service, same ~2.1 bpw as
-  NInfer's T2 2.125 bpw). But the NInfer T2 prefill GEMM is **already at ~185 GB/s cold-L2 = 77%
-  of the 240 GB/s DRAM ceiling** (`cal38` `w1(1,2)@8`, L2-flushed), and the coalesced-over-fetch
-  fix is a **measured NO-GO** (a ~70% regression — see the root-cause note above). Prefill-bucket
-  profile at W=1024 (`NINFER_PREFILL_PROFILE=1`, single 1024-tok chunk, total 5084 ms): MLP GEMMs
-  (gdn_mlp 2137 ms + attn_mlp 682 ms) ≈ **55%** of prefill time, already at 77% of the DRAM
-  ceiling; the mixers/attention (gdn_mixer 1279 ms + attn_mixer 985 ms, which include the GDN
-  recurrent scan, attention, and their projection GEMMs) ≈ **45%**. Even lifting the MLP GEMMs to
-  100% of the ceiling buys only ~1.17× on their 55% ≈ **~10% total → ~190 t/s**, not 300. The
-  45% mixer/attention time is where the remaining NInfer headroom is. Reaching 300 t/s (a 1.8× cut
-  in prefill time) on the NInfer stack therefore needs to roughly *halve* prefill time — beyond
-  what the MLP GEMM's remaining bandwidth headroom allows alone; it requires closing the **stack**
-  gap with Prism (GEMMs at the full ceiling *and* substantially faster GDN-scan/attention) — i.e.
-  architectural work, not a kernel access-pattern tweak. Weights are already at the 2-bit floor
-  (sub-2-bit GGML formats IQ2_XXS/IQ2_S/IQ1_M have no in-tree kernels, no PQ/VQ path), so a lower
-  bit-rate is a from-scratch format build, not the path. **Realistic near-term NInfer prefill
-  target: ~190–200 t/s** (GEMM to ceiling + modest non-GEMM cuts); 300+ t/s on this stack is not
-  claimed to be reachable by the levers measured so far.
+- **Prefill (PP): 300+ t/s — the target stands; the GEMM traffic lever is OPEN (earlier
+  "190–200 cap / GEMM tapped out" conclusion WITHDRAWN after a factor-of-4 bandwidth correction).**
+  The card demonstrably does 296 t/s here (Prism's 2.13-bpw PQ2_0 service, same ~2.1 bpw as
+  NInfer's T2 2.125 bpw). Corrected `cal38` measurement: the NInfer T2 prefill GEMM streams its
+  **logical** packed codes at **~19% of the ~240 GB/s DRAM ceiling** (~46 GB/s; a single
+  ceiling-rate pass of the gate_up logical data would be ~5.9 ms vs the measured 30.6 ms → ~5×
+  headroom). It is **not** bandwidth-saturated, so lifting DRAM utilization / cutting the 32×
+  weight re-read traffic is a live lever toward 300+. Weights are already at the 2-bit floor
+  (sub-2-bit GGML formats IQ2_XXS/IQ2_S/IQ1_M have no in-tree kernels, no PQ/VQ path), so the
+  lever is traffic/efficiency, not bit-rate. The coalesced `int32v` full-line variant is a NO-GO
+  *as that variant* (register/occupancy cost) and does not close the lever — the next design to
+  try is an LDS-staged, higher-occupancy, weight-stationary panel loader. Prefill-bucket profile
+  at W=1024 (`NINFER_PREFILL_PROFILE=1`, single 1024-tok chunk, total 5084 ms): MLP GEMMs
+  (gdn_mlp 2137 ms + attn_mlp 682 ms) ≈ 55%; mixers/attention (gdn_mixer 1279 ms + attn_mixer
+  985 ms, incl. the GDN recurrent scan, attention, and their projection GEMMs) ≈ 45%. The bucket
+  split shifts with context (in the same run attention grew ~0.99 s → 4.41 s across the four
+  chunks), so it is one-chunk evidence, not a fixed ceiling.
 - **Decode (TS): 25–30 t/s.** No-spec Prism baseline on this card is 22.2 t/s; closing the gap
   to 25–30 is the decode-side lever (separate from prefill).
 
-Baseline to beat (NInfer T2, 1,065-tok prompt): **~165 t/s prefill**. The gap to Prism's 296 t/s
-is a **stack/architecture gap at equal weight bit-rate** (GEMM already at 77% of the DRAM ceiling;
-the remaining lever is the ~27% non-GEMM attention/GDN time plus the last 23% of GEMM headroom),
-**not** a weight-read traffic gap — the coalesced 128-byte-line fix that would have targeted the
-latter was measured and regressed.
+Baseline to beat (NInfer T2, 1,065-tok prompt): **~165 t/s prefill** (the closest same-scale
+NInfer record is 142.2 t/s at 4,100 tokens). Prism's 296 t/s (4,069-tok prompt, no cached
+tokens) is a real reference on the same card, but the two engines use different timing
+definitions, token counts, formats, and paths, so it is a **reference, not a controlled
+attribution** of the gap. The gap is closed by lifting the GEMM's ~19% DRAM utilization toward
+the ceiling (cutting the 32× weight re-read traffic) plus the mixer/attention time — **not** by
+any measured ceiling on the GEMM.
 
 ## 4. Decode backlog (only if decode is resumed — parked for now)
 
