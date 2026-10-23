@@ -62,6 +62,7 @@
 #include "ops/softmax_attention/dense/causal_cache/prompt_common.cuh"
 
 #include <cstdint>
+#include <type_traits>
 
 namespace ninfer::ops {
 
@@ -85,16 +86,26 @@ struct CausalPromptFa2Stage {
     static_assert(Bytes % 16 == 0);
 };
 
-template <int Warps, bool PackedValues, bool PackedKeys>
+// Stages is the depth of the K/V double buffer: 2 on cards with a large shared-memory carve-out
+// (sm_8x, where the copy of the next tile overlaps this tile's math), 1 on RDNA3 where the 2-stage
+// shapes exceed the 64 KiB LDS ceiling and the tiles are copied and computed sequentially.
+template <int Warps, bool PackedValues, bool PackedKeys, int Stages = 2>
 struct CausalPromptFa2Shape {
     static_assert(Warps == 4 || Warps == 8);
-    using Stage                    = CausalPromptFa2Stage<PackedValues, PackedKeys>;
-    static constexpr int Threads   = Warps * 32;
-    static constexpr int Br        = Warps * 16;
-    static constexpr int QBytes    = Br * kCausalPromptHeadDim;
-    static constexpr int SmemBytes = QBytes + 2 * Stage::Bytes;
-    // The CTA's FP32 Q group scales pass through the stage the prologue does not fill.
-    static_assert(Br * kCausalPromptFa2Groups * 4 <= Stage::KBytes);
+    static_assert(Stages == 1 || Stages == 2);
+    using Stage                = CausalPromptFa2Stage<PackedValues, PackedKeys>;
+    static constexpr int WarpCount   = Warps;
+    static constexpr int StageCount  = Stages;
+    static constexpr int Threads     = Warps * 32;
+    static constexpr int Br          = Warps * 16;
+    static constexpr int QBytes      = Br * kCausalPromptHeadDim;
+    // The CTA's FP32 Q group scales: a 2-stage shape passes them through the stage the prologue
+    // does not fill; a 1-stage shape has no unused stage to borrow, so they live in a dedicated
+    // region after the single stage.
+    static constexpr int QScaleBytes = Br * kCausalPromptFa2Groups * 4;
+    static constexpr int SmemBytes   = QBytes + Stages * Stage::Bytes + (Stages == 1 ? QScaleBytes : 0);
+    static_assert(Stages == 2 ? (QScaleBytes <= Stage::KBytes) : true,
+                  "2-stage shape stashes its Q group scales in the unused stage");
 };
 
 // A 64-key FP16 partial is bounded by 64 * max|code| * max_scale (every probability is at most
@@ -111,6 +122,42 @@ static_assert(CausalPromptFa2Shape<8, false, false>::SmemBytes == 100352);
 static_assert(CausalPromptFa2Shape<4, false, false>::SmemBytes == 83968);
 static_assert(CausalPromptFa2Shape<8, true, false>::SmemBytes == 84992);
 static_assert(CausalPromptFa2Shape<8, true, true>::SmemBytes == 84992);
+// The 1-stage RDNA3 descent targets fit the 64 KiB LDS ceiling on every INT8 geometry.
+static_assert(CausalPromptFa2Shape<4, false, false, 1>::SmemBytes <= 65536);
+static_assert(CausalPromptFa2Shape<4, true, false, 1>::SmemBytes <= 65536);
+static_assert(CausalPromptFa2Shape<4, true, true, 1>::SmemBytes <= 65536);
+
+#if defined(__HIPCC__)
+// RDNA3 gives a thread group at most 64 KiB of LDS (gfx1102: sharedPerBlock ==
+// sharedPerBlockOptin == 65536). Every 2-stage INT8 shape above exceeds it, and two stages alone
+// already do for unpacked keys, so no 2-stage shape can be configured on this device family. An
+// over-ceiling shape is rebuilt smaller before the launch configures it: drop to one stage first,
+// and only then to four warps. A one-stage four-warp shape fits every INT8 geometry, so the
+// descent always terminates there. (A descended 8-warp split shape falls to four warps and runs
+// unsplit; the four-warp shape sweeps the same keys, so the result is unchanged.)
+inline constexpr int kCausalPromptFa2LdsCeilingBytes = 64 * 1024;
+
+template <typename Shape>
+struct CausalPromptFa2LdsFit {
+    using type = Shape;
+};
+
+template <int Warps, bool PackedValues, bool PackedKeys>
+struct CausalPromptFa2LdsFit<CausalPromptFa2Shape<Warps, PackedValues, PackedKeys, 2>> {
+    using Two  = CausalPromptFa2Shape<Warps, PackedValues, PackedKeys, 2>;
+    using One  = CausalPromptFa2Shape<Warps, PackedValues, PackedKeys, 1>;
+    using type = std::conditional_t<
+        Two::SmemBytes <= kCausalPromptFa2LdsCeilingBytes, Two,
+        std::conditional_t<One::SmemBytes <= kCausalPromptFa2LdsCeilingBytes,
+                           One, CausalPromptFa2Shape<4, PackedValues, PackedKeys, 1>>>;
+};
+#else
+// No LDS ceiling on sm_8x: the 2-stage shape is used as planned.
+template <typename Shape>
+struct CausalPromptFa2LdsFit {
+    using type = Shape;
+};
+#endif
 
 // One ldmatrix.trans b16 lane of an INT8 [key][d] tile holds the codes
 // {V[k][d], V[k][d+1], V[k+1][d], V[k+1][d+1]}. Returns the FP16 B-fragment halves
@@ -162,8 +209,9 @@ __host__ __device__ __forceinline__ std::int64_t causal_prompt_fa2_partial_row(i
 // PackedValues selects the packed INT4 G32 value plane (rk8v4, rk4v4); PackedKeys selects rk4v4's
 // Lloyd-Max key plane. cache_k and cache_v are the raw planes either way.
 template <typename Geometry, typename Metadata, int Warps, bool Split, bool PackedValues,
-          bool PackedKeys>
-__global__ __launch_bounds__((CausalPromptFa2Shape<Warps, PackedValues, PackedKeys>::Threads), 1) void
+          bool PackedKeys, int Stages = 2>
+__global__ __launch_bounds__(
+    (CausalPromptFa2Shape<Warps, PackedValues, PackedKeys, Stages>::Threads), 1) void
 causal_attention_prompt_i8_fa2_kernel(const __nv_bfloat16* __restrict__ q,
                                       const std::int8_t* __restrict__ cache_k,
                                       const std::int8_t* __restrict__ cache_v,
@@ -175,7 +223,7 @@ causal_attention_prompt_i8_fa2_kernel(const __nv_bfloat16* __restrict__ q,
                                       float2* __restrict__ partial_stats) {
     constexpr int D             = kCausalPromptHeadDim;
     constexpr int DB16          = D / 2;
-    using Shape                 = CausalPromptFa2Shape<Warps, PackedValues, PackedKeys>;
+    using Shape                 = CausalPromptFa2Shape<Warps, PackedValues, PackedKeys, Stages>;
     using Stage                 = typename Shape::Stage;
     constexpr int Threads       = Shape::Threads;
     constexpr int Br            = Shape::Br;
@@ -250,8 +298,10 @@ causal_attention_prompt_i8_fa2_kernel(const __nv_bfloat16* __restrict__ q,
     const int kb_begin        = Split ? min(key_blocks, split * pages_per_split) : 0;
     const int kb_end          = Split ? min(key_blocks, kb_begin + pages_per_split) : key_blocks;
 
+    // A 1-stage shape has a single stage at a fixed offset; a 2-stage shape alternates between the
+    // two. The stage index is ignored (always 0) in the 1-stage case.
     const auto stage_base = [&](int stage) {
-        return smem_raw + Shape::QBytes + stage * Stage::Bytes;
+        return smem_raw + Shape::QBytes + (Stages == 1 ? 0 : (stage & 1)) * Stage::Bytes;
     };
 
     // rk4v4: the next tile's packed keys, 16 bytes (32 dimensions of one key) per chunk, held in
@@ -370,7 +420,11 @@ causal_attention_prompt_i8_fa2_kernel(const __nv_bfloat16* __restrict__ q,
     };
 
     // The first tile's copy overlaps the Q encoding below; the first loop barrier publishes both.
-    if (kb_begin < kb_end) { issue_tile(kb_begin); }
+    // A 1-stage shape issues its first tile inside the loop (there is no second stage to overlap
+    // the copy with), so only the 2-stage path pre-issues here.
+    if constexpr (Stages == 2) {
+        if (kb_begin < kb_end) { issue_tile(kb_begin); }
+    }
 
     // The whole CTA rotates and encodes the Q rows of its active warps, QRows rows per warp at a
     // time: one row is a chain of dependent shuffles (the rotation's five lane stages and four
@@ -381,7 +435,10 @@ causal_attention_prompt_i8_fa2_kernel(const __nv_bfloat16* __restrict__ q,
     // at four rows, 31.1 us at eight). The group scales pass through the stage the first tile does
     // not fill.
     constexpr int QRows = 4;
-    float* q_scale_s    = reinterpret_cast<float*>(stage_base((kb_begin + 1) & 1));
+    // 2-stage: the stage the first tile does not fill. 1-stage: a dedicated region after the
+    // single stage (issue_tile never writes there, so it stays valid across the whole sweep).
+    float* q_scale_s = reinterpret_cast<float*>(
+        smem_raw + Shape::QBytes + (Stages == 2 ? ((kb_begin + 1) & 1) : 1) * Stage::Bytes);
     const int active_q_groups = div_up(rows, 16) * (16 / QRows);
 #pragma unroll 1
     for (int group = warp; group < active_q_groups; group += Warps) {
@@ -431,7 +488,10 @@ causal_attention_prompt_i8_fa2_kernel(const __nv_bfloat16* __restrict__ q,
             }
         }
     }
-    if (kb_begin < kb_end) { expand_keys(kb_begin); }
+    // A 1-stage shape expands its first tile inside the loop, after the copy that fills it.
+    if constexpr (Stages == 2) {
+        if (kb_begin < kb_end) { expand_keys(kb_begin); }
+    }
     __syncthreads();
 
     const int a_mat    = lane >> 3;
@@ -737,16 +797,34 @@ causal_attention_prompt_i8_fa2_kernel(const __nv_bfloat16* __restrict__ q,
         }
     };
 
-    // Every warp publishes one tile per barrier; the next tile's copy overlaps this tile's math.
+    if constexpr (Stages == 2) {
+        // Every warp publishes one tile per barrier; the next tile's copy overlaps this tile's
+        // math.
 #pragma unroll 1
-    for (int kb = kb_begin; kb < kb_end; ++kb) {
-        cp_wait<0>();
-        __syncthreads();
-        const bool has_next = kb + 1 < kb_end;
-        if (has_next) { issue_tile(kb + 1); }
-        qk_softmax(kb);
-        pv(kb);
-        if (has_next) { expand_keys(kb + 1); }
+        for (int kb = kb_begin; kb < kb_end; ++kb) {
+            cp_wait<0>();
+            __syncthreads();
+            const bool has_next = kb + 1 < kb_end;
+            if (has_next) { issue_tile(kb + 1); }
+            qk_softmax(kb);
+            pv(kb);
+            if (has_next) { expand_keys(kb + 1); }
+        }
+    } else {
+        // One stage: copy a tile, then compute it, with no overlap between tiles. The leading
+        // copy reuses the stage the previous iteration just read, so the trailing barrier orders
+        // every warp's reads of that tile before the next copy overwrites it.
+#pragma unroll 1
+        for (int kb = kb_begin; kb < kb_end; ++kb) {
+            issue_tile(kb);
+            cp_wait<0>();
+            __syncthreads();
+            expand_keys(kb);
+            __syncthreads();
+            qk_softmax(kb);
+            pv(kb);
+            __syncthreads();
+        }
     }
 
     running_l0         = warp_sum<4>(running_l0, FullMask);

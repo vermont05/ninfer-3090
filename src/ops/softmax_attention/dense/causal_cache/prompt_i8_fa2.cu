@@ -15,34 +15,40 @@
 namespace ninfer::ops::detail {
 namespace {
 
-template <typename Geometry, typename Metadata, bool PackedValues, bool PackedKeys>
-void launch_for(const Tensor& q, const Tensor& positions, float scale, const Tensor& k_pages,
-                const Tensor& v_pages, const Tensor& k_scale_pages, const Tensor& v_scale_pages,
-                Metadata metadata, CausalAttentionExecutionEnvelope envelope,
-                WorkspaceArena& workspace, std::int32_t multiprocessor_count, Tensor& out,
-                cudaStream_t stream) {
-    const auto width = static_cast<std::int32_t>(q.ne[2]);
-    const CausalPromptFa2Plan plan = causal_prompt_fa2_plan(
-        Geometry::QHeads, width, envelope.max_visible_keys, multiprocessor_count);
+// Launches attention for a concrete (compile-time) fitted shape: the warps/stages the shape names
+// and, when the shape is an eight-warp split, the FP32 merge. A split plan whose shape descended to
+// four warps runs unsplit here (the four-warp shape sweeps the same keys).
+template <typename Geometry, typename Metadata, bool PackedValues, bool PackedKeys, typename Fit>
+void launch_fitted(const Tensor& q, const Tensor& positions, float scale, const Tensor& k_pages,
+                   const Tensor& v_pages, const Tensor& k_scale_pages, const Tensor& v_scale_pages,
+                   Metadata metadata, CausalAttentionExecutionEnvelope envelope,
+                   WorkspaceArena& workspace, const CausalPromptFa2Plan& plan, Tensor& out,
+                   cudaStream_t stream) {
+    const auto width       = static_cast<std::int32_t>(q.ne[2]);
+    const int fit_warps    = Fit::WarpCount;
+    const int fit_stages   = Fit::StageCount;
+    const bool fit_split   = plan.splits > 1 && fit_warps == 8;
+
     CausalPromptFa2Partials partials{};
-    if (plan.splits > 1) {
+    if (fit_split) {
         partials =
             allocate_causal_prompt_fa2_partials(workspace, Geometry::QHeads, width, plan.splits);
     }
 
-    const auto launch = [&]<int Warps, bool Split>() {
-        using Shape       = CausalPromptFa2Shape<Warps, PackedValues, PackedKeys>;
+    const auto launch = [&]<int Warps, int Stages, bool Split>() {
+        using Shape       = CausalPromptFa2Shape<Warps, PackedValues, PackedKeys, Stages>;
         const auto kernel = causal_attention_prompt_i8_fa2_kernel<Geometry, Metadata, Warps, Split,
-                                                                  PackedValues, PackedKeys>;
+                                                                  PackedValues, PackedKeys,
+                                                                  Stages>;
         configure_cuda_device_once([] {
             return cudaFuncSetAttribute(
                 causal_attention_prompt_i8_fa2_kernel<Geometry, Metadata, Warps, Split,
-                                                      PackedValues, PackedKeys>,
+                                                      PackedValues, PackedKeys, Stages>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize, Shape::SmemBytes);
         });
         const dim3 grid(static_cast<unsigned>(div_up(width, Shape::Br)),
                         static_cast<unsigned>(Geometry::QHeads),
-                        static_cast<unsigned>(plan.splits));
+                        static_cast<unsigned>(Split ? plan.splits : 1));
         kernel<<<grid, Shape::Threads, Shape::SmemBytes, stream>>>(
             static_cast<const __nv_bfloat16*>(q.data), static_cast<const std::int8_t*>(k_pages.data),
             static_cast<const std::int8_t*>(v_pages.data),
@@ -54,24 +60,62 @@ void launch_for(const Tensor& q, const Tensor& positions, float scale, const Ten
         CUDA_CHECK(cudaGetLastError());
     };
 
-    if (plan.splits == 1) {
-        if (plan.warps == 4) {
-            launch.template operator()<4, false>();
+    if (fit_split) {
+        if (fit_stages == 1) {
+            launch.template operator()<8, 1, true>();
         } else {
-            launch.template operator()<8, false>();
+            launch.template operator()<8, 2, true>();
         }
+        constexpr float Log2E = 1.4426950408889634074f;
+        causal_attention_prompt_i8_fa2_merge_kernel<Geometry, Metadata>
+            <<<dim3(static_cast<unsigned>(width), static_cast<unsigned>(Geometry::QHeads)),
+               kCausalPromptHeadDim, 0, stream>>>(
+                static_cast<const float*>(partials.rows.data),
+                static_cast<const float2*>(partials.stats.data), metadata, width, plan.splits,
+                scale * Log2E, static_cast<__nv_bfloat16*>(out.data));
+        CUDA_CHECK(cudaGetLastError());
         return;
     }
-    // Only eight-warp CTAs split.
-    launch.template operator()<8, true>();
-    constexpr float Log2E = 1.4426950408889634074f;
-    causal_attention_prompt_i8_fa2_merge_kernel<Geometry, Metadata>
-        <<<dim3(static_cast<unsigned>(width), static_cast<unsigned>(Geometry::QHeads)),
-           kCausalPromptHeadDim, 0, stream>>>(
-            static_cast<const float*>(partials.rows.data),
-            static_cast<const float2*>(partials.stats.data), metadata, width, plan.splits,
-            scale * Log2E, static_cast<__nv_bfloat16*>(out.data));
-    CUDA_CHECK(cudaGetLastError());
+    if (fit_warps == 4) {
+        if (fit_stages == 1) {
+            launch.template operator()<4, 1, false>();
+        } else {
+            launch.template operator()<4, 2, false>();
+        }
+    } else {
+        if (fit_stages == 1) {
+            launch.template operator()<8, 1, false>();
+        } else {
+            launch.template operator()<8, 2, false>();
+        }
+    }
+}
+
+template <typename Geometry, typename Metadata, bool PackedValues, bool PackedKeys>
+void launch_for(const Tensor& q, const Tensor& positions, float scale, const Tensor& k_pages,
+                const Tensor& v_pages, const Tensor& k_scale_pages, const Tensor& v_scale_pages,
+                Metadata metadata, CausalAttentionExecutionEnvelope envelope,
+                WorkspaceArena& workspace, std::int32_t multiprocessor_count, Tensor& out,
+                cudaStream_t stream) {
+    const auto width = static_cast<std::int32_t>(q.ne[2]);
+    const CausalPromptFa2Plan plan = causal_prompt_fa2_plan(
+        Geometry::QHeads, width, envelope.max_visible_keys, multiprocessor_count);
+    // The planned shape, descended on RDNA3 to fit the LDS ceiling (a 1-stage, and if needed
+    // four-warp, variant); unchanged on sm_8x. plan.warps is a runtime value, so the requested
+    // (two-stage) shape is selected by branch and the descent is a compile-time type choice.
+    if (plan.warps == 4) {
+        using Fit =
+            typename CausalPromptFa2LdsFit<CausalPromptFa2Shape<4, PackedValues, PackedKeys, 2>>::type;
+        launch_fitted<Geometry, Metadata, PackedValues, PackedKeys, Fit>(
+            q, positions, scale, k_pages, v_pages, k_scale_pages, v_scale_pages, metadata, envelope,
+            workspace, plan, out, stream);
+    } else {
+        using Fit =
+            typename CausalPromptFa2LdsFit<CausalPromptFa2Shape<8, PackedValues, PackedKeys, 2>>::type;
+        launch_fitted<Geometry, Metadata, PackedValues, PackedKeys, Fit>(
+            q, positions, scale, k_pages, v_pages, k_scale_pages, v_scale_pages, metadata, envelope,
+            workspace, plan, out, stream);
+    }
 }
 
 template <typename Metadata, typename Cache>

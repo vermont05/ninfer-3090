@@ -86,13 +86,20 @@ This is the top open question. Bisect **without Prism**:
   any case can even report a skip. Pre-existing platform gap, not a Q8/fold regression
   (FP8 A16 record legs, which fit, run and pass; FP8 A8/NVFP4 A4 skip via the stub
   refusals).
-- [ ] **New (2026-10-22): `ninfer-perplexity` aborts on its default Int8Group64 KV.** The
+- [x] **`ninfer-perplexity` aborted on its default Int8Group64 KV — FIXED 2026-10-22.** The
   i8 FA2 prompt kernel (`CausalPromptFa2Shape<8,false,false>` ≈ 98 KiB dynamic smem)
-  exceeds gfx1102's 64 KiB LDS ceiling: the one-time `cudaFuncSetAttribute` throws
-  `hipErrorInvalidValue` and the site's `CUDA_CHECK` aborts before any token scores —
+  exceeded gfx1102's 64 KiB LDS ceiling: the one-time `cudaFuncSetAttribute` threw
+  `hipErrorInvalidValue` and the site's `CUDA_CHECK` aborted before any token scored —
   the same trap commit 24306ae4 fitted the bf16 causal tiers for, which this launcher
-  never got. `--kv-dtype bf16` scores fine (how §1's PPL number was produced); the fix is
-  the same shape descent (or a smaller-Warps instantiation) on the i8 path.
+  never got. Fixed with the same shape-descent idiom: `CausalPromptFa2Shape`/the kernel
+  take a `Stages` depth, and a HIP-gated `CausalPromptFa2LdsFit` rebuilds an over-ceiling
+  2-stage shape as a 1-stage (and, for 8-warp, 4-warp) variant — the only INT8 geometry
+  that fits (51,200 B). The 1-stage path copies and computes each 64-key tile sequentially
+  (no double-buffer overlap) and keeps its Q group scales in a dedicated LDS region (the
+  2-stage path borrows the unused stage); the QK/PV math is unchanged and shared. Verified
+  on gfx1102: the default `int8` path now scores (ppl 4.3917 over the §1 corpus) and
+  matches the `bf16` reference (ppl 4.3920) to four decimals. The `--kv-dtype bf16`
+  workaround in `.qual/qual1/ppl.sh` is no longer required.
 
 ## 2. Contract fixes (from Codex review — both decided 2026-10-21)
 
