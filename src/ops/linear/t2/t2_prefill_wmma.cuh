@@ -220,6 +220,184 @@ __global__ __launch_bounds__(32, 8) void t2_prefill_wmma1_kernel(
     }
 }
 
+// Column-split variant (cal64/cal64b): a 64-thread block whose two warps split the token
+// columns of a (16*MF) x (16*NF*2) block tile and share its row panel. Each warp computes one
+// (16*MF) x (16*NF) tile exactly as t2_prefill_wmma1_kernel does, fed by WIDE loads: one
+// 32 B/lane int8v load supplies two consecutive s-slots and is byte-identical per lane to
+// that kernel's two 16 B loads, so fragment pairing — and every output bit — is preserved.
+// The win is layout (cal60: requests are sector-bound, so only layout moves them): the two
+// warps touch DISJOINT token windows (columns are tokens), halving per-block x sectors, and
+// the panel raster keeps them hot (P=32: 975M L2 hits against 24M misses).
+//
+// ROW COVERAGE LAW (pinned by cal64b's verify runs): a block covers 16*MF rows, NOT 16*MF*2.
+// Callers must size the grid as (rows / (16*MF*Panel), columns / (16*NF*2), Panel) — tile
+// stride 16*MF, grid.x = column blocks — and the shape must satisfy rows % (16*MF*Panel) == 0
+// and columns % (16*NF*2) == 0. cal64 measured a 22.8-50.4% coverage bug with a 16*MF*2
+// stride; its timings are void.
+//
+// Verified BIT-EXACT against t2_prefill_wmma1_kernel on identical buffers — 35,651,584 /
+// 35,651,584 outputs, both passes, gate_up 34816x5120x1024 — for all five shapes swept
+// ((2,1) at P=8/16/32, (4,1) at P=8/16). The gate must be the engine kernel itself: T2
+// activations are stored in quantiser-permuted order, so a scalar identity-pairing reference
+// on synthetic data diverges from BOTH kernels by design (cal64b: 1/35,651,584 match).
+// (4,1) shapes spill 112 B — do not pursue. 86 VGPR, 0 private segment, occupancy 8.
+//
+// VERDICT (cal65/cal66, closed 2026-10-23): the cal64b probe win was a coverage artifact — its
+// timing grid carried cal63/64's overlap-trick extra /2 on grid.x, measuring half the rows, so
+// 23.14 ms is half-work. Full-coverage timing (cal66, grid.x = N/(16*MF*P), flush per rep, same
+// epilogue both arms): (2,1) P=32 loses to the shipped (1,2) G32 raster at every engine shape —
+// gate_up 45.95 vs 28.77 ms, down 24.08 vs 14.61, o_proj 6.94 vs 4.19, flat across P=8/16/32 —
+// reproducing the engine's -27% ABBA (104.2 vs 142.4 tok/s, bit-exact text). Mechanism: halving
+// x windows keeps warp count identical, so each weight row is read by 2 warps — weight traffic
+// doubles, and at 2.125 bpw weights dominate. The coverage law applies to TIMING grids too.
+// Routed by NINFER_T2_A8_COLSPLIT in t2_a8.cu, default off; the lane is closed.
+template <int MF, int NF, int Panel, class Epilogue>
+__global__ __launch_bounds__(64, 8) void t2_prefill_wmma2_kernel(
+    const std::uint8_t* __restrict__ w_codes, const __half* __restrict__ w_scales,
+    const std::int8_t* __restrict__ x, const __half* __restrict__ xs, std::int32_t k_cols,
+    std::int32_t t_pad, std::int32_t tokens, bool rows_fast, Epilogue epilogue) {
+    using namespace wmma_detail;
+    constexpr int kGroupK = 128; // one weight scale group, as in the shipped tile
+    constexpr float kMagic = 12582912.0F; // 1.5 * 2^23
+
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int warp = static_cast<int>(threadIdx.x) >> 5;
+    (void)rows_fast; // panel raster only; grid is the caller's (see the coverage law above)
+    const int col0 = static_cast<int>(blockIdx.y) * (16 * NF * 2) + warp * (16 * NF);
+    const int row0 = Panel > 0
+                         ? (static_cast<int>(blockIdx.z) * static_cast<int>(gridDim.x) + static_cast<int>(blockIdx.x)) * (16 * MF)
+                         : static_cast<int>(blockIdx.x) * (16 * MF);
+
+    const int colWin = lane >> 1; // Awin window column within the warp tile
+    const int rowWin = lane & 15; // Bwin slot row within the warp tile
+
+    int8v acc[MF][NF];
+    float accf[MF][NF][8];
+    const int8v magic = {0x4B400000, 0x4B400000, 0x4B400000, 0x4B400000,
+                          0x4B400000, 0x4B400000, 0x4B400000, 0x4B400000};
+#pragma unroll
+    for (int m = 0; m < MF; ++m) {
+#pragma unroll
+        for (int n = 0; n < NF; ++n) {
+            acc[m][n] = magic;
+#pragma unroll
+            for (int e = 0; e < 8; ++e) { accf[m][n][e] = 0.0F; }
+        }
+    }
+
+    // Row bases, walked per group (the cal59 D22 diet — no reindexed address math): weight
+    // lines, weight scales, activation windows. pBOff is the NF token-window row offset.
+    const std::size_t kRowBytes  = static_cast<std::size_t>(k_cols) / 4;
+    const std::size_t kScaleCols = static_cast<std::size_t>(k_cols) / kGroupK;
+    const std::uint8_t* pA[MF];
+    const __half* pS[MF];
+    const std::int8_t* pB = x + static_cast<std::size_t>(col0 + colWin) * k_cols;
+#pragma unroll
+    for (int m = 0; m < MF; ++m) {
+        pA[m] = w_codes + (static_cast<std::size_t>(row0) + static_cast<std::size_t>(rowWin) +
+                            static_cast<std::size_t>(m) * 16) *
+                               kRowBytes;
+        pS[m] = w_scales + (static_cast<std::size_t>(row0) + static_cast<std::size_t>(rowWin) +
+                             static_cast<std::size_t>(m) * 16) *
+                                kScaleCols;
+    }
+    std::size_t pBOff[NF];
+#pragma unroll
+    for (int n = 0; n < NF; ++n) { pBOff[n] = static_cast<std::size_t>(n) * 16 * k_cols; }
+
+    const int kGroups = k_cols / kGroupK;
+    for (int g = 0; g < kGroups; ++g) {
+#pragma unroll
+        for (int m = 0; m < MF; ++m) {
+#pragma unroll
+            for (int n = 0; n < NF; ++n) { acc[m][n] = magic; }
+        }
+
+        // Weight lines for this group: MF lines of 32 bytes, one per Bwin row.
+        int8v line[MF];
+#pragma unroll
+        for (int m = 0; m < MF; ++m) { line[m] = *reinterpret_cast<const int8v*>(pA[m]); pA[m] += kGroupK / 4; }
+
+        // Four wide-load steps, each feeding the s-pair (2*sp, 2*sp+1): the int8v read is
+        // 32 B/lane, its two int4v halves are the engine kernel's av[s] bytes verbatim.
+#pragma unroll
+        for (int sp = 0; sp < 4; ++sp) {
+            int4v av[NF][2];
+#pragma unroll
+            for (int n = 0; n < NF; ++n) {
+                const int8v wide = *reinterpret_cast<const int8v*>(pB + pBOff[n] + sp * 32);
+                av[n][0] = {wide[0], wide[1], wide[2], wide[3]};
+                av[n][1] = {wide[4], wide[5], wide[6], wide[7]};
+            }
+            int4v bv[MF][2];
+#pragma unroll
+            for (int m = 0; m < MF; ++m) {
+                int lw[8];
+                *reinterpret_cast<int8v*>(lw) = line[m];
+                bv[m][0] = wmma_code_frag(static_cast<unsigned>(lw[2 * sp]));
+                bv[m][1] = wmma_code_frag(static_cast<unsigned>(lw[2 * sp + 1]));
+            }
+#pragma unroll
+            for (int j = 0; j < 2; ++j) {
+#pragma unroll
+                for (int m = 0; m < MF; ++m) {
+#pragma unroll
+                    for (int n = 0; n < NF; ++n) {
+                        acc[m][n] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, av[n][j],
+                                                                               true, bv[m][j], acc[m][n], true);
+                    }
+                }
+            }
+        }
+        pB += kGroupK;
+
+        // Fold this group's dots — the shipped sequence: xs hoisted per group, bits ->
+        // float, scale by ws[row] * xs[col], fma. Shared xs columns make the column split
+        // free on the scale side too.
+        float xsv[NF][8];
+#pragma unroll
+        for (int n = 0; n < NF; ++n) {
+            const int cb = col0 + n * 16 + (lane >= 16 ? 8 : 0);
+            const __half* xp = xs + static_cast<std::size_t>(g) * t_pad + cb;
+#pragma unroll
+            for (int e = 0; e < 8; ++e) { xsv[n][e] = __half2float(*xp); xp += 1; }
+        }
+#pragma unroll
+        for (int m = 0; m < MF; ++m) {
+            const float wv = __half2float(*pS[m]); pS[m] += 1;
+#pragma unroll
+            for (int n = 0; n < NF; ++n) {
+                const int cBase = col0 + n * 16 + (lane >= 16 ? 8 : 0);
+                const int8v v   = acc[m][n];
+#pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    const int col = cBase + e;
+                    if (col < tokens) {
+                        const float dot = __int_as_float(v[e]) - kMagic;
+                        accf[m][n][e] = fmaf(dot, wv * xsv[n][e], accf[m][n][e]);
+                    }
+                }
+            }
+        }
+    }
+
+    // Epilogue: every tile's eight fragment words, columns < tokens (padded columns are
+    // zero and contribute nothing).
+#pragma unroll
+    for (int m = 0; m < MF; ++m) {
+        const int row = row0 + m * 16 + rowWin;
+#pragma unroll
+        for (int n = 0; n < NF; ++n) {
+            const int cBase = col0 + n * 16 + (lane >= 16 ? 8 : 0);
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                const int col = cBase + e;
+                if (col < tokens) { epilogue(row, col, accf[m][n][e]); }
+            }
+        }
+    }
+}
+
 } // namespace ninfer::ops::detail
 
 #endif // defined(__HIPCC__)

@@ -96,6 +96,24 @@ int wmma_panel() {
     }();
     return panel;
 }
+
+// NINFER_T2_A8_COLSPLIT=8|16|32 routes the WMMA prefill to the column-split tile
+// (t2_prefill_wmma2_kernel, cal64/cal64b): 64-thread blocks whose warps split the token
+// columns, fed by wide 32 B/lane loads. Verified bit-exact to the shipped kernel on identical
+// buffers (35,651,584/35,651,584, all five swept shapes) at 86 VGPR / 0 spill / occupancy 8.
+// VERDICT (cal65/cal66): -27% at the engine (ABBA median 104.2 vs 142.4 tok/s, +67-72% on every
+// prefill GEMM bucket, bit-exact text); the probe win was half-coverage timing — full-coverage
+// probe times it +60-69% vs the shipped raster (cal66). Default off keeps the shipped raster;
+// the value is the row-panel count. Needs w.n % (32*P) == 0 and columns % 32 == 0.
+int wmma_colsplit() {
+    static const int panel = [] {
+        const char* value = std::getenv("NINFER_T2_A8_COLSPLIT");
+        if (value == nullptr) { return 0; }
+        const std::string text(value);
+        return text == "8" ? 8 : text == "16" ? 16 : text == "32" ? 32 : 0;
+    }();
+    return panel;
+}
 #endif
 
 std::int32_t tile_columns(std::int32_t tokens) {
@@ -345,6 +363,28 @@ void tile_gemm(const T2A8Activations& x, const Weight& w, Epilogue epilogue, cud
         constexpr int kTileRows    = 16;
         const unsigned wcolumn_blocks = static_cast<unsigned>(columns) / kTileColumns;
         const unsigned wrow_blocks    = static_cast<unsigned>(w.n) / kTileRows;
+        const int cs = wmma_colsplit();
+        if (cs > 0) {
+            // Column-split tile (2,1): a 64-thread block covers 16*MF = 32 rows, so the grid
+            // is (row blocks / Panel, token blocks, Panel) with a 32-row tile stride — the
+            // coverage law in t2_prefill_wmma.cuh. Shapes that miss the divisibility fall
+            // back to the shipped raster.
+            const dim3 csgrid(static_cast<unsigned>(w.n) / (32u * unsigned(cs)),
+                              static_cast<unsigned>(columns) / 32u, static_cast<unsigned>(cs));
+            const bool fits = w.n % (32 * cs) == 0 && columns % 32 == 0;
+            const auto cslaunch = [&]<int P>() {
+                t2_prefill_wmma2_kernel<2, 1, P, Epilogue><<<csgrid, 64, 0, stream>>>(
+                    static_cast<const std::uint8_t*>(w.qdata), static_cast<const __half*>(w.scales),
+                    x.codes, x.scales, kCols, columns, x.tokens, rows_fast, epilogue);
+            };
+            if (fits) {
+                if (cs == 8) { cslaunch.template operator()<8>(); }
+                else if (cs == 16) { cslaunch.template operator()<16>(); }
+                else { cslaunch.template operator()<32>(); }
+                CUDA_CHECK(cudaGetLastError());
+                return;
+            }
+        }
         const bool panel = wmma_panel() == 32 && wrow_blocks % 32u == 0u;
         const dim3 wgrid = panel   ? dim3(32u, wcolumn_blocks, wrow_blocks / 32u)
                        : rows_fast ? dim3(wrow_blocks, wcolumn_blocks)

@@ -918,3 +918,75 @@ column-split grid (`grid = (N/(16·MF·P), T/(16·NF·2), P)`, tile stride 16·M
 gate, then the engine-level end-to-end A/B at the 4,210-token prompt (baseline 144–148 t/s,
 TTFT 29.2 s) with coherent-text check under the GPU lock. Probe files: `.qual/wmma/cal64b.cu`,
 `run65.sh`, `roc65/` CSVs, `roc65-stdout.txt`.
+
+## 2026-10-23 cal65 + cal66 (column-split integrated and CLOSED: the probe win was a coverage artifact)
+
+The cal64b integration path, executed end to end. Kernel `t2_prefill_wmma2_kernel<MF,NF,Panel,
+Epilogue>` (64 threads, `__launch_bounds__(64,8)`, two warps split token columns, 32 B/lane wide
+x loads byte-identical per lane to wmma1's two 16 B loads) ported into `t2_prefill_wmma.cuh`;
+engine grid `= (N/(32·P), T/32, P)`, `row0 = (z·gridDim.x + x)·16·MF`, launched only when
+`N % (32·P) == 0` and `T % 32 == 0`, behind `NINFER_T2_A8_COLSPLIT` (default **off** — shipped
+G32 panel raster unchanged). Device asm post-port: all P∈{8,16,32} instantiations 86 VGPR,
+private 0, LDS 4096 — identical to probe V21, cal61/cal62 laws satisfied.
+
+Engine ABBA at the 4,210-token prompt (`run66.sh`, cold boot per leg, one lock hold):
+
+| leg | prefill tok/s | TTFT |
+|---|---|---|
+| off (A) | 144.9, 129.6, 142.4 (median 142.4) | 29.2, 32.7, 29.7 s |
+| cs32 (B) | 104.9, 104.2, 100.2 (median 104.2) | 40.4, 40.6, 42.2 s |
+
+Every B leg below every A leg: **−27% median**. Greedy 128-token text gate: **TEXT MATCH** —
+the port is bit-exact end to end; the loss is pure geometry.
+
+**Operating point ruled out (run67).** `NINFER_PREFILL_PROFILE` legs (one per arm, cold boot,
+W=4210) show the engine **chunks the prompt at 1024 tokens** (four `tokens=1024` chunks, then
+129/5/2) — the prefill GEMM runs at **T=1024, exactly the probe's certified T**. The T=4256
+whole-prompt hypothesis is dead. The regression is entirely the T2 prefill tile GEMMs, per
+1024-token chunk (off → cs32): gdn_mlp 2075 → 3470 ms (+67%), attn_mlp 656 → 1129 (+72%),
+fine proj+conv 13.2 → 22.8 ms/layer (+72%), fine out 4.91 → 8.36 (+70%); non-GEMM GDN segments
+(nc/rec/norm) untouched; panel legs flat (cs8 ≈ cs16 ≈ cs32 ≈ 104 tok/s).
+
+**cal66 closes the case: cal64b's timing grid computed HALF the rows.** cal64b's timing pass
+carried over cal63/64's "overlap trick" — `grid.x = N/(16·MF·2·P)`, an extra `/2` that in those
+kernels halved *column* work in exchange for `t_pad = T−3`. For the column-split kernel the
+channel doesn't exist (NF=1: `grid.y = T/32` already covers all columns), so the extra `/2`
+simply skipped half the rows: gate_up timing ran 17,408 of 34,816 rows. Its 23.14 ms is
+**half-coverage**; full coverage ≈ 46 ms. cal66 re-times with `grid.x = N/(16·MF·P)` (identical
+to the engine csgrid), all three engine prefill shapes at T=1024, 96 MB L2 flush before EVERY
+timed rep, same epilogue both arms, verify = probe kernel vs engine kernel on identical buffers
+(all three shapes **BIT-EXACT**: 35,651,584, 5,242,880, 5,242,880 — the cal64b geometry law
+holds; only its timing grid was wrong):
+
+| shape (T=1024) | engine (1,2,G32) | cs (2,1) P=32 | P=16 | P=8 |
+|---|---|---|---|---|
+| gate_up 34816×5120 | 28.77 ms | 45.95 (+60%) | 46.58 | 46.63 |
+| down 5120×17408 | 14.61 ms | 24.08 (+65%) | 23.83 | 23.81 |
+| o_proj 5120×5120 | 4.19 ms | 6.94 (+66%) | 6.85 | 6.86 |
+| seq gate_up→down→o_proj | 45.81 ms | 77.58 (+69%) | — | — |
+
+Full-coverage probe reproduces the engine's +67–72% to within a few percent, at every panel
+(flat — matching the engine), and 23.14 × 2 = 46.3 ms lands on the measured 45.95. **Mechanism
+of the loss:** column-split halves x traffic (16-token windows per warp) and keeps warp count
+identical, so each row of weights is read by 2 warps instead of 1 — **weight traffic doubles**,
+and at 2.125 bpw weights dominate (gate_up weights 44.6 MB vs x 5.2 MB; 27B streams ~7 GB per
+pass — L2's 2 MB cannot absorb it). cal64's counter story ("halved x sectors, 975M hits") was
+counting requests on a half-work kernel; the DRAM ledger it was supposed to win on is the
+weights.
+
+**Laws established (cal65/66):**
+1. **The coverage law applies to the TIMING grid, not just to verify.** Verify grid, timing grid,
+   and engine grid must be identical (`grid.x = N/(16·MF·P)`); the cal63/64 overlap trick is
+   specific to row-split column overlap and voids any timing on column-split kernels. Any probe
+   win measured with a grid mismatch is void — re-certify before believing it.
+2. The engine chunks prompts at **1024 tokens**; probe T=1024 IS the engine operating point.
+3. Column geometry cannot win T2 prefill on this card: the traffic budget is the weights
+   (2.125 bpw), and any split that duplicates weight reads per warp loses more than it saves on
+   x. The shipped (1,2) G32 raster — 16 rows × 32 cols per warp, weights read once per column
+   tile — stays the winner.
+
+**Ship decision (final):** gate stays default-off; shipped raster (median 142.6 cold-boot)
+unchanged. Column-split code stays in-tree behind `NINFER_T2_A8_COLSPLIT` as the
+bit-exact-certified geometry with this verdict documented; cal66 closes the column-split lane.
+Files: `.qual/wmma/cal66.cu`, `/tmp/cal66-out.txt`, `run66.sh`, `run67.sh`,
+`/tmp/cal65-abba.tsv`, `/tmp/cal65-profile.tsv`, engine asm dump.
