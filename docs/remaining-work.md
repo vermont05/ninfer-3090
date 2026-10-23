@@ -724,3 +724,58 @@ that can run on this machine (no Flash-Next artifact on disk) **passes, on `hip-
   volume, from the 68.0 GB two-part `Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS` GGUF. Producing a local
   artifact is a ~70 GB download + a ~15 min conversion — a user-side decision (disk, network),
   not a code gap. Free disk here is 290 GB.
+
+## 2026-10-23 cal59 (y-fastest panel + register-diet battery): the diet works, the request floor is dead
+
+cal58 ended with a critical path: y-fastest panel geometry (swap grid.y↔grid.z so the in-flight
+working set is `16NF`-column windows ≈ 1.31 MB ≤ 2 MB L2, killing the (2,2) in-flight overshoot
+that amplified requests 2.9–3.5×) **plus** a spill-free (2,2)@8 (44 B scratch removed). Predicted
+per-launch ideal: x-once 5.24 GB + weights-once 1.43 GB + writes 0.2 GB ⇒ 13.5 ms DRAM-term;
+88 M request floor ⇒ 13.1 ms ⇒ ~13–14 ms = 2.3×. Three kernel families, shipped body verbatim
+(bit-exact by construction), all `__launch_bounds__(32,8)`, gate_up 34816×5120×1024, cold-L2
+best-of-5 with 96 MB flush, rocprofv3 two-pass GL2C (protocol identical to cal57/58):
+`Y` = y-fastest geometry, `D` = y-fastest + walked pointers (walk `pA/pS/pB` per group instead of
+recomputing `gBase`-indexed addresses), `L` = y-fastest + LDS-staged x panel (4 KB NF=2 / 8 KB
+NF=4, static shared, copy 128 B/row per group, fragment reads from LDS).
+
+| shape | VGPR/spill | best ms | DRAM GB | reqs M | wr MB | binding term |
+|---|---|---|---|---|---|---|
+| Y22_p8 (2,2)P8 y-fastest, original loads | 128/44 | 30.43 | 12.0 | 210 | 187 | reqs (model 31.8) |
+| Y22_p4 (P=4) | 128/44 | 27.95 | 13.7 | 202 | 187 | reqs (model 30.6) |
+| Y14_p8 (1,4) | 128/432 | 52.24 | 25.4 | 524 | **16 969** | spill-writes (5.4× DRAM) |
+| Y12_p8 (1,2) | 128/36 | 28.45 | 5.5 | 180 | 214 | reqs (model 27.3) |
+| **D22_p8 (2,2)P8 spill-free diet** | **127/0** | **27.99** | 9.6 | 190 | 142.5 | reqs (model 28.9) |
+| L22_p8 LDS-staged x | 128/80 | 158.04 | 8.3 | 404 | 258 | LDS reads (measured ≫ model) |
+| L24_p8 (2,4) LDS | 241/16 | 86.49 | 1.38 | 215 | 151 | LDS-bound (measured 30× model) |
+| L22_p32 (P=32) | 128/80 | 157.99 | 6.1 | 393 | 249 | reqs+LDS |
+
+- **The register diet works exactly as designed.** Walking the pointers (`D22_p8`) collapses the
+  (2,2)@8 footprint to **127 VGPR, 0 spill** (Y22_p8: 128 VGPR, 44 B), cuts scratch writes
+  187→142 MB, DRAM 12.0→9.6 GB, requests 210→190 M — and time 30.4→28.0 ms. The diet is
+  bit-exact and needs no engine change (same body, reordered address arithmetic).
+- **The 88 M request floor for (2,2) is dead.** Best achieved on this geometry: 190 M, and
+  190/6.6 Greq/s = 28.9 ms ≈ measured 28.0. The request stream — not DRAM (9.6 GB ⇒ 18.8 ms),
+  not writes (142 MB ⇒ 0.6 ms) — binds every shape in this family. y-fastest geometry + zero
+  spill together buy −8% vs the 29.9 ms control, nowhere near 2.3×.
+- **(1,4) is confirmed dead at this occupancy:** 432 B scratch = 17 GB of writes per launch
+  (120× the output bytes). NF=4 requires a register budget ≫ 128 VGPR (L24_p8 at 241 VGPR
+  spills only 16 B and lands at 4 blocks/SIMD — 86 ms).
+- **LDS staging is net-negative on this chip and explains cal58's "hits don't reduce
+  requests".** The global→LDS copies are perfectly coalesced (L22_p32: 6.12 GB DRAM — the lowest
+  ever measured on this shape, 1.13 GB weights + x-once), **but LDS reads enter the GL2C request
+  stream**: hits jump 115→337 M and total requests to 393–404 M ⇒ 158 ms, 5.6× slower than the
+  global-load twin. wmma B-fragments are 16 B/lane; every fragment is a new request. This
+  confirms requests are counted at issue, per-access, with no coalescing credit for LDS.
+- **Consequence.** Time on gfx1102 = issued requests / ~6.6–6.8 Greq/s, and the shipped wmma
+  fragment pattern (16 B/lane x-loads from rows `k_cols` apart) issues ~180–210 M requests on
+  gate_up no matter the geometry (panel, y-fastest, spill-free all land 27.5–30.5 ms). 13–14 ms
+  needs ≤ ~90 M requests ⇒ x loaded at full-sector (≥32 B/lane) granularity with fragments
+  fed from registers/LDS **without new per-fragment requests** — i.e. a fundamentally different
+  fragment supply (e.g. one wide load amortized across 8 `s`-steps, 32 B/lane `int8v` loads),
+  not more L2 blocking. Next probe must attack request granularity, not locality.
+
+Diet note for any future integration: `D22`-style walked pointers alone are a **bit-exact
+−8% (27.99 vs 29.90 control; vs the 30.4 ms y-fastest twin)** on the (2,2)@8 shape — strictly
+below the shipped G32 panel's 30.2 ms cold, so not a ship candidate by itself; it is the
+proof that the spill law is beatable at 128 VGPR. Files: `.qual/wmma/cal59.cu`,
+`roc59/` counter CSVs, `parse59.py`.
