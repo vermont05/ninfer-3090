@@ -388,13 +388,16 @@ Targets for the NInfer 27B stack (T2 ternary, **2.125 bpw** weights) on the **RX
   The card demonstrably does 296 t/s here (Prism's 2.13-bpq PQ2_0 service, same ~2.1 bpw as
   NInfer's T2 2.125 bpw). But the NInfer T2 prefill GEMM is **already at ~185 GB/s cold-L2 = 77%
   of the 240 GB/s DRAM ceiling** (`cal38` `w1(1,2)@8`, L2-flushed), and the coalesced-over-fetch
-  fix is a **measured NO-GO** (a ~70% regression — see the root-cause note above). GEMM is ~73%
-  of prefill time; even lifting that GEMM to 100% of the ceiling buys only ~1.17× on its portion
-  ≈ **~17% total prefill speedup → ~193 t/s**, not 300. The other ~27% is attention/GDN
-  non-GEMM. Reaching 300 t/s (a 1.8× cut in prefill time) on the NInfer stack therefore needs to
-  roughly *halve* prefill time — beyond what the GEMM's remaining bandwidth headroom allows, and
-  beyond cutting non-GEMM overhead alone. It requires closing the **stack** gap with Prism: a GEMM
-  that actually reaches the full DRAM ceiling *and* substantially faster attention/GDN — i.e.
+  fix is a **measured NO-GO** (a ~70% regression — see the root-cause note above). Prefill-bucket
+  profile at W=1024 (`NINFER_PREFILL_PROFILE=1`, single 1024-tok chunk, total 5084 ms): MLP GEMMs
+  (gdn_mlp 2137 ms + attn_mlp 682 ms) ≈ **55%** of prefill time, already at 77% of the DRAM
+  ceiling; the mixers/attention (gdn_mixer 1279 ms + attn_mixer 985 ms, which include the GDN
+  recurrent scan, attention, and their projection GEMMs) ≈ **45%**. Even lifting the MLP GEMMs to
+  100% of the ceiling buys only ~1.17× on their 55% ≈ **~10% total → ~190 t/s**, not 300. The
+  45% mixer/attention time is where the remaining NInfer headroom is. Reaching 300 t/s (a 1.8× cut
+  in prefill time) on the NInfer stack therefore needs to roughly *halve* prefill time — beyond
+  what the MLP GEMM's remaining bandwidth headroom allows alone; it requires closing the **stack**
+  gap with Prism (GEMMs at the full ceiling *and* substantially faster GDN-scan/attention) — i.e.
   architectural work, not a kernel access-pattern tweak. Weights are already at the 2-bit floor
   (sub-2-bit GGML formats IQ2_XXS/IQ2_S/IQ1_M have no in-tree kernels, no PQ/VQ path), so a lower
   bit-rate is a from-scratch format build, not the path. **Realistic near-term NInfer prefill
