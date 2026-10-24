@@ -5904,3 +5904,68 @@ Its ABBA runner is `/home/vermont/tmp/swiglu-a8/run-swiglu-abba.sh` (A = knob un
 B = knob on = int8 activations + WMMA panel split; one binary, one flock hold, `A B B A`, route line
 required in the B legs, coherence checked per arm — the arms' texts are **expected to differ**, int8
 activations are not bit-identical). **Not measured yet. Ships only on the user's explicit decision.**
+
+## 43. Prefill attribution probe P1: the attention mixer is the biggest bucket, and one 5-token chunk is 30 % of TTFT
+
+Marker `=== PREFILL PROBE P1 DONE 02:47:19 ===` (`/home/vermont/tmp/prefill-probe/P1.log`), binary
+`ninfer-serve.base2` sha1 prefix `0ab1eec3ad`, env `NINFER_PREFILL_PROFILE=1 NINFER_T2_DECODE=simt
+NINFER_T2_I8_SMALL=off`, `ROCR_VISIBLE_DEVICES=1`. Gate: five dirty quiet-checks (max busy 95-100 %,
+foreign hits 7-50), then a clean one (`50 samples, max busy 0%, foreign hits 0, dirty 0`);
+`LOCK ACQUIRED 02:46:13` / `LOCK RELEASED 02:47:19`. Leg contention record:
+`leg1: 33 samples busy max 100% mean 60.4% foreign openers: NONE` - the busy% is this probe's own
+server (its own name is in the sampler's exclusion list), zero non-excluded openers, so the window is
+self-induced, not contended. Request: `prompt 4,215 | output 128 | cache 0 (0.0%) | TTFT 33.0s |
+total 42.8s | prefill 127.8 tok/s | decode 13.0 tok/s`; text `sha1 77f1779eb831 chars 574 words 93
+max 8-gram repeats 1`.
+
+The per-chunk lines account for the request exactly: chunks `1024, 1024, 1024, 1024, 112, 5, 2`
+sum to 4215 tokens, and their `total=` values sum to 32987.5 ms, which reproduces the reported
+127.8 tok/s (`4215 / 33.0 s`). The `tokens=51` (409.9 ms) and its `tokens=2` (468.3/418.3 ms) lines
+belong to the warmup request, not to this one.
+
+Bucket sums over the request's own chunks (ms, share of the 32987.5 ms of layer time):
+
+| bucket | ms | share |
+|---|---|---|
+| attn_mixer | 15430.3 | **46.8 %** |
+| gdn_mlp | 9120.2 | 27.6 % |
+| gdn_mixer | 5526.0 | 16.8 % |
+| attn_mlp | 2908.5 | 8.8 % |
+
+Two measured facts follow.
+
+**(1) The wide-chunk rate is near the reference.** The four 1024-token chunks are 4096 tokens in
+21695.3 ms = **188.8 tok/s**, and their `attn_mixer` grows 621.9 -> 1167.6 -> 1691.8 -> 2228.7 ms,
+i.e. deltas 545.7, 524.2, 536.9 ms per chunk - the expected causal term, linear in context per chunk.
+
+**(2) The tail is not. The 5-token chunk costs 9773.1 ms, of which `attn_mixer` = 9181.4 ms** -
+573.8 ms per full-attention layer (16 layers) for 5 queries against a ~4210-token context. Scaling
+chunk 1's attention cost by the causal work ratio `(5 x 4210.5) / (1024 x 512)` predicts 25.0 ms for
+that chunk: **the measured value is 368x that**. This one chunk is **29.6 % of the request's layer
+time**; deleting it (keeping the rest as measured) gives 23214.4 ms = **181.6 tok/s** against the
+measured 127.8 tok/s. The neighbouring tail chunk `tokens=2` costs 468.3 ms with
+`attn_mixer 82.1`, and that same chunk's linear buckets are unremarkable (`gdn_mixer 100.4`,
+`gdn_mlp 212.9`, matching the warmup's `tokens=2` at 418.3 ms), so the anomaly is specific to the
+full-attention mixer at tiny query width with a long cache, not to the request's tail in general.
+
+Caveats, kept deliberately:
+- Shares are usable, the **absolute** 127.8 tok/s is not the served reference. `NINFER_PREFILL_PROFILE=1`
+  fences between buckets, serialising work the served path overlaps; the served point at `7042f064`
+  pools 203 tok/s. Do not compare the two, and no throughput claim is made from this leg.
+- The 368x is **arithmetic**, not a measurement: it is a causal-work ratio applied to chunk 1's
+  measured cost. It says the 9181 ms is not explained by causal attention FLOPs; it does not identify
+  the mechanism.
+- The anomaly was measured **with the profiler on**. Fence insertion is a live confound for exactly
+  this shape (a launch-bound tiny chunk whose async pipeline the fences serialise), so the follow-up
+  leg must first re-measure the same request with `NINFER_PREFILL_PROFILE` unset - server-side
+  per-request `prefill` rate only - before any kernel-level claim.
+- The probe's own note `gdn-mixer fine (per sampled layer, n=16)` for the 5-token chunk reads
+  `nc=0.030 proj=1.932 rec=0.061 norm=0.022 out=0.726 (ms)`, i.e. the GDN side of the same chunk is
+  ~2.8 ms per sampled layer - a useful control that the tiny chunk is not universally expensive.
+
+Next, in order: re-measure the tail-chunk cost without the profiler; trace which attention route a
+tiny query width with a long cache takes (route selector thresholds, any per-call cost scaling with
+context rather than query width); the attention route qualification already queued for the dirty
+`tile_io.cuh` / `tiled_mma.cuh` headers. Priority ordering follows the measurement: the full-attention
+mixer is now the largest measured bucket at 46.8 %, above the linear mixer (16.8 %) and the MLPs
+(36.4 % combined).
