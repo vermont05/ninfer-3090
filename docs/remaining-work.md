@@ -5809,3 +5809,98 @@ at 128 threads) — is still **unmeasured**. Fixed by pinning `ROCR_VISIBLE_DEVI
 them (`prefill_a8`) is the user's to set. Everything above is an integration map for the
 **gate_up integer-activation route**: it is offered for measurement and decision, and ships **only on
 the user's explicit decision**. Nothing in this section is committed to the tree.
+
+## §42 — cal75 run2 measured on the served card: it reports **CU=16**, and that voids the 32-CU relabelling
+
+Marker verified in the log: `=== CAL75 run2 DONE rc=0 02:45:07 ===`
+(`/home/vermont/tmp/cal75/run2.log`, output `run2.out`). Gate was clean — 38 samples, **max busy 0 %**,
+**zero foreign openers** of `/dev/dri/renderD129` over the 25 s window — the run held
+`/tmp/ninfer-gpu.lock` for its whole length, and `ROCR_VISIBLE_DEVICES=1` pinned the served part
+(the fix from item 6 above). Contention record for the run itself is **thin**: the sampler caught 2
+lines (`busy=0 openers=1` at launch, `busy=38 openers=0` — that 38 % is cal75's own work, no foreign
+opener appeared). The whole binary ran in under a second.
+
+**Ground truth from `hipGetDeviceProperties` on device 1:**
+
+```
+device: AMD Radeon RX 7600M XT  CU=16  maxThreadsPerCU=2048  sharedMemPerCU=1048576 B
+        regsPerCU=131072  maxDynSharedPerBlock=65536 B  sharedMemPerBlockOptin=65536 B
+```
+
+**1. The 32-CU relabelling is void — preserved as an unfavourable finding.** cal75 sizes its grid as
+`G = 32 × MB` blocks and prints `thr/CU = 32 × MB`, i.e. it assumes **32** CUs (1 block/CU per `MB`).
+The runtime reports **16**. So every occupancy label in this leg is **2× low**, and the real figures are
+`2 × MB` blocks/CU = `64 × MB` thr/CU: `C16 MB=10` is 320 blocks = **20 blocks/CU = 640 thr/CU** (not
+320), `C2 MB=28` is 896 blocks = **56 blocks/CU = 1792 thr/CU** (not 896), of the measured 2048
+thr/CU ceiling. It follows that **docs line 4448 item (iv) — "cal70/cal71 hardcode 16 CU, labels are
+2× inflated, re-run at 32 CU" — is wrong**: `multiProcessorCount` is 16, so cal70/cal71's original
+16-CU labels need **no** correction, and cal75's re-run of them was unnecessary. The "32 CUs" the
+project quotes for this part is AMD's marketing count (RDNA3 CUs of 64 lanes, 2048 SPs ÷ 64); ROCm's
+CU unit here is 128 lanes wide (2048 threads ÷ 16). **All occupancy and grid arithmetic in this project
+must use 16.** The device 0 iGPU line (`CU=6`) from run1 is a different part entirely.
+
+**2. §40's LDS-cap arithmetic is confirmed, and the reported per-CU figure is not the cap.** The pad
+arms declare 32 000 B of **static** shared and measured **max 2 blocks/CU (64 thr/CU at 32 threads)**;
+2 × 32 000 = 64 000 ≤ the 65 536 B `maxDynSharedPerBlock`, so the occupancy API behaves as if the
+per-CU LDS budget is **64 KB**, exactly as §40 assumed for the served i8 tile — even though the
+properties call reports `sharedMemPerCU = 1 048 576 B`. That 1 MB figure is therefore **not usable**
+as a budget; treat the effective per-CU LDS as 64 KB (measured behaviour: 32 KB static ⇒ 2 blocks/CU).
+Unpadded forms measured **64 blocks/CU = 2048 thr/CU**, i.e. the thread-slot ceiling (16 CU × 2048 =
+32 768 threads = 1024 waves).
+
+**3. The pad-vs-unpad question is NOT answered — inconclusive, preserved.** pad arms exist only at
+`MB = 1, 2` and cap at 2 blocks/CU (**64 thr/CU = 3 % of the thread slots**), while the unpadded arms
+start at 8 blocks/CU (`C8 MB=4`) and 14 (`C2 MB=7`). There is **no matched-occupancy pair**, so this
+leg cannot separate "cost of the 32 KB LDS footprint" from "cost of running at 3 % occupancy". A
+matched re-run (unpadded at `MB=1`/`2` grid sizes against pad at the same real occupancy) is required
+before any LDS-cap conclusion is quoted. Medians as measured, event-timed (TMAC/s, the probe's own
+unit; `MB` label as printed — halve for blocks/CU):
+
+| form | `MB` | blocks | real blocks/CU | TMAC/s event | wall |
+|---|---|---|---|---|---|
+| u8 C2 pad0 | 7 | 224 | 14 | 479.73 | 375.62 |
+| u8 C2 pad0 | 16 | 512 | 32 | 754.58 | 638.37 |
+| u8 C2 pad0 | 28 | 896 | 56 | 1097.38 | 952.21 |
+| u8 C8 pad0 | 4 | 128 | 8 | 1205.52 | 934.75 |
+| u8 C8 pad0 | 7 | 224 | 14 | 1925.74 | 1522.49 |
+| u8 C8 pad0 | 8 (shipped-tile point) | 256 | 16 | 2108.09 | 1682.71 |
+| u8 C8 pad0 | 13 | 416 | 26 | 2837.98 | 2323.17 |
+| u8 C16 pad0 | 4 | 128 | 8 | 2362.94 | 1837.45 |
+| u8 C16 pad0 | 7 | 224 | 14 | 3783.24 | 2985.84 |
+| u8 C16 pad0 | 10 | 320 | 20 | **4702.71** | 3833.02 |
+| u8 C2 pad1 | 1 | 32 | 2 (cap 2) | 77.48 | 59.45 |
+| u8 C2 pad1 | 2 | 64 | 2 (cap 2) × 2 waves | 153.96 | 118.70 |
+| u8 C8 pad1 | 1 | 32 | 2 (cap 2) | 364.32 | 268.27 |
+| u8 C8 pad1 | 2 | 64 | 2 (cap 2) × 2 waves | 727.85 | 538.67 |
+
+Event/wall ratios sit at 0.74–0.87 throughout (launch-overhead-shaped, as in cal70/cal71). `MB=1` pad
+launches 32 blocks = exactly 16 CU × 2 (full at the cap); `MB=2` is 2 waves at the same occupancy, so
+its doubled throughput is queueing, not occupancy. `outcheck (last-write): 229376 nonzero words of
+28672 x 8` — the last-write arm's outputs are nonzero, so the timings are not measuring a dead loop.
+Exit printed `Warning: Resource leak detected by SharedSignalPool, 2 Signals leaked.` (probe-side HIP
+signal pool, after all measurements were printed; recorded for completeness).
+
+**4. Not reproducible — preserved as an unfavourable housekeeping fact.** `/home/vermont/tmp/cal75/`
+now contains **only the binary, the runner and the logs**; `cal75.cu` is gone. The leg above is
+therefore not rebuildable, and its MAC accounting (what one "TMAC" counts in `C`/loop terms) cannot
+be re-derived from source. Any follow-up on the LDS cap needs the probe **rewritten** with the 16-CU
+convention and matched grids, not a re-run of this binary.
+
+**5. What this changes for the served point, stated as arithmetic.** Thread slots per CU = 2048, so the
+machine hosts 1024 wave32s. Served WMMA panel form (`__launch_bounds__(32,8)`, no LDS declared,
+123 VGPR measured in §34): register-limited at `131 072 / (32 × 123)` = **33 blocks/CU = 1056 thr/CU**,
+i.e. 52 % of slots, 16 CU × 33 = 528 blocks resident. Served i8 tile form (128 threads, 32 KB LDS,
+225 VGPR): LDS-limited at **2 blocks/CU = 256 thr/CU** (12.5 % of slots; the register limit would
+allow 4), 32 blocks resident over 16 CU. That the served mixer runs at 528 blocks and the served i8
+tile at 32 blocks is arithmetic from the measured ceilings, not a measured served-route occupancy —
+the served-route occupancy census is still open.
+
+**Gating, restated.** Nothing here is a throughput claim about the model; these are microbenchmark
+rows, one of them inconclusive on its own question. The gate_up integer-activation candidate
+(`NINFER_T2_A8_SWIGLU=1`, default OFF, in `src/ops/wrapper/linear_swiglu.cpp`) is built
+(`build-hip/apps/ninfer-serve`, sha1 prefix `1b645cc30b`, `BUILD3 rc=0`) and carries a once-per-process
+route line `[swiglu-a8] split route taken: T=… policy=…` so a leg that fell through to A16 is visible.
+Its ABBA runner is `/home/vermont/tmp/swiglu-a8/run-swiglu-abba.sh` (A = knob unset = served A16,
+B = knob on = int8 activations + WMMA panel split; one binary, one flock hold, `A B B A`, route line
+required in the B legs, coherence checked per arm — the arms' texts are **expected to differ**, int8
+activations are not bit-identical). **Not measured yet. Ships only on the user's explicit decision.**
