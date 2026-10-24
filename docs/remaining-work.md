@@ -5470,3 +5470,31 @@ a clean four-leg re-run is owed before any claim in either direction.
 test) — the combined runner `build-hip-test/tests/ninfer_tests` has now been relinked (01:52:49,
 after the rebuilt `libninfer_ops.a` at 01:30:28) and both it and `build-hip/apps/ninfer-serve`
 contain the `NINFER_T2_A8_MF` knob, so the battery exercises the committed edit.
+
+### §36-correction (same session, 01:58) — the set was NOT killed by the harness; **I** truncated it
+
+The paragraph above says the harness killed the ABBA task at `cand2`. That attribution is **wrong**
+and is retracted. What actually happened: the harness posted a *spurious* "completed exit 0"
+notification for the ABBA task at ~01:56:29 while the script was still alive and running (its output
+file grew from 34 to 59 lines afterwards, and the log files prove legs 3 and 4 continued). Treating
+that notification as the end of the run, I read a truncated file, saw a server on port 18983, judged
+it an orphan, and killed it — **it was the live `cand2` server, mid-request**. That destroyed the
+second candidate leg. Lesson recorded: a background-task completion notice is not evidence the work
+finished; check the log-file mtimes / the script's own `DONE` marker before killing anything, and
+never kill a `ninfer-serve` on the assumption it is stale without checking whether a run is in flight.
+
+Complete record of the panel `(2,2,32)` set, replacing the two "never ran" rows above:
+
+| leg | arm | prefill | TTFT | decode | sha1 | busy at settle / before req |
+|-----|-----|---------|------|--------|------|------------------------------|
+| base1 | served `<1,2,32>` | **204.1 t/s** | 20.7 s | 12.7 | `77f1779eb831` | 0 % / 45 % |
+| cand1 | `MF=2` panel `<2,2,32>` | **99.9 t/s** | 42.2 s | 13.0 | `77f1779eb831` | 93 % / 18 % |
+| cand2 | `MF=2` panel | — **(killed by me mid-request at 01:56:32)** | — | — | — | 85 % / 45 % |
+| base2 | served `<1,2,32>` | **203.6 t/s** | 20.7 s | 12.8 | `77f1779eb831` | 74 % / 52 % |
+
+The control legs bracket at 204.1 / 203.6 (0.25 % spread), reproducing the served record. The one
+completed candidate leg stands at 99.9 t/s = **−51 %**, i.e. a 2.04× loss against both controls,
+measured while the control legs ran at *higher* card-busy samples than the candidate (45 %/52 %
+before-request vs 18 %). The verdict in §36 is unchanged in substance — **no promotion, arm
+unfavourable** — but it now rests on one surviving candidate leg plus one self-inflicted gap, so the
+quiet-card four-leg re-run stays owed before the −51 % number is quoted as the arm's measurement.
