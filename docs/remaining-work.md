@@ -5723,3 +5723,89 @@ fields, so `bind_moe` (`load/text.cpp:59-80`) is never reached: there is no rout
    `hipcc -std=c++20 --offload-arch=gfx1102 -O3 -o OUT SRC.cu -L/usr/lib/x86_64-linux-gnu
    -l:libamdhip64.so` — without the trailing library the link fails `undefined symbol:
    __hipRegisterFatBinary`, because this install ships only the shared hip runtime.
+
+## 41. gate_up is already *admitted* to the A8 WMMA route — the route is closed at the swiglu wrapper, not at the policy (source-derived, nothing here measured)
+
+§40 finding 4 stopped at "gate_up is not on the WMMA path". Reading the admission chain end to end
+shows the route is not blocked by policy, not blocked by shape, and not missing kernels. It is closed
+at exactly one call site. All of this is read out of source; **no measurement in this section**, and
+per §39 static instruction counts and FLOPs shares have repeatedly failed to predict served speed.
+
+**1. The served policy for gate_up is already the integer policy.**
+- `parameters.cpp:139`: `integer_route(out.gate_up, {Q4_G64_FP16, T2_G128_FP16}, 34816, 5120)`.
+- `integer_route` (`parameters.cpp:33-50`) flips `A16Only` → `AllowA8Int` (or `AllowPrefillCublas` when
+  `prefill_cublas`) for exactly that shape. It compiles only under `NINFER_SM8X_COMPAT`, which the HIP
+  backend defines **globally** (`CMakeLists.txt:49-51`, comment: "The HIP backend takes the same
+  route"), and `ninfer_ops` also sets it PUBLIC (`src/ops/CMakeLists.txt:59`).
+- `prefill_a8` defaults **true** (`src/models/load_options.h:28`); `prefill_cublas` defaults false
+  (`:31`). Our served command line passes neither flag.
+- So served gate_up carries `p.gate_up.policy == AllowA8Int`, and
+  `t2_a8_admits(AllowA8Int)` is true (`t2_a8.cu:499-502`).
+
+**2. The shape is admissible, including the panel law.**
+`t2_a8_shape_supported` (`t2_a8.cu:504-507`): `output_rows % prefill_rows_per_block() == 0` and
+`input_rows ∈ {5120, 6144, 17408}`. gate_up: 34 816 % 16 = 0 ✓, k = 5120 ✓ → `t2_a8_supported` true.
+Panel law at served `MF=1`: `wrow_blocks = 34 816/16 = 2176`, `2176 % 32 = 0` ✓ (68 panels). gate_up
+satisfies `w.n % 512 == 0` exactly — §40's table column already said "shape yes".
+With the served env `NINFER_T2_I8_SMALL=off` the small band is off, so `route(t)` is the tile route
+from `kT2A8MinTokens = 17` up (`t2_a8.h:27`) — i.e. at prefill widths gate_up would launch
+`t2_prefill_wmma1_kernel<1,2,32,SplitStoreEpilogue>`, the same kernel form the 203 t/s point runs on
+for q+k, value+z, o_proj and mlp_down.
+
+**3. The split epilogue gate_up needs already exists.**
+`t2_a8.h:58-64`: `t2_a8_quantize(x, ws)` quantises once, and `t2_a8_project_split(x, w, first,
+first_offset, split, second, second_offset)` — implemented via `SplitStoreEpilogue`
+(`t2_a8.cu:471-487`, `require_plane` `:463-469`) — does **one** pass over a parent weight writing rows
+`[0, split)` into `first` and the rest into `second`, as BF16 `[rows, T]` planes. That is gate/up out
+of the 34 816-row parent, and `silu_mul` consumes two planes today (`linear_swiglu.cpp:174-176`).
+
+**4. The closure point.** `src/ops/wrapper/linear_swiglu.cpp:168-178`: the T2 branch ignores both its
+`policy` and its `ws` arguments — comment "A16 by construction" — and calls the 4-arg `linear()`, which
+is `LinearPolicy::A16Only` with a `nullptr` workspace (`linear.cpp:209-212`), landing in
+`select_t2_a16_launch` (`t2_dispatch.cpp:14-80`: t ≤ 16 `small_t_v2`, ≤ 32 `r64_c32`, ≤ 64 `r64_c64`,
+else `r64_c128`). Its `ws` is a real arena: `ffn()` calls
+`linear_swiglu(hidden, gu, activation, p.gate_up.policy, workspace, stream)` (`ffn.cpp:147-153`).
+The other half of the gap is sizing: the T2 branch of
+`linear_swiglu_workspace_capacity_bytes` (`linear_swiglu.cpp:54-60`) deliberately queries
+`linear_workspace_capacity_bytes(..., A16Only, ...)` and reserves only the BF16 `(34 816, T)` plane; it
+never calls `t2_a8_workspace_bytes`.
+Workspace arithmetic, labelled as arithmetic: the A16 route's plane is `34 816 × T × 2` B; a split
+route needs gate + up = `2 × 17 408 × T × 2` B — the same total — plus
+`t2_a8_activation_bytes(5120, T)` (`t2_a8.cu:515-536`, codes + per-group scales) for the quantised
+activations.
+
+**5. Size of the prize, as arithmetic only.** Per token, linear FLOPs (`2·n·k`, shapes from §40):
+gate_up 356.5 MF × 64 layers = 22 818 MF of ≈47 640 MF ⇒ **47.9 %**; mlp_down 24 %; GDN trio × 48
+23 %; attention trio × 16 5 %. At 203 t/s the served point sustains ≈9.7 TFLOP/s of linear work.
+**This is not a time share.** `NINFER_PREFILL_PROFILE=1` (probe in
+`src/models/qwen3_5/execution/text.cpp:269-440`, buckets mixer/mlp per layer kind, print
+`tail=… gdn_mixer=… gdn_mlp=… attn_mixer=… attn_mlp=…`) is the way to get the time share.
+
+**Queued, not yet a result.** Probe P1 (`/home/vermont/tmp/prefill-probe/run-probe.sh`, log
+`P1.log`) runs the served committed binary (`/home/vermont/tmp/l2-ab/ninfer-serve.base2`, sha1
+`0ab1eec3ad`, the 203.7 t/s arm) on the standard 4.2 k-token request with
+`NINFER_PREFILL_PROFILE=1`, self-gated on 25 s quiet + one `flock /tmp/ninfer-gpu.lock` hold, with a
+per-leg contention record. As of 03:0x the card is held by the user's own
+`llama-server --model Swift-Bonsai-2-PQ2_0.gguf` session (`~/src/prism-decode2-work`, via
+`srv.sh`, which also holds the lock); busy 88 %; both the cal75 poller and P1 are waiting, and
+**nothing has been measured on that card**.
+
+**6. cal75 run1 failed on the wrong device — preserved, as an unfavourable result.**
+`/home/vermont/tmp/cal75/run1.log`, `=== CAL75 RUN1 DONE rc=2 02:41:12 ===`: the gate was clean (38
+samples, max busy 0 %, zero foreign openers) and the lock was held for the run, but
+`run-cal75.sh` did not set `ROCR_VISIBLE_DEVICES`, so the process opened **device 0**, which is not
+the served card: it reported `AMD Radeon Graphics CU=6 maxThreadsPerCU=2048
+sharedMemPerCU=393216 B` — an iGPU/APU, 6 CU. The binary is built `--offload-arch=gfx1102` only, so
+`hipOccupancyMaxActiveBlocksPerMultiprocessor(&nb_, (const void*)k_u8<2,0>, 32, 0)` returned
+`invalid device function` at source line 116 and the run exited 2 before timing. **No throughput rows,
+no occupancy numbers, and no conclusion** from run1, including: the 32-CU relabelling of cal70/cal71
+(docs line 4448 item (iv)) is still unmeasured, and the served part's
+`sharedMemPerMultiprocessor` — the number the LDS-cap arithmetic in §40 assumes (64 KB ⇒ 2 blocks/CU
+at 128 threads) — is still **unmeasured**. Fixed by pinning `ROCR_VISIBLE_DEVICES=1` in the runner
+(same as the probe scripts); run2 armed. The 6-CU device line is also why the probe scripts set
+`ROCR_VISIBLE_DEVICES=1` explicitly: nothing in this project should be measured on device 0.
+
+**Gating, restated.** Activations quantised to int8 change numerics, and the model-level switch for
+them (`prefill_a8`) is the user's to set. Everything above is an integration map for the
+**gate_up integer-activation route**: it is offered for measurement and decision, and ships **only on
+the user's explicit decision**. Nothing in this section is committed to the tree.
