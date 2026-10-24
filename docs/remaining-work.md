@@ -5261,3 +5261,82 @@ stream. Both are register/traffic levers, not shuffle-count levers, and both sta
 qualify by compile census (spills 0, private ≈ 0, instruction count at or below served) before any GPU
 leg, because §15 and cal59/cal61 both measured register relief and instruction reduction predicting
 neither magnitude nor sign.
+
+## §34 — The `(2,2)` register diet is **not needed**: plain `(2,2)` is 120 VGPR / 0 spills at the served
+### `__launch_bounds__(32,8)`, in both a verbatim-copy probe TU and the served TU with the real epilogue; the LDS-diet and xs-de-hoist variants are refuted by census, and cal58's 44 B spill for `(2,2,8)` does not reproduce
+
+Compile-only — device-metadata reads off `llvm-readelf -n` on `--save-temps=obj` gfx1102 objects, plus an
+instruction census over the `.s`. **No GPU, no lock, no throughput claim in this section.** Artifacts:
+`/home/vermont/tmp/t2diet/cal72.cu` (verbatim copies of the served body at `t2_prefill_wmma.cuh:143-278`
+plus diet variants, probe epilogue `OutStore{ __half* }`), `/home/vermont/tmp/t2diet/cal73.cu` (the **real**
+header `ops/linear/t2/t2_prefill_wmma.cuh` with the **real** served epilogue `SplitStoreEpilogue`, verbatim
+from `src/ops/linear/t2/t2_a8.cu:238-257`), `/home/vermont/tmp/t2diet/census72.py`, and the save-temps
+`.s`/`.o` beside them. Census parser notes: in this ROCm's `.s` each kernel body runs from its column-0
+label `NAME: ; @NAME` to `.Lfunc_end`; LDS ops spell `ds_load_*`/`ds_store_*` (not `ds_read`/`ds_write`);
+`__syncthreads()` in a 32-thread block elides entirely (0 `s_barrier` in the whole file) — the LDS variants
+paid no barrier, they paid liveness.
+
+**Metadata** (`VGPR / SGPR / private / LDS / spills`, MINB=8 as served):
+
+| kernel | TU | VGPR | priv | LDS | spill |
+|---|---|---|---|---|---|
+| `<1,2,32>` control | cal72 probe | 123 | 36 B | 0 | 8 |
+| `<2,2,32>` plain | cal72 probe | **120** | **0** | 0 | **0** |
+| `<2,2,33>` y-fastest (col0/row0 swapped) | cal72 probe | 120 | 0 | 0 | 0 |
+| `<2,2,32>` LDS per-m staging (`k_pmlds`) | cal72 probe | **240** | 0 | 8192 B | 0 (occ-4 warning) |
+| `<2,2,32>` LDS staging, xs **un-hoisted** (`k_pmlds_unh`) | cal72 probe | **248** | 0 | 8192 B | 0 (occ-4 warning) |
+| `<2,2,32>` LDS staging, half-warp copy (`k_pmlds_hw`) | cal72 probe | 128 | **424 B** | 4096 B | **108** |
+| `<1,2,32>` control, real epilogue | cal73 served TU | 123 (SGPR 45) | 36 B | 0 | 8 |
+| `<2,2,32>` real epilogue | cal73 served TU | **120** | **0** | 0 | **0** |
+| `<2,2,0>` real epilogue (shipped raster) | cal73 served TU | 120 | 0 | 0 | 0 |
+| `<1,2,0>` real epilogue | cal73 served TU | 123 | 36 B | 0 | 8 |
+
+The cal72 control reproduces the served served-shape metadata (123 VGPR / 8 spills / 36 B private; SGPR
+37 probe vs 45 served TU vs the 43 in the earlier census — SGPR is TU-context-dependent, VGPR/spill are not).
+
+**Instruction census** (whole function, cal72 `.s`; per-tile = total / (MF·NF·16) tiles per block):
+
+| shape | total | WMMA | perm | bfe | global_load | instr/tile |
+|---|---|---|---|---|---|---|
+| (1,2) panel32 (served shape) | 852 | 16 | 32 | 24 | 24 | **53.25** |
+| (2,2) panel32 | 1455 | 32 | 64 | 48 | 24 | **45.47** |
+| (2,2) panel33 (y-fastest) | 1455 | 32 | 64 | 48 | 24 | 45.47 |
+| (2,2) LDS staging | 1593 | 32 | 64 | 48 | 32 | 49.78 |
+| (2,2) LDS + xs un-hoisted | 1733 | 32 | 64 | 48 | 54 | 54.16 |
+| (2,2) LDS half-warp copy | 1737 | 32 | 64 | 48 | 32 | 54.28 |
+
+**Findings.**
+
+1. **No diet is needed for `(2,2)` at the served launch bounds.** Plain `(2,2)` allocates 120 VGPR with
+   zero spills and zero private memory at `__launch_bounds__(32,8)` (128-VGPR cap), in the probe TU **and**
+   in the served TU with the real bf16 dual-destination epilogue. The cal57/cal58 premise — fit `(2,2)@8`
+   into 64 VGPR (MINB=16) — is moot for the served MINB=8 launch.
+2. **cal58's 44 B spill for `(2,2,8)` does not reproduce in served TU context, and my own hypothesis for
+   it (epilogue-induced) is refuted.** cal73's `<2,2,32>` with `SplitStoreEpilogue` verbatim is 0 spills.
+   Whatever produced cal58's 44 B is specific to the cal58 probe TU, not to the served kernel+epilogue.
+   The (2,2) integration leg therefore runs at strictly better allocation than the 44 B-spill leg measured
+   at gate_up standalone; cal58's −4 % time result stays valid for what it measured.
+3. **Every diet variant is refuted** (rows preserved per the standing rule): LDS-staged per-m split raises
+   VGPR to 240 and drops occupancy to 4 waves; removing the xs hoist on top of it is worse (248, and
+   +278 instructions, `global_load` 24→54, `s_waitcnt` 32→114 — the hoist is what keeps the fold's scale
+   stream out of the steady loop, matching cal22's finding); the half-warp copy meets occupancy 8 only by
+   spilling 108 times / 424 B private (84 scratch ops in the body) — 13.5× the served spill count.
+   Register pressure in this kernel is not spent where a diet assumed; staging spends it.
+4. **y-fastest geometry is census-neutral**: swapping the `col0`/`row0` block-index expressions (probe
+   `Panel==33`) changes neither registers (120/0/0) nor any instruction count (1455, 32 WMMA, 64 perms,
+   48 bfe, 24 loads). In the **real** header the `Panel == 0` raster already carries a row/col swap in the
+   runtime `rows_fast` flag (`t2_prefill_wmma.cuh:153-158`), and cal73 measures `<2,2,0>` at 120/0/0 —
+   y-fastest for the shipped raster needs only host-side grid mapping. Panel-mode y-fastest
+   (`Panel > 0`) needs the geometry branch in the kernel template.
+5. **Gate status for the §33 law** (spills 0, private ≈ 0, instruction count at or below served):
+   spills **0** ✓, private **0** ✓, instructions: 1.71× served **per launch**, **0.85× served per tile**
+   (fragment-build cost — 4 perms + 6 bfe per fragment, 2 tiles per `wmma_code_frag` amortization —
+   amortizes across the doubled M; the per-tile figure is the comparison the §23f bucket math consumes).
+
+**Next leg (not run, gated):** GPU ABBA of `(2,2)` + y-fastest vs served `(1,2)` + x-panel, in a clean
+sampler window under `flock /tmp/ninfer-gpu.lock`, per the cal58 traffic model (in-flight x set ≤ L2 ⇒
+x-once ≈ 5.24 GB + weights-once 1.43 GB ⇒ DRAM ≈ 13.5 ms + request ≈ 13.1 ms vs the 29–30 ms measured
+legs; a model prediction, **not** a measurement — §15/cal59/cal61 all showed register/traffic levers
+predicting neither magnitude nor sign). Integration is host-side: template shape `(1,2,32)` → `(2,2,32)`
+with grid recomputation at the launch site (`t2_a8.cu:393`), geometry branch for panel y-fastest, bit-exact
+completion check against the served sha1 as always.
