@@ -5996,3 +5996,138 @@ kQueryRows)`, `KVHeads = 4`, `kQueryRows = 64`) collapses to `4 x ceil(30/64) = 
 layer-call - four blocks on a 16-CU device, each looping the entire visible cache. A 4-CTA grid cannot
 fill the card and cannot hide the per-tile latency of ~66 context tiles, which is the direction the
 573.8 ms per layer points.
+
+## 44. S1 (swiglu A8 ABBA) measured **nothing** - and the reason is structural: this model's dense FFN is Hadamard-rotated, so it never enters `linear_swiglu`
+
+### The leg, preserved unfavourably
+
+Marker `=== SWIGLU-A8 ABBA S1 DONE 02:59:07 ===` (`/home/vermont/tmp/swiglu-a8/S1.log`, runner
+`/home/vermont/tmp/swiglu-a8/run-swiglu-abba.sh`), one binary `build-hip/apps/ninfer-serve` sha1 prefix
+`1b645cc30b` (the dirty working tree), order `A B B A`, `LOCK ACQUIRED 02:55:31` /
+`LOCK RELEASED 02:59:07`, all four legs inside that one hold, env
+`NINFER_PREFILL_PROFILE=1 NINFER_T2_DECODE=simt NINFER_T2_I8_SMALL=off`, `ROCR_VISIBLE_DEVICES=1`,
+A = `NINFER_T2_A8_SWIGLU` unset, B = `=1`.
+
+**All four legs printed `ROUTELINE ABSENT (leg ran A16)`** - the split route never engaged in either
+arm, so both arms ran the identical kernel schedule. What the legs then measured:
+
+| leg | TTFT | prefill | decode | text sha1 |
+|---|---|---|---|---|
+| A | 20.9 s | 202.0 t/s | 12.9 | `77f1779eb831` |
+| B | 20.8 s | 202.8 t/s | 12.9 | `77f1779eb831` |
+| B | 20.8 s | 202.8 t/s | 12.9 | `77f1779eb831` |
+| A | 20.9 s | 202.0 t/s | 12.9 | `77f1779eb831` |
+
+The 202.0 / 202.8 spread is the ABBA off-leg pattern on a **single** route, not an effect: identical
+text sha1 in all four legs (the runner expected the arms' texts to *differ*, since int8 activations are
+not bit-identical - identical texts are a second, independent sign that the B legs never left A16).
+Contention record per leg window: `A: 102 samples busy max 100% mean 72.3% foreign openers: NONE`,
+`B: 78 samples ... mean 71.2% ... NONE` - the busy% is the leg's own server, zero non-excluded
+openers. **Verdict: S1 is void as a route test. No throughput claim, favourable or unfavourable, comes
+from it. The gate_up integer-activation lever stays unmeasured, and S1 does not move it.**
+
+### Why the knob cannot engage on this model (source-derived, CPU-only, nothing here measured)
+
+`ffn()` dispatches on rotation before it looks at anything else
+(`src/models/qwen3_5/execution/ffn.cpp:127-129`):
+
+```cpp
+if (rotated_dense(p)) { rotated_dense_ffn(hidden, p, residual, workspace, stream, basis); return; }
+```
+
+and `rotated_dense` is `rotated(p.gate_up.hadamard_signs) || rotated(p.down.hadamard_signs)`
+(ffn.cpp:17-19). This artifact carries those signs on the FFN weights - from the manifest inside
+`/home/vermont/models/bonsai2_27b_text_swift.ninfer`:
+
+```
+{"parameter":"text/layers/0/mlp/gate","input":"text/layers/0/ffn_input","activation_policy":"A16Only",
+ "auxiliaries":{"hadamard_signs":{"object":"auxiliary/000000"}}},
+{"parameter":"text/layers/0/mlp/up","input":"text/layers/0/ffn_input", ... "auxiliaries":{"hadamard_signs": ...}},
+```
+
+So every dense FFN call in this model takes `rotated_dense_ffn`, whose gate_up projection is
+`ops::linear(x, gu, plane, p.gate_up.policy, workspace, stream)` (ffn.cpp:51) - **a 5-arg `linear()`,
+not `linear_swiglu`**. The `t2_weight` branch §41 added (the one with the route line) lives in
+`linear_swiglu`, which this model's manifest never reaches. The knob is inert here; a B leg is
+indistinguishable from an A leg by construction, which is exactly what S1 observed.
+
+The second half of the finding is the one that changes §41's premise. `dense()` promotes gate_up's
+policy - `integer_route(out.gate_up, {Q4_G64_FP16, T2_G128_FP16}, 34816, 5120)`
+(`src/models/qwen3_5/execution/parameters.cpp:138`) with `prefill_a8 = true` by default
+(`src/models/load_options.h:28`) and `NINFER_SM8X_COMPAT` defined (`CMakeLists.txt:50`) - and the
+policy reaches `linear()`'s own integer branch at `src/ops/linear/linear.cpp:116-117`:
+
+```cpp
+if (workspace != nullptr && detail::t2_a8_admits(policy) && detail::t2_a8_supported(w, x.ne[1])) {
+```
+
+with a non-null `workspace` (ffn.cpp:51) and every predicate satisfiable: `qtype == T2_G128_FP16`,
+`layout == RowSplit`, `n = 34816` with `34816 % 512 == 0`, `k = 5120` in the admitted set, and
+`route(1024) != Route::None` at the served chunk width. **§41's claim that gate_up is "served by the
+A16 rowsplit-MMA schedule, because linear_swiglu's T2 branch called the 4-arg linear" does not apply
+to this model**: on the rotated path gate_up already goes through the A8 WMMA route at the 203 t/s
+served point, so there is no closed route at the swiglu wrapper to open. §41's shape/panel-policy
+census is fine; its call-site diagnosis is void for this artifact. (Source-derived: no kernel trace
+or rate in this section identifies the route, and no GPU time was spent on it.)
+
+Consequences recorded, deliberately:
+- `src/ops/wrapper/linear_swiglu.cpp`'s dirty `NINFER_T2_A8_SWIGLU` branch is **dead code for this
+  model**. It stays uncommitted and unmeasured. Do not queue GPU legs for it; a leg on this artifact
+  cannot exercise it. (The change is left in the working tree - not discarded - because it is the
+  right shape for a *non-rotated* dense model; whether to keep it is the user's call.)
+- The gate_up lever is already spent: prefill gains must come from elsewhere. The measured buckets
+  below are where the remaining time is.
+- Shipping gates are unchanged: `prefill_a8` is a user-facing flag, `NINFER_T2_A8_SWIGLU` is a
+  measurement knob, and iu4 stays gated on the user's explicit decision.
+
+### §43's profiler caveat is discharged - and §43's binary is not HEAD
+
+S1's four legs ran **with** `NINFER_PREFILL_PROFILE=1` (exported by the runner at line 34) and
+reported 202.0-202.8 t/s / TTFT 20.8-20.9 s. §43 flagged that its 127.8 t/s "is not the served
+reference... fences between buckets, serialising work the served path overlaps". Four instrumented
+legs at ~202 t/s say the fences are not worth 75 t/s, so that caveat is discharged: **the gap between
+§43's 127.8 and the served 203 is the binary, not the profiler.** `ninfer-serve.base2`
+(`0ab1eec3ad`, built 2026-10-23 17:38 from the tree's own 16:25 build) predates `7042f064` (2026-10-23
+21:59, the `v_perm_b32` served-prefill win) and `02fb4d31` (2026-10-24 01:49, the MF=2 knob), so it is
+not a committed-HEAD build and never was one. Any base2-vs-working-tree comparison is a **cross-binary**
+comparison with two commits and three dirty files between the arms, not a clean committed-vs-dirty pair.
+`/home/vermont/tmp/tailprobe/run-tailprobe.sh` (profiler-on vs profiler-off on base2) is queued on a
+premise this section answers: **do not launch it as written** - re-scope it to HEAD-vs-dirty.
+
+### Measured cross-binary tail: the 5-token chunk cost is a property of the build, not of the request
+
+Same request (`prompt 4,215 | output 128`), same instrumented path, two binaries
+(`[prefill-probe]` lines, ms):
+
+| chunk | base2 `0ab1eec3ad` (P1) | dirty tree `1b645cc30b` (S1 A / S1 B) |
+|---|---|---|
+| `tokens=5` | **9773.1** (attn_mixer **9181.4**) | **653.3 / 652.8** (attn_mixer **88.0 / 88.0**) |
+| `tokens=2` | 468.3 (attn_mixer 82.1) | 462.6 / 462.2 (attn_mixer 81.4 / 81.3) |
+| `tokens=112` | 1050.8 (attn_mixer 456.8) | 949.2 / 946.6 (attn_mixer 449.1 / 448.0) |
+| 4 x `tokens=1024` | 4629.5 / 5149.4 / 5686.2 / 6230.2 | 3926.4 / 4419.8 / 4952.8 / 5494.6 |
+| request | TTFT 33.0 s, **127.8 t/s** | TTFT 20.9 / 20.8 s, **202.0 / 202.8 t/s** |
+
+The chunk sums reproduce each leg's own reported rate, so the probes are self-consistent: leg A's
+chunks sum to 20858.7 ms and 4215 / 20.86 s = 202.1 t/s against its reported 202.0; base2's sum
+32987.5 ms reproduces its 127.8.
+
+The load-bearing line is the `tokens=5` chunk: **9181.4 ms of `attn_mixer` became 88.0 ms**, a 14.9x
+drop in the same instrumented bucket on the same request. Two things are established by that alone:
+the 5-token tail's cost is **not** intrinsic to the request shape (so §43's "one 5-token chunk is 30 %
+of TTFT" is a property of `0ab1eec3ad` and older, not of the served path today), and the drop is
+specific to the full-attention mixer - the neighbouring `tokens=2` chunk barely moved (468.3 -> 462.6),
+as did the 112 chunk's `attn_mixer` (456.8 -> 449.1), so it is not a general tail-shaped effect.
+
+What is **not** established: which of the changes between the two binaries did it. The dirty tree
+carries `7042f064` (v_perm), `02fb4d31` (MF=2) and the three uncommitted files, two of which are the
+attention headers `.../causal_cache/bf16/tile_io.cuh` and `.../tiled_mma.cuh`. v_perm explains the
+linear-side movement (gdn_mlp per 1024-chunk 2078.9 -> 1686.7, gdn_mixer 1262.1 -> 1081.9,
+attn_mlp 666.3 -> 537.1), which leaves the attention headers as the candidate for a 9.1 s attention
+delta - **a candidate, not a result.** The clean test is a committed-HEAD build vs the dirty tree in
+one hold, comparing the `tokens=5` line and the whole-request rate. That is also the route
+qualification those two headers need before they can be committed.
+
+Unfenced projection, marked as arithmetic: base2's served (unfenced) rate was 175.2-175.6 t/s at
+TTFT 24.0-24.1 s with the same text sha1 `77f1779eb831`; removing ~9.1 s of tail from a 24.0 s TTFT
+gives ~14.9 s for 4215 tokens = **~271 t/s**. The dirty tree measured 202 t/s *with* fences and
+202-203 pooled, so this projection is not a target to quote as achieved; 300 t/s stays unmeasured.
