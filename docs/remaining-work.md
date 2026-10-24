@@ -4862,9 +4862,53 @@ sibling compile, not the linked byte-identical arm, and §29's instruction to ga
 that qualification: the census is admissible because the census-base compile reproduces served's
 *recorded* metadata exactly (256 VGPR / 55-57 SGPR / 608 B private / 65,536 LDS / 19 spills — the
 served row §28 and §24 obtained from the same `-save-temps=obj` pipeline, and now matched by an
-independent arm), not because the census object is the object that was linked. An attempt to hash the
-device code per section with `objcopy --dump-section` produced no usable output (failures were
-suppressed in the loop); the per-section proof is unfinished, and is stated as unfinished.
+independent arm), not because the census object is the object that was linked.
+
+**The per-section proof, finished (2026-10-24, CPU only, no lock).** `objcopy --dump-section` is the
+wrong tool here and that is why the first attempt printed nothing: it takes **the first section
+matching a name**, and a HIP host object has hundreds of sections named `.group`. Bytes are read at
+the `(fileoff, size)` records `objdump -h` prints instead, and sections are keyed by
+`(name, size, sha1)` — `/home/vermont/tmp/tile16-ab/secdiff.py`.
+
+Host objects, census vs plain (current artifacts in `/home/vermont/tmp/tile16-ab/obj/`; the compiles
+were re-run since the byte-diff above, so absolute sizes moved — the **delta did not**: 21,048 B in
+both runs):
+
+```
+base  ctrl 5,794,504 B → censbase 5,815,552 B   (516 sections in both)
+cand  cand 5,633,040 B → censcand 5,654,088 B   (437 sections in both)
+```
+
+Section *count* is unchanged; the **only section whose size grows is `.hip_fatbin`**, by exactly
+21,048 B in both arms (5,413,728 → 5,434,776 base; 5,354,592 → 5,375,640 cand). Host *content*
+differences beyond the fatbin: the aggregate `.text` (11,970 B base / 11,634 B cand, same size, bytes
+differ) in both arms, and in the **base arm only** six `configure_cuda_device_once` lambdas (553 B
+each) and one libstdc++ `_M_rehash` helper (307 B).
+
+Inside `.hip_fatbin` (magic `__CLANG_OFFLOAD_BUNDLE__`, unpacked with
+`clang-offload-bundler --type=o --targets=hipv4-amdgcn-amd-amdhsa--gfx1102` — the type is `o`, `O` is
+rejected):
+
+```
+device payload   ctrl 5,409,632 B → censbase 5,430,680 B   (+21,048, +1 section)
+                 cand 5,350,496 B → censcand 5,371,544 B   (+21,048, +1 section)
+
+.text   5,058,764 B  byte-identical in the base pair      (cand pair: 4,999,628 B, identical)
+.note      98,972 B  byte-identical in the base pair      (cand pair: 98,964 B, identical)
+.comment / .dynamic / .bss                               identical
+.AMDGPU.csdata   0 B  present in the census arm, absent in the plain arm
+.dynsym / .dynstr / .hash / .gnu.hash / .rodata / .relro_padding   same sizes, bytes differ
+```
+
+So the whole 21,048 B is **layout, not code**: the census arm's device object carries one extra empty
+`.AMDGPU.csdata` section, whose insertion shifts addresses and forces the padding and link-edit
+tables (`.dynsym`, `.dynstr`, `.hash`, `.gnu.hash`, `.relro_padding`, `.rodata`) to be rewritten. No
+device section grows. The device **ISA bytes (`.text`) and the kernel metadata notes (`.note`) are
+byte-identical between the plain compile and the `--save-temps=obj` compile, in both arms** — which
+is a stronger admissibility argument for Gate B than the metadata-agreement argument alone: the
+census arm is ISA-neutral on the device side, and it is the *host*-side perturbation (aggregate
+`.text`, the `configure_cuda_device_once` lambdas) that keeps the census object from being the object
+we link. Gate C's arms use the plain compiles.
 
 **The ABBA measurement was launched after this build** (`abba-t16.sh`, 4 legs B-C-C-B in one flock
 hold, ports 18971-18974, 1024-token lighthouse prompt, `max_tokens` 128, temperature 0; expected
@@ -4874,6 +4918,57 @@ pooled delta against the off-leg spread. Card state at launch: lock free, `/sys/
 empty, no `ninfer-serve` running. When the set queued, another session took the lock and ran
 `llama-bench` on the card (`-ngl 999 -fa 1`, therock build) — our set waits behind it, which is the
 protocol, not an incident.
+
+**Set t16, legs landed 00:28:45–00:33:20 — contaminated by foreign card occupancy, so the pooled
+number is an artifact and is recorded as nothing.** Measured, in ABBA order:
+
+```
+leg      binary      TTFT    prefill t/s    decode t/s (server's last 3)   completion sha1
+base1    904bbc8c90   20.8 s      203.1     8.4  / 12.8 / 12.9             77f1779eb831
+cand1    c6bd4b871f   21.3 s      198.3     8.2  / 13.0 / 12.9             77f1779eb831
+cand2    c6bd4b871f   21.3 s      198.4     8.8  / 11.8 /  7.1             77f1779eb831
+base2    904bbc8c90   31.0 s      135.9     9.2  /  9.4 /  9.7             77f1779eb831
+```
+
+Coherence passes: all four legs print the baseline sha1 `77f1779eb831`, 574 chars, 93 words, 59 distinct
+(63%), max 8-gram repeat 1 — the tile shape changes no output byte.
+
+The set's statistics do not survive. Off-leg spread is 67.2 t/s in the **base** arm (203.1, 135.9) and
+0.1 t/s in the cand arm (198.3, 198.4); pooled, cand 198.35 vs base 169.50 = **+28.85 t/s (+17.0%) on
+the candidate**, i.e. the sign every static analysis in §28–§30 predicted to be the other way. That
+sign is produced by the contamination, not by the tile shape.
+
+**Cause, found after the fact.** At 00:35, ten minutes into our lock window's tail, `/proc/*/fd` and
+`fuser /dev/dri/renderD129` show a foreign process on **our compute card**:
+
+```
+PID 1250943 (seen at 00:35, gone)  .../llama.cpp-prism-tune/build-therock/bin/test-backend-ops -o CPY -b ROCm0
+PID 1290090 (started 00:35:13)     same binary, next op
+/sys/class/drm/card1/device/gpu_busy_percent: 60% at 00:34:24, 27/28/28/12/6% over the next 5 s
+```
+
+It does not take `/tmp/ninfer-gpu.lock` — CLAUDE.md's rule that the user's own processes are unlocked,
+here for the first time with a measurement it ruined. The same binary ran TTFT 20.8 s in leg 1 and 31.0 s
+in leg 4. The degradation begins in cand2 (its decode falls 8.8 → 11.8 → **7.1** while its prefill was
+already measured) and is full by base2. In ABBA order B-C-C-B, contention arriving in leg 3 and
+deepening in leg 4 hits the *second base leg*, so it inflates the candidate by exactly the amount the
+contamination takes from base2. The pooled delta is that mechanism; **discard it.**
+
+**What does survive** is the uncontaminated prefix — the three legs whose TTFT is 20.8–21.3 s: base1
+203.1 vs cand 198.3 / 198.4 (cand spread 0.1) = **−4.8 t/s (−2.4%) on the candidate**, same direction as
+§29's prediction (unfavourable) at about **a third of its predicted magnitude** (−16 t/s predicted,
+−4.8 measured). This is a lead, not a result: the base arm has one clean leg, and "a delta inside the
+off-leg spread is not a result" cannot be evaluated against a contaminated spread.
+
+**Re-run, and the protocol lesson written into the rules.** `abba-t16b.sh` re-runs the same two binaries
+(arms unchanged, base `904bbc8c90`, cand `c6bd4b871f`) with two things set t16 lacked: (1) it **waits for
+the card to be actually quiet before taking the lock** — no foreign opener of `/dev/dri/renderD129` and
+`gpu_busy_percent ≤ 3` in every sample over a sustained 25 s window, aborting after 3 h rather than
+measuring on a busy card; (2) it samples `gpu_busy_percent` plus the list of foreign render-node openers
+every 2 s through the whole lock hold (`gpuwatch.py`, artifacts in `/home/vermont/tmp/tile16-ab/watch/`)
+and prints per-leg windows, so admissibility is proved per leg instead of assumed. The rule this
+measurement earns: **holding `/tmp/ninfer-gpu.lock` proves no other *lock user* is on the card; it proves
+nothing about the user's own processes, and a leg is admissible only with a clean sampler window.**
 
 ## §31 — The T2 GEMM prefill group, censused: 295 integer fragment-build ops per 16 WMMA, and the
 ### activation-scale stream is 16× redundant in issued bytes
@@ -4932,21 +5027,42 @@ smaller scale: the WMMA issue rate is not what this kernel is bounded by, static
 | weight scales | 64 B | 32 B | 2.00× |
 | **global total** | **10,304 B** | **4,704 B** | **2.19×** |
 
-Mechanism, from source: `t2_prefill_wmma.cuh:160-161` —
+Mechanism, from source. `t2_prefill_wmma.cuh:160-161` —
 
 ```
 const int colWin = lane >> 1; // Awin window column within the warp tile
 const int rowWin = lane & 15; // Bwin slot row within the warp tile
 ```
 
-`lane >> 1` makes lanes `2i` and `2i+1` compute **identical addresses**, so the activation stream's
-16 B/lane load is issued twice for every byte used; `lane & 15` folds the weight stream the same way in
-pairs. Correcting two earlier wordings on the way here: the loads are **not** "oversized per lane" —
-16 B/lane (`int4v`) is exactly one A fragment — and the redundancy is not activation-only, the weight
-pair carries the same 2.00×. The largest byte-volume lever is the **xs activation-scale stream: 1,024 B
-issued to move 64 B** (16.0×), i.e. sixteen lanes repeat the same scale fetch. Whether that costs time
-is unmeasured: it is 10 % of issued bytes, on a kernel whose per-group cost is dominated by the 295
-build ops, and nothing here claims it is worth GPU time.
+`lane >> 1` makes lanes `2i` and `2i+1` compute **identical addresses** (`pB = x + (col0 + colWin) *
+k_cols`, `:181`), so each activation `int4v` load issues 32 lanes for 16 lane-distinct rows: 2.00×
+issued/unique per instruction, 8,192 B issued for 4,096 B of codes the group actually reads. `lane & 15`
+folds the weight side the same way in pairs (`pA[m]` at `:189`), so the weight stream carries the same
+2.00×. The xs scale stream is the extreme case, from `:237-241`:
+
+```
+const int cb = col0 + n * 16 + (lane >= 16 ? 8 : 0);
+for (int e = 0; e < 8; ++e) { xsv[n][e] = __half2float(xs[g * t_pad + cb + e]); }
+```
+
+`cb` takes **two values per warp** (`lane < 16` and `lane >= 16`), so each of the 16 hoisted scalar
+scale fetches has 2 distinct addresses replicated over 16 lanes apiece; per group the stream issues
+1,024 B to move the 32 scale halfs (64 B) the fold consumes — **16.0×**.
+
+Correcting two earlier wordings on the way here: the loads are **not** "oversized per lane" — 16 B/lane
+(`int4v`) is exactly one A fragment, and 32 B/lane (`int8v`) is exactly one weight group line — and the
+redundancy is not activation-only.
+
+**Load-site vs instruction reconciliation, stated as a bound.** The source has ~34 load sites per group
+(16 `av[n]` `int4v` + 2 `line[m]` `int8v` + 16 xs scalar), the loop census sees 24 global-load
+instructions (19 `b128` + `b64` + `b32` + 2 `u16` + `d16_b16`): the compiler merges and broadcasts some
+of them, so the **per-stream** split of the 19 `b128` (16 activation-code + 2 weight-code + 1 xs) is an
+attribution consistent with the width census and with the `colWin`/`rowWin`/`cb` address patterns above,
+not an instruction-by-instruction trace. The issued-bytes total (10,304) is read directly off widths × 32
+lanes; the 4,704 address-unique figure is computed from those address patterns.
+
+Whether any of this costs time is **unmeasured**: 10 % of issued bytes is the xs stream, on a kernel
+whose per-group cost is dominated by the 295 build ops, and §31 claims nothing about throughput.
 
 **Provenance caveats.** (1) The census is of compiled-in defaults: the engine route (panel on,
 `SplitStoreEpilogue`, `wgrid` from `t2_a8.cu:388-391`) was read off the launch site, not traced in a
