@@ -5560,3 +5560,36 @@ runner) to confirm correctness of the committed knob on the served shapes — ru
 is written. Then the 32 KB LDS fallback question (leg 6). 300 t/s still needs a lever that moves
 fewer bytes, i.e. 4-bit activations (`iu4`) and the gate_up integer-activation route — both
 **user-gated**, nothing claimed.
+
+## §38 — Route qualification of the `MF=2` knob: **all three env legs Passed** on the served shapes.
+> Correctness is settled for `02fb4d31`; speed is settled by §35 (parity, y-fastest) and §37 (−52 %, panel).
+
+`bash /home/vermont/tmp/t2diet/qual-mf2.sh`, 02:15–02:19, one `flock /tmp/ninfer-gpu.lock` hold per leg
+(no suite-wide hold), relinked `ninfer_tests` runner, `ctest -R '^ninfer_linear_t2_a8_test$'` (the
+`build-hip-test` tree registers one combined runner; per-test executables do not exist here). A leg
+printing `SKIP: no usable CUDA device` would not count as a pass — none did; each leg registered and
+passed exactly 1 test.
+
+| leg | env | result | wall |
+|-----|-----|--------|------|
+| A | served defaults (`(1,2,32)` panel) | **Passed** | 12.70 s |
+| B | `NINFER_T2_A8_MF=2` (panel `(2,2,32)`) | **Passed** | 12.77 s |
+| C | `NINFER_T2_A8_MF=2 NINFER_T2_A8_WMMAPANEL=0 NINFER_T2_A8_RASTER=rows` (`(2,2,0)`) | **Passed** | 12.61 s |
+
+**Findings.**
+1. The `MF=2` geometry guards (tile-rows law `w.n % 32 == 0`, panel law `(w.n/32) % 32 == 0`,
+   `Panel = 16·MF·Panel` row coverage) select routes that are **bit-exact against the CPU reference**
+   on every shape the battery covers, including the served gate_up (n = 34816) and mlp_down (n = 5120)
+   classes. This is the qualification the handoff asked for: the code in `02fb4d31` may stay, it is
+   correct, unset env reproduces the served route, and both `MF=2` routes compute the right answer.
+2. Leg durations are within 0.16 s of each other across all three legs — the test's own GPU work is
+   small relative to setup, so this says nothing about speed and is recorded only as a run log.
+3. Combined state of the tile family, final for this line of work: **correct, inert under y-fastest
+   (§35, −0.35 %), sharply negative under the served panel raster (§37, −52 %)**, in the leanest
+   register/spill footprint in the served TU (§37 table). The knob ships **default off**; the served
+   operating point remains `203 t/s` (`7042f064`, `<1,2,32>`, pooled control 203.13, served completion
+   sha1 `77f1779eb831`). No speed is claimed for `MF=2` and none is available.
+4. Queue status: `MF=2` work is closed (measured on both rasters, qualified, rejected on speed).
+   Open leads that do not need a user decision: the served non-panel fallback's **32 KB LDS per block**
+   occupancy question (§37 finding 6), which served op shapes actually land on that fallback (census
+   in progress, CPU-only), the `cal71` occupancy sweep, and the confound-free l2 pair.
