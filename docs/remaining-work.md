@@ -6131,3 +6131,159 @@ Unfenced projection, marked as arithmetic: base2's served (unfenced) rate was 17
 TTFT 24.0-24.1 s with the same text sha1 `77f1779eb831`; removing ~9.1 s of tail from a 24.0 s TTFT
 gives ~14.9 s for 4215 tokens = **~271 t/s**. The dirty tree measured 202 t/s *with* fences and
 202-203 pooled, so this projection is not a target to quote as achieved; 300 t/s stays unmeasured.
+
+## §45. What the width-5 window actually contains: the probe's `attn_mixer` bucket is *not* attention, and §44's
+## candidate set is incomplete. (source-derived, **no measurement in this section** - the W1 sweep it
+## motivates is launched, result pending)
+
+§44 closed with the two dirty attention headers as "the candidate for a 9.1 s attention delta". A
+source-side read of the served path (an Explore pass over the repo; **every claim below is derived from
+source, not measured**) says that candidate was chosen against a mislabelled quantity, and that the
+competing candidate is reachable with an env knob and no code change at all.
+
+**1. The bucket is the whole front half of the layer.** `[prefill-probe]`'s `attn_mixer` for layer i is
+`mixer_i = elapsed(prev_end_event, mid_i)` (src/models/qwen3_5/execution/text.cpp:402-417): it spans
+everything between the previous layer's midpoint and this layer's midpoint, which includes the QKV+gate
+projection - a 14336 x 5120 GEMM that is *width-independent* in its weight traffic. So the P1 line
+
+    [prefill-probe] tokens=5 total=9773.1ms ... attn_mixer=9181.4
+
+is not "attention cost 9181 ms". At width 5 the attention part is small and the projection part is not.
+Any share table built on that bucket (including §43's) is a *within-instrument* attribution only.
+
+**2. The int8 attention routes this model never takes.** `causal_softmax_attention.cpp:691-695`: if
+`cache.storage == KvCacheStorage::BFloat16` the call is handed to `detail::bf16_kv_append_attention`
+and returns **before any route resolution**. Every SmallT / ChunkedSmallT / Prompt threshold in the int8
+`CausalAttentionRoute` ladder is dead code for this artifact. That is why no attention env knob exists
+for it (§44 note), and it is also why the dirty headers can only be qualified by A/B on the binary, not
+by a knob.
+
+**3. Which bf16 attention plan each chunk gets** (`src/ops/softmax_attention/dense/causal_cache/bf16/plan.cpp`):
+width > 256 → tiled; our 1024-token chunks land on `Tiled64`, which descends to `<64,32>` = 65536 B of
+dynamic LDS, i.e. exactly the device's `maxDynSharedPerBlock`, so 1 workgroup/CU, grid 16 x 24 = 384
+CTAs, 128 threads, no split axis. Width <= 256 with `rows = width * group(6) <= 32` → `Grouped32` +
+merge: the width-5 chunk runs a grouped grid `dim3(4,8,1)` = 32 CTAs x 64 threads with ~17 serial key
+tiles each, then a merge grid `dim3(24,1,5)` = 120 CTAs x 256 threads. 32 CTAs on a 16-CU device is the
+*shape* of a latency-bound launch - but the arithmetic below is what says latency alone cannot be the
+story:
+
+    width-5 mixer window ~ 2.9e8 MACs attention + 7.3e8 MACs projection ~ 1 GFLOP
+    9181 ms over the model's 48 attention layers ~ 574 ms/layer ~ 1.7 GFLOP/s
+
+which is 1000-2000x below the rate the same kernels hit in the 1024-token chunks. A pure-attention
+explanation for the width-5 window lands in the 0.1-5 ms/layer range. **~9181 ms cannot be attention
+work; it has to come from the linear side of the same window.**
+
+**4. The linear side does switch at exactly that width.** `t2_dispatch.cpp:29-33`: at `t <= 16` the T2
+projection leaves the WMMA panel route and takes `launch_t2_small_t_v2` (`src/ops/linear/t2/t2_small_t_v2.cu`).
+That tier's occupancy constants (`kMinBlocks`, "N CTAs per SM", `t2_small_t_v2.cu:88-91`, and the
+`small_t.cu:66-76` family) are RTX-3090/5090 measurements. On this device (16 CUs at the 128-lane
+convention, 131072 regs/CU) `__launch_bounds__(256,4)` caps the kernel at 64 VGPR/lane, and the tier
+compiles into scratch spill - the same spill signature §42 measured on the decode path. Note the
+mirroring in P1.log: the width-2 chunk is 468 ms and the width-5 chunk is 9773 ms, both in the same
+tier, and the tier is also what decode steps run.
+
+**5. GCN has no tensor core for these ops at all.** `src/ops/wmma/mma.cuh:12-20`: "GCN has neither
+ldmatrix nor an mma.sync tensor core"; one m16n8k16 is ~32 DS shuffles plus ~150 ALU ops. Only int8
+gets hardware help (`__builtin_amdgcn_sudot4`). So every bf16/fp16 attention and small-T projection
+number in this file is an emulated-MMA number, and register pressure converts into scratch traffic
+directly rather than into a spill that a tensor core would hide.
+
+**6. The 112 / 51 / 5 / 2 chunk boundaries are not attention-driven.** text.cpp:1932-1934:
+`vision_chunk = multimodal->vision->prepare_chunk(prompt_t0, len); len = vision_chunk.length;` - the
+vision pass shrinks the last chunks. The tail shape is a property of the request path.
+
+**Consequence for §44.** Its candidate set is downgraded, not confirmed: with the projection inside the
+bucket and a tier switch at exactly width 16, `7042f064` (v_perm_b32, whose whole effect is removing
+scratch table loads) is at least as good an explanation of the 9181 ms -> 88 ms collapse as the two
+dirty attention headers. §44's cross-binary table stays valid as a cross-binary observation; its
+attribution was under-determined.
+
+**Cheapest bisection, and it needs no build:** `NINFER_T2_V2=r16|r16b4|r32|r32k8|r64`
+(`t2_small_t_v2.cu:56-83`) pins one row schedule for every small-T shape, and `NINFER_T2_SMALLT=v1`
+(`t2_dispatch.cpp:25-33`) bypasses the v2 tier wholesale. Both reach widths 2 and 5 and reach nothing
+at width 112+ (which takes `launch_t2_mma_r64_c128`), so they isolate the tier in question.
+
+**Launched:** `/home/vermont/tmp/head-ab/run-smallt-sweep.sh W1` on base2 (`0ab1eec3ad`, the tree that
+*shows* the anomaly), arms `0 / r16 / r32 / r64 / SMALLT=v1 / 0b`, one flock hold, 25 s quiet gate,
+`NINFER_PREFILL_PROFILE=1`, per-leg contention folding. Reference lines to beat: `tokens=5 total=9773.1ms
+attn_mixer=9181.4` and whole-request `prefill 127.8 tok/s` (text sha1 `77f1779eb831`). The committed-HEAD
+vs dirty-tree ABBA (`/home/vermont/tmp/head-ab/run-head-abba.sh`, built in a clean worktree so the dirty
+files are the only delta) is queued behind it - it is still the qualification gate for `tile_io.cuh` and
+`tiled_mma.cuh`, and neither header ships on this section's authority. **Nothing in §45 is a measured
+result.**
+
+---
+
+## §46 - The width-5 anomaly does not reproduce on the binary that showed it. (measured; unfavourable to §43 and §44)
+
+Run: `/home/vermont/tmp/head-ab/run-smallt-sweep.sh W1`, binary `ninfer-serve.base2` sha `0ab1eec3ad`
+(verified in the run's own header line), port 18994, `NINFER_PREFILL_PROFILE=1`,
+`NINFER_T2_DECODE=simt NINFER_T2_I8_SMALL=off`, prompt 1024 words / max_tokens 128. Quiet gate passed
+before the lock (`quiet-check: 50 samples, max busy 0%, foreign hits 0, dirty 0`), all legs inside one
+`flock /tmp/ninfer-gpu.lock` hold, sampler folded per leg window.
+
+**Leg 0 (baseline, both small-T knobs unset) - measured, and the anomaly is gone.** From
+`W1-0-server.log`, request chunks (`total` / `attn_mixer`, ms):
+
+```
+1024  4630.7 /  613.5      112  1045.6 / 452.5
+1024  5108.1 / 1162.6      5     647.2 /  87.2      <-- the §43/§44 line
+1024  5663.3 / 1684.3      2     458.2 /  80.6
+1024  6207.3 / 2217.3
+warmup: 51 -> 523.9 / 43.3    2 -> 430.6 / 37.8
+```
+
+`req#1 done | prompt 4,215 | output 128 | cache 0 (0.0%) | TTFT 23.8s | total 33.8s | prefill 177.3
+tok/s | decode 12.7 tok/s`. The request's own chunk lines sum to 23,760.4 ms for 4,215 tokens = 177.4
+tok/s, matching the leg's reported rate, so the leg is internally consistent. Leg window: 42 samples,
+busy max 100%, mean 61.9%, **foreign openers NONE** (the busy is this leg's own server, excluded by
+name; that is what "no foreign" means here, and it is a weaker statement than §46.5).
+
+**The reference run, same binary, same prompt, same env line, same chunk law** (`P1.log`,
+`0ab1eec3ad`): 1024-chunks `4629.5 / 5149.4 / 5686.2 / 6230.2`, 112 `1050.8`, 2 `468.3` - each within
+0.5-2% of the numbers above - and `tokens=5 total=9773.1ms attn_mixer=9181.4` at `prefill 127.8 tok/s`
+(TTFT 33.0s). 9773.1 vs 647.2 is **15.1x** in one chunk and one chunk only; 127.8 vs 177.3 t/s is
+**+39%** for the whole request. P1's chunk lines also sum to its own TTFT, so P1 is internally
+consistent too: the 9.1 s were really spent in that run.
+
+**What is NOT the explanation**, each checked:
+1. *A different binary.* Both runs report `0ab1eec3ad`.
+2. *A different env.* Both printed `NINFER_T2_A8_WMMANATIVE=(unset) NINFER_T2_DECODE=simt
+   NINFER_T2_I8_SMALL=off`, both with `NINFER_PREFILL_PROFILE=1`.
+3. *A different chunk law.* Both ran `1024,1024,1024,1024,112,5,2` on the same 4,215-token request.
+4. *A detected foreign GPU process.* P1's leg window: 33 samples, busy max 100%, mean 60.4%, **foreign
+   openers NONE**; W1-0: 42 samples, **foreign openers NONE**. Neither quiet gate skipped: P1's took
+   five busy rounds before passing (`max busy 0%, foreign hits 0`), W1-0's passed first try.
+5. *The small-T tier as a whole.* The `tokens=2` chunk takes the same `t <= 16` tier and reproduced to
+   2%. The instability is specific to width 5 in that run.
+
+**Consequences, recorded as unfavourable:**
+- §43's headline (`attn_mixer 9181.4` at width 5, "368x the causal-work prediction") is a **single-run
+  observation of a single run**, and it has now failed to reproduce on the same binary. No kernel-level
+  claim may rest on it, and none is made here.
+- §44's cross-binary table (base2 `9773.1` vs dirty tree `653.3 / 652.8`) is **confounded by run
+  state**, not settled by the diff: its base2 side is P1, whose width-5 cost is not reproducible. The
+  table stands only as an observation about those two runs.
+- Any baseline quoted from P1 (`127.8 tok/s`, `sha1 77f1779eb831`) must not be used as the reference
+  line. Use a same-session re-measurement of the same binary (here: `177.3 tok/s`).
+- The `+15.1%` served-prefill gain claimed for `7042f064` (v_perm_b32) does **not** lean on P1: it
+  stands on its own committed ABBA. This section does not touch it.
+- Probe design requirement added going forward: a per-chunk claim must come with its **run-to-run
+  spread on the same binary** (baseline arm measured at least twice in the session). A single-chunk
+  reading from a single run is not a quantity, and treating it as one is what §43/§44 did.
+
+**The sweep itself is void, by my bug.** Legs `V16` onward never ran: the script's `env NINFER_T2_V2=r16
+-u NINFER_T2_SMALLT "$BIN" …` puts `-u` after the assignment, which GNU `env` rejects -
+`env: '-u': No such file or directory`, server died, script exited 11 at `03:34:14`, no `DONE` marker.
+Only leg 0 (above) exists from W1. Lines 110-114 are now `env -u NINFER_T2_SMALLT NINFER_T2_V2=r16
+"$BIN" …` (and the v1 arm likewise); the re-run is queued as W2 with the full arm set in one hold.
+
+**Open, unresolved:** why width 5 cost 9.1 s more in P1 than here, with everything checkable equal.
+Candidate mechanisms not yet tested, listed as candidates only: host-side stall (launch-latency-bound
+chunk under CPU contention - P1 ran at 02:46, this leg at 03:33, with a `cmake --build` compiling
+CPU-side in the window; the width-5 chunk is 32 CTAs x 64 threads on 16 CUs, i.e. launch-latency
+dominated, so it is the chunk most exposed, which is also why the wide chunks match), KV-cache
+occupancy at the tail chunk, and the profiler's fences. W2's `0`/`0b` pair, and a repeat of the
+baseline across sessions, is the measurement that separates these. **No cause is claimed by this
+section.**
