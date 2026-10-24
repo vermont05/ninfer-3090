@@ -5593,3 +5593,133 @@ passed exactly 1 test.
    Open leads that do not need a user decision: the served non-panel fallback's **32 KB LDS per block**
    occupancy question (§37 finding 6), which served op shapes actually land on that fallback (census
    in progress, CPU-only), the `cal71` occupancy sweep, and the confound-free l2 pair.
+
+## §39 — The FA2 diet-L2 lever is **measured flat**: 175.85 vs 176.50 t/s (−0.37 %), inside the base arm's
+> own 1.6 t/s spread. Deleting all 686 in-loop scratch loads did **not** move served prefill.
+
+Four legs, B-C-C-B in one `flock /tmp/ninfer-gpu.lock` hold, 02:22:13 → 02:26:26, log
+`/tmp/l2clean-run.log`:
+
+```
+BASE=/home/vermont/tmp/l2-ab/ninfer-serve.base2 CAND=/home/vermont/tmp/l2-ab/ninfer-serve.cand2 \
+  bash /home/vermont/tmp/tile16-ab/abba-t16b.sh l2clean 128
+```
+
+**Why this runner and these binaries.** The l2-native runner (`/home/vermont/tmp/l2-ab/abba-l2b.sh`) has
+no quiet gate and no settle, and its default `CAND` (`ninfer-serve.cand3`) **does not exist on disk** —
+checked before spending any GPU time; the clean build (`build-arms-clean.sh`) emits `.base2`/`.cand2`.
+`abba-t16b.sh` is parameterized by `BASE`/`CAND` and enforces the protocol §tile16's contamination
+lesson earned: 25 s sustained quiet (busy ≤ 3 %, zero foreign openers of `/dev/dri/renderD129` via
+`gpuwatch.py`) before the lock, 12 s settle per leg, and a per-leg contention window. Arms are the same
+16:25 tree archive with **only** `prompt_i8_fa2.cu.o` swapped — base = committed baseline object
+`e9bd4fb67e`, candidate = census9 diet `b420769879`; binaries `0ab1eec3ada4…` (base) and `62dc1e3d3b54…`
+(cand). Statics of the pair: in-loop scratch loads **686 → 0**, VGPR 238 with 528 B/lane private against
+base 256 with 2 016 B/lane.
+
+| leg | arm | prefill | TTFT | decode | sha1 |
+|-----|-----|---------|------|--------|------|
+| base1 | baseline FA2 `0ab1eec3ad` | 177.3 t/s | 23.8 s | 13.0 | `77f1779eb831` |
+| cand1 | diet FA2 `62dc1e3d3b` | 175.9 t/s | 24.0 s | 12.9 | `77f1779eb831` |
+| cand2 | diet FA2 `62dc1e3d3b` | 175.8 t/s | 24.0 s | 12.9 | `77f1779eb831` |
+| base2 | baseline FA2 `0ab1eec3ad` | 175.7 t/s | 24.0 s | 12.9 | `77f1779eb831` |
+
+Admissibility: quiet gate 50 samples, max busy 0 %, foreign hits 0, card QUIET at 02:22:13. Per-leg
+windows (base1 24 samples mean 81.1 % busy, cand1 55 mean 71.6 %, cand2 85 mean 69.6 %, base2 116 mean
+68.4 %): **zero foreign openers in every leg window** — the busy% is our own server's load, and the
+window lengths differ because they span model load + request + settle.
+
+**Findings.**
+1. Pooled candidate **175.85** against base **176.50** = **−0.65 t/s (−0.37 %)**. The same-arm spread on
+   the *base* legs is 1.6 t/s (177.3 vs 175.7); the candidate legs sit 0.1 apart. The delta is **inside
+   the base arm's own spread**, so it is not a result: the lever is inert at served scale, and the
+   direction it points is negative.
+2. **This closes the handoff's item-4 gate with measurement.** The diet removed 686 of 686 in-loop
+   scratch loads (none remain) and 1 488 B/lane of private traffic, and served prefill did not move.
+   Static instruction-count reduction has now failed to convert to speed three times in this family:
+   §34's 14.6 % fewer instructions per tile → §35 parity, §37's leanest-kernel-in-the-TU arm → −52 %,
+   §39's entire scratch-load stream deleted → parity. The premise that the served loop's ~685 scratch
+   loads are *the* cost is refuted at served scale; the handoff's warning that "static instruction count
+   alone did not translate to speed" is confirmed on the lever it named.
+3. Coherence preserved: all four legs emit the served completion `77f1779eb831` (574 chars, 93 words,
+   59 distinct, max 8-gram repeat 1), identical text on both arms.
+4. **Level anomaly, recorded and unexplained.** This set ran at 176 t/s; the same class of binary (the
+   tree's own 16:25 build) measured 203.7 t/s with TTFT 20.7 s in the clean tile16 set (§ tile16 legs),
+   against 176 t/s and 24.0 s here. Both arms shifted together by ~27 t/s, so the *paired* comparison is
+   unaffected, but **the absolute numbers in this table are not comparable with the 203 t/s served
+   point** and no absolute is claimed from them. Cause unmeasured — a colder card at a single-request
+   4.2 k-token warm-up is the untested candidate; with zero foreign openers, contention is not being
+   claimed on either side.
+5. Queue consequence: FA2 diet-L2 is **closed as a speed lever** — measured flat, no re-implementation
+   on the current tree is warranted by measurement. Served operating point unchanged: 203 t/s
+   (`7042f064`, `<1,2,32>`, pooled control 203.13).
+
+## §40 — Served-shape census: **no served op reaches the WMMA non-panel fallback**, and §37's 32 000 B LDS
+> row is **mis-attributed** — it belongs to the i8 tile, which is what serves **gate_up**.
+> Source-derived and cited; no GPU touched, no lock taken.
+
+Two CPU-side items: the served op/shape census (conversion sidecar + dispatch guards), and a re-read of
+the served TU's device metadata to check the LDS attribution §37 finding 6 made.
+
+**Correction first.** `.group_segment_fixed_size: 32000` in `cal74.meta.txt` belongs to
+**`t2_prefill_i8_kernel<5120, SplitStoreEpilogue>`** (line 1428 onward: 225 VGPR, 0 VGPR spills, 288 B
+private, `max_flat_workgroup_size: 128`) — the non-WMMA T2 i8 tile. Every WMMA form, panel *and*
+non-panel, has `.group_segment_fixed_size: 0`. The source agrees: `t2_prefill_wmma.cuh` declares **no
+`__shared__` at all** (loads are direct global reads), while `t2_prefill_i8.cuh:50-58,94` declares
+`kSmem = 2·(4096+9216+128) + 2·2048 = 30 976` B of static shared, which the compiler rounds to 32 000.
+So §37 finding 6's table row (`<1,2,0>` … 32 000 B) is **wrong as attributed**, and its
+"shapes the panel law cannot take, e.g. n = 7168" is the **`MF=2`** law (`w.n/32`): at served `MF=1` the
+same shape yields 448 % 32 = 0 — panel. §37's panel-vs-served comparison is untouched by this (those
+rows are all group_segment 0).
+
+**Geometry** (from `/home/vermont/models/bonsai2_27b_text_swift.ninfer.conversion.json`, read with
+`python3 -I`, JSON metadata only; loader `src/models/qwen3_5/config.cpp:106-152`): hidden 5120, vocab
+248 320, 64 layers = 48 `linear_attention` + 16 `full_attention`, heads 24 / KV 4 / head_dim 256 (query
+width 6144, key width 1024), GDN keys 16×128 = 2048, GDN values 48×128 = 6144, dense `intermediate_size`
+17 408. The FFN is **Dense** — `config.cpp:166-181` takes the `DenseConfig` branch and rejects MoE
+fields, so `bind_moe` (`load/text.cpp:59-80`) is never reached: there is no router linear in this model.
+
+**Panel law at served `MF=1`:** `wrow_blocks = w.n/16`, panel requires `wrow_blocks % 32 == 0`
+⇔ **`w.n % 512 == 0`** (`t2_a8.cu:399-400`, `wmma_panel()` default 32 at `:92-96`).
+
+| op (per layer) | `w.n × w.k` | `wrow_blocks` | panel? | reaches `t2_a8` WMMA? |
+|---|---|---|---|---|
+| GDN q+k fused | 4096 × 5120 | 256 | yes | yes — `gdn_input_proj.cpp:798-803` |
+| GDN value+z fused | 12288 × 5120 | 768 | yes | yes — same site |
+| attn q+k fused (16 L) | 7168 × 5120 | 448 | yes | yes — `attn_input_proj.cpp:274-281` |
+| attn gate+value fused (16 L) | 7168 × 5120 | 448 | yes | yes — same site |
+| attn o_proj (16 L) | 5120 × 6144 | 320 | yes | yes — `linear.h:19-23` → `linear_add.cpp:217-220` |
+| GDN output (48 L) | 5120 × 6144 | 320 | yes | yes — same path |
+| mlp/down (64 L) | 5120 × 17408 | 320 | yes | yes — `linear_add.cpp:217-220` |
+| **mlp gate+up (64 L)** | 34816 × 5120 | 2176 | shape yes | **no** — `linear_swiglu.cpp:168-178` calls the 4-arg `linear()`, which is `A16Only` with a `nullptr` workspace (`linear.cpp:209-212`) → A16 / small-T mma route, not `tile_gemm` |
+| lm_head | 248320 × 5120 | 15520 | shape yes | **no** — runs on **one** token per prefill request (`text.cpp:2038-2041`), below `kT2A8MinTokens = 17` (`t2_a8.h:27`, route `t2_a8.cu:180-188`) → decode GEMV / A16 |
+
+**Findings.**
+1. Under default envs **every shape that reaches `tile_gemm` satisfies `w.n % 512 == 0`**: the served
+   route never launches the non-panel fallback `t2_prefill_wmma1_kernel<…,0>`. The non-panel form is
+   reachable only by overriding envs (`NINFER_T2_A8_WMMAPANEL=0`, or `MF=2` on a shape not divisible by
+   1024). §37 finding 6's landing place does not exist on the served route.
+2. The 32 000 B LDS / 225 VGPR tile is the **i8 tile on the A16 route**, and the op that route serves is
+   **gate_up — 64 layers × 34 816 × 5120, the model's largest weight class and its dominant prefill
+   FLOPs.** Arithmetic from metadata: 128 threads per block at 32 000 B per block, so a 64 KB per-CU LDS
+   budget caps residency at 2 blocks/CU = 256 threads/CU; 225 VGPR gives the same cap
+   (65 536 registers/CU ÷ 225 = 291 threads → 2 blocks of 128). **This cap is arithmetic from metadata,
+   not a measurement**, and its throughput cost is unmeasured.
+3. Per prefill chunk of `len` tokens, all 64 layers run once: 48×(GDN q+k, GDN value+z, GDN output),
+   16×(attn q+k, attn gate+value, o_proj), 64×(gate_up *(non-WMMA)*, mlp_down) — `text.cpp:1868-2060`.
+   lm_head runs once per request, on the last token only. Never on WMMA at all: GDN a/b projections
+   (48×5120, bf16 fused), GDN convolution (bf16), all norms, token embedding (gather).
+   `prefill_chunk_` is a constructor argument (`text.cpp:651-660`), i.e. config-driven; its served value
+   is not derivable from these files and is **unverified here**.
+4. Stated as a lead, claimed by no measurement here: gate_up — the biggest single weight class — is not
+   on the WMMA path in the served build, and the tile that does serve it is LDS-capped by its own static
+   shared. That makes served prefill throughput partly a **route** question (which kernel serves gate_up)
+   rather than a tile-shape question, so §37's rejection of the `MF=2` panel form does not bear on it.
+5. Queued, gated on a quiet card + lock: `cal75` (source `.qual/wmma/cal75.cu`, built 02:31 to
+   `/home/vermont/tmp/cal75/cal75`) — cal71's occupancy sweep re-labelled for this 32-CU part
+   (`G = 32·MB`, `macs = 32·MB·(400·8·C)·4096`; docs line 4448 item (iv)), plus a **32 000 B static-LDS
+   pad arm** so the cap's throughput cost is read off a pipe-matched pair, and
+   `hipOccupancyMaxActiveBlocksPerMultiprocessor` printed per kernel so the cap is a measured property
+   and not VGPR arithmetic. Compile recipe, worth recording because no standalone probe script had one:
+   `hipcc -std=c++20 --offload-arch=gfx1102 -O3 -o OUT SRC.cu -L/usr/lib/x86_64-linux-gnu
+   -l:libamdhip64.so` — without the trailing library the link fails `undefined symbol:
+   __hipRegisterFatBinary`, because this install ships only the shared hip runtime.
