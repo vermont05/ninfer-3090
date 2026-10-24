@@ -5414,3 +5414,59 @@ served mlp_down shape; Full/SampledRows vs the CPU reference) in three env legs 
 (`w.n % 32 == 0`, panel law `(w.n/32) % 32 == 0`) puts n = 1024/4096/34816/5120 on the panel path and
 n = 7168 (`224 % 32 = 7`) on the `<2,2,0>` fallback, so both new code paths are covered. Then the
 `MF=2` **panel** ABBA arm.
+
+## §36 — First measured leg of the `(2,2)` **panel** arm (`<2,2,32>`, served x-panel raster): 99.9 t/s
+> ## against 204.1 t/s on the same card in the same minute — an unfavourable leg, **set incomplete**
+> ## (killed mid-`cand2`), so no verdict, and the arm is **not** promoted
+
+This is the arm §34 queued and §35 named as the missing isolation: same 120 VGPR / 0 private /
+0 spills tile, **served** x-panel raster, so the tile is the only variable (the §35 set changed tile
+*and* raster together). Candidate env `NINFER_T2_A8_MF=2` alone; base = served defaults
+`<1,2,32>`. Same binary both arms, sha1 `58efa02ba2` (the served `7042f064` tree).
+
+Protocol: `abba-mf2.sh mf2panel 128 30` with `CAND_ENV="NINFER_T2_A8_MF=2"`, four legs inside one
+`flock /tmp/ninfer-gpu.lock` hold acquired 01:52:30, 30 s settle per leg, busy% sampled at settle,
+before server start and before the request, temperature 0, 1024-word lighthouse prompt, 128 max tokens.
+
+| leg | arm | prefill | TTFT | decode | sha1 | busy at settle / before req |
+|-----|-----|---------|------|--------|------|------------------------------|
+| base1 | served `<1,2,32>` | **204.1 t/s** | 20.7 s | 12.7 | `77f1779eb831` | 0 % / 45 % |
+| cand1 | `MF=2` panel `<2,2,32>` | **99.9 t/s** | 42.2 s | 13.0 | `77f1779eb831` | 93 % / 18 % |
+| cand2 | `MF=2` panel | — | — | — | — | 85 % / — |
+| base2 | served | — (never ran) | — | — | — | — |
+
+**Findings.**
+1. The candidate's only completed leg is **−51 %** versus the control leg taken one minute earlier on
+   the same card with the same binary. That is ~110× the served record's own off-leg spread (§35:
+   203.4/202.5 ≈ 0.45 %), so spread does not explain it.
+2. The card was **not** idle: a neighbouring session was on it (93 % busy at `cand1` settle, 85 % at
+   `cand2` settle). Contention is a real confound and it inflates TTFT — **but it cuts the wrong way
+   for the candidate**: `base1` ran its request at 45 % busy, `cand1` at 18 % busy. The candidate was
+   measured on the quieter of the two legs and still came in at 2.04× slower. A quiet-card re-run is
+   owed, and the direction of these samples makes an innocent explanation for the candidate unlikely,
+   not likely.
+3. Text is bit-exact on both completed legs (sha1 `77f1779eb831`, 574 chars, 93 words, 59 distinct
+   = 63 %, max 8-gram repeat 1), so the geometry guard is not producing wrong output — the panel
+   `MF=2` route is *correct* on the served shapes, just measured slow.
+4. Mechanism is **unmeasured**, recorded as a hypothesis only: panel coverage is `16·MF·Panel` rows per
+   block, so `MF=2` at `Panel=32` covers 1024 rows per block against the served 512, halving the block
+   count per launch (served gate_up: 2176 blocks → 1088). §35 already showed launch-count halving is
+   inert when the tile is smaller, so a halving *combined* with a 32-row tile under the panel raster is
+   the shape of the suspect. To be tested with an occupancy sweep (`G = 32·MB`), not asserted here.
+
+**Incident record (protocol, so the numbers are trusted):** the harness killed the background ABBA
+task at `cand2` (~01:56:29) — legs 3 and 4 never ran — leaving the leg-2 server orphaned on port
+18983. It was my own process: killed (needed `-9`), `pgrep -x ninfer-serve` clean afterwards, card
+back to 0 % busy. The flock handle died with its script, so the lock was released; nothing ran
+unlocked and no foreign process was touched.
+
+**Verdict: no result — the set is incomplete.** What is recorded is an unfavourable preliminary leg,
+preserved deliberately. The `MF=2` panel arm stays uncommitted as a route (the knob exists in code at
+`02fb4d31`, off by default, served geometry unchanged); it is **not** promoted on a 99.9 t/s leg, and
+a clean four-leg re-run is owed before any claim in either direction.
+
+**Next legs (queued, gated):** clean four-leg `MF=2` panel ABBA on a quiet card; the
+`ninfer_linear_t2_a8_test` qualification battery (`qual-mf2.sh`, three env legs, one lock hold per
+test) — the combined runner `build-hip-test/tests/ninfer_tests` has now been relinked (01:52:49,
+after the rebuilt `libninfer_ops.a` at 01:30:28) and both it and `build-hip/apps/ninfer-serve`
+contain the `NINFER_T2_A8_MF` knob, so the battery exercises the committed edit.
