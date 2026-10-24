@@ -6504,3 +6504,50 @@ prints the same width more than once per request.
   exists only in `.qual/wmma` probes, so shipping it is implementing a quantise-activations path in the
   served T2 kernel, not flipping a knob. Docs also carry its ceiling note: iu4 alone does not reach
   300 t/s; the quadratic attention term has to shrink too.
+
+### 47.8 The served point's own noise floor, measured: three identical legs on one binary (B3).
+
+Reason it was worth a card slot: the standing rule (user, 2026-10-24) is that **every A/B is measured in
+the model**, so the bar for an in-model delta is the spread of the served point itself. §47.1 quoted
+1.0% from *two* baseline legs; three legs on one binary measure it instead of assuming it.
+
+`/home/vermont/tmp/head-ab/run-baseline-repeat.sh B3` → `queue-B3.out`, `=== BASELINE-REPEAT B3 DONE
+07:39:42 ===`. No arms: identical binary (`/home/vermont/tmp/head-ab/build/apps/ninfer-serve`,
+`dd5bb1b389` = HEAD build, which 47.4a proved is the served binary), identical env (the T2 knobs
+explicitly `-u`'d), identical request (prompt 4,215 | output 128 | temp 0), three times, all inside
+**one** `flock /tmp/ninfer-gpu.lock` hold after the 25 s quiet gate. Logs `B3-{B0,B1,B2}-server.log`.
+
+| leg | prefill t/s | TTFT s | output sha1 | max 8-gram repeat |
+|-----|------------|--------|-------------|-------------------|
+| B0  | 205.4      | 20.5   | `77f1779eb831` | 1 |
+| B1  | 203.6      | 20.7   | `77f1779eb831` | 1 |
+| B2  | 202.7      | 20.8   | `77f1779eb831` | 1 |
+
+mean **203.90**, min 202.70, max 205.40, **spread 2.70 t/s = 1.32% of mean**. TTFT spread 0.3 s = 1.5%.
+Contention: zero foreign openers of `/dev/dri/renderD129` in all three leg windows; the busy% maxima of
+100 are the legs' own work.
+
+Per-chunk averages (per-chunk, not sums - 47.5):
+
+| log | t2 | t5 | t51 | t112 | t1024 |
+|-----|-----|-----|------|------|-------|
+| B0 | 435.6×2 | 643.5×1 | 354.8×1 | 934.9×1 | 4620.9×4 |
+| B1 | 457.1×2 | 650.4×1 | 520.3×1 | 943.9×1 | 4662.2×4 |
+| B2 | 459.5×2 | 650.5×1 | 543.7×1 | 946.8×1 | 4682.1×4 |
+
+What this buys, stated as the rules it sets for the legs that follow:
+
+1. **Headline bar = 1.32%.** A cross-arm headline delta below ~1.3% is not a result (same standard 47.1
+   applied to H1's 0.25%, and it confirms the MF=2 verdict: −2.2% clears this bar and reproduced in both
+   legs). Quoting a single leg's rate as if it were the served point is now explicitly unsupported -
+   the served point is 203.90 ± 1.32%, measured three times, and 202.55 (47) was one leg of it.
+2. **Output is deterministic**: identical text sha1 on all three legs at temp 0. So in a future arm a
+   *changed* text sha is attributable to the arm, and an unchanged sha is evidence of numerics
+   stability - both readings are usable, which is exactly what the coherence half of a ship decision needs.
+3. **Per-chunk repeatability is width-dependent.** The width-1024 lines repeat within 1.3%
+   (4620.9 → 4682.1); the width-51 line does not (354.8 → 520.3 → 543.7, +53% monotone across leg
+   index, same binary, same request). So per-chunk claims belong on the wide chunks, and any width-51
+   reading - including the §43/§46 lineage built on small-chunk probe lines - carries a ~50% single-run
+   uncertainty. That is a *third* independent reason the small-chunk anomaly lines failed to reproduce.
+4. Nothing here is a throughput claim about a route: it is the noise floor, and it is the bar the iu4
+   leg has to clear in the model.
