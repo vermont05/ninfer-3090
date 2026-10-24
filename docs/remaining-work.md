@@ -5340,3 +5340,77 @@ legs; a model prediction, **not** a measurement — §15/cal59/cal61 all showed 
 predicting neither magnitude nor sign). Integration is host-side: template shape `(1,2,32)` → `(2,2,32)`
 with grid recomputation at the launch site (`t2_a8.cu:393`), geometry branch for panel y-fastest, bit-exact
 completion check against the served sha1 as always.
+
+## §35 — The `(2,2)` + y-fastest leg is **measured parity**: 202.9 / 202.7 vs 203.5 t/s, inside the
+### off-leg spread, bit-exact on all four legs. The −14.6 % per-tile instruction reduction did **not** translate
+### ABBA run `mf2`, 2026-10-24, one `flock /tmp/ninfer-gpu.lock` hold, one binary, arms differ only in env
+
+GPU measurement, favourable and unfavourable rows both preserved. Card: RX 7600M XT (gfx1102, 32 CUs),
+`card1`, model `bonsai2_27b_text_swift.ninfer` (T2_G128_FP16). One binary
+`build-hip/apps/ninfer-serve` sha1 `58efa02ba2`; the arms are **environment only**:
+
+- **BASE** = served defaults: `t2_prefill_wmma1_kernel<1,2,32>`, x-panel raster (the 203 t/s operating point, §16).
+- **CAND** = `NINFER_T2_A8_MF=2 NINFER_T2_A8_WMMAPANEL=0 NINFER_T2_A8_RASTER=rows` →
+  `t2_prefill_wmma1_kernel<2,2,0>` with the `rows_fast` swap: 32×32 one-warp blocks, y-fastest.
+
+Protocol (`/home/vermont/tmp/t2diet/abba-mf2.sh`): 4 legs B-C-C-B inside one lock hold (acquired 01:41:53,
+released 01:48:27), 30 s settle after each server exit, `gpu_busy_percent` + VRAM sampled before server start
+**and** before each request, `ROCR_VISIBLE_DEVICES=1`, `NINFER_T2_DECODE=simt NINFER_T2_I8_SMALL=off` (served
+decode route), temperature 0, 1024-word lighthouse prompt → **prompt 4,215 tokens**, `max_tokens 128`.
+
+| leg | arm | prefill tok/s | TTFT | decode tok/s | completion sha1 |
+|---|---|---|---|---|---|
+| base1 | base | 39.3 | 1 m 47.2 s | 13.0 | `77f1779eb831` |
+| cand1 | cand | 202.9 | 20.8 s | 7.9 | `77f1779eb831` |
+| cand2 | cand | 202.7 | 20.8 s | 12.9 | `77f1779eb831` |
+| base2 | base | **203.5** | 20.7 s | 12.9 | `77f1779eb831` |
+
+Coherence: all four legs produced the **same 574-character completion** — 93 words, 59 distinct (63 %),
+most-frequent word `two` ×8, max 8-gram repeat 1, byte-identical to the served control text. The candidate
+route is bit-exact end-to-end.
+
+**Verdict: no result.** The usable comparison is `base2` 203.5 vs the candidate pair 202.9 / 202.7 (mean
+202.8): **−0.35 %**, inside the off-leg spread the served record itself carries (203.4 / 202.5 = 0.9 t/s
+≈ 0.45 %). Per the standing rule, a delta inside the off-leg spread is not a result. `base1` (39.3 t/s,
+TTFT 1 m 47.2 s) is the cold first leg — first server start after idle; it is excluded from the throughput
+comparison exactly as §16's pooled-first-leg caveat excludes it, and recorded here because the protocol
+preserves every leg.
+
+Confound recorded: a **CPU-only** compile of the test tree (12 jobs, no lock, no card access) ran
+concurrently. It cannot perturb kernel time, but it loads CPU/DRAM during each leg's model-load phase;
+the B-C-C-B layout and the identical 30 s settle absorb it, and both cand legs and base2 sit in the served
+band, which bounds the effect.
+
+**Findings.**
+
+1. **The instruction-count lever is measured-inert for tile doubling.** §34 census: `(2,2)` is 45.47 instr/tile
+   vs served 53.25 (**−14.6 %**) at 120 VGPR / 0 private / 0 spills, and 1.71× the instructions per launch
+   with **half** the launches per tile. Measured effect on served prefill: **−0.35 % (inside spread)**. The
+   §31→§16 conversion factor measured on the `v_perm_b32` change (−23.5 % instructions → +15.1 % speed,
+   factor ≈ 0.64) would have predicted ≈ +9 % ≈ 221 t/s. It over-predicted by ≈ 9 points **in the wrong
+   direction**. The §34 traffic model (DRAM ≈ 13.5 ms + request ≈ 13.1 ms vs the 29–30 ms measured legs)
+   over-predicted by > 2×. This joins §15/cal59/cal61: static instruction counts and traffic models
+   predict **neither magnitude nor sign** at this operating point.
+2. **Launch-count halving per tile bought nothing either** — the served leg is not launch-overhead-bound,
+   and at 203 t/s it is not instruction-issue-bound. Doubling one warp's tile work (2× WMMA, 2× fragment
+   builds per block) is throughput-neutral at this occupancy, exactly as cal58's standalone gate_up −4 %
+   at a 44 B-spill `(2,2,8)` leg already hinted.
+3. **The `(2,2)` family is qualified as a route, not promoted as a lever.** Default (unset) keeps the served
+   `(1,2,32)` geometry and grid exactly and measures 203.5 t/s with the served sha1 on the served route
+   (base2); the knob's y-fastest arm is bit-exact on served shapes. The **panel** arm (`NINFER_T2_A8_MF=2`
+   alone, `<2,2,32>`, 120/0/0) is **unmeasured** — queued, not claimed.
+4. **What the target needs.** §23f: 300 t/s needs −26.8 % of total time; the linear bucket is 70.4 % of it.
+   Two levers on that bucket are now measured inert (fragment-build stream at ISA floor §31/§33; tile-shape
+   doubling §35). The remaining bucket-movers change **bytes moved**, not instructions issued: 4-bit
+   activations (`iu4`) and the gate_up integer-activation route — both **user-gated**, neither measured,
+   nothing claimed here.
+
+**Next leg (queued, gated):** route qualification battery `ninfer_linear_t2_a8_test`
+(`tests/ops/linear/test_t2_a8.cpp`: widths 1…1024 over `{n,k}` = `{1024,5120} {4096,5120} {7168,5120}
+{34816,5120} {5120,6144} {5120,17408}` — `{34816,5120}` is the served gate_up shape, `{5120,17408}` is the
+served mlp_down shape; Full/SampledRows vs the CPU reference) in three env legs — served defaults,
+`MF=2` panel, `MF=2 WMMAPANEL=0 RASTER=rows` — one lock hold per test
+(`/home/vermont/tmp/t2diet/qual-mf2.sh`). At those shapes the `MF=2` law
+(`w.n % 32 == 0`, panel law `(w.n/32) % 32 == 0`) puts n = 1024/4096/34816/5120 on the panel path and
+n = 7168 (`224 % 32 = 7`) on the `<2,2,0>` fallback, so both new code paths are covered. Then the
+`MF=2` **panel** ABBA arm.
