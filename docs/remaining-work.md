@@ -4970,6 +4970,48 @@ and prints per-leg windows, so admissibility is proved per leg instead of assume
 measurement earns: **holding `/tmp/ninfer-gpu.lock` proves no other *lock user* is on the card; it proves
 nothing about the user's own processes, and a leg is admissible only with a clean sampler window.**
 
+**Set t16b, legs landed 00:46:06–00:49:34 — clean, and the tile shape is confirmed unfavourable.** The
+quiet-gate held for the whole set: `card QUIET 00:45:19`, lock acquired the same second, released
+00:49:48, and **zero foreign openers of `/dev/dri/renderD129` in every leg window** (sampler at 2 s,
+129 samples, leg windows base1 1-23, cand1 24-67, cand2 68-95, base2 96-123; logs
+`/home/vermont/tmp/tile16-ab/abba-t16b.log`, samples `watch/t16b-samples.tsv`). The busy percentages in
+those windows (max 100%, means 57–80%) are **this set's own servers** — a prefill+decode leg is exactly
+what a busy card looks like from `gpu_busy_percent`; the admissibility column is the opener list, and it
+is empty in all four windows.
+
+```
+leg      binary      TTFT    prefill t/s    decode (server's last line)   completion sha1
+base1    904bbc8c90   20.7 s      203.7     12.9                          77f1779eb831
+cand1    c6bd4b871f   21.1 s      199.6      6.6  ← anomaly, see note     77f1779eb831
+cand2    c6bd4b871f   21.2 s      198.6     12.9                          77f1779eb831
+base2    904bbc8c90   20.8 s      202.8     12.9                          77f1779eb831
+```
+
+Prefill, pooled ABBA: cand 199.10 vs base 203.25 = **−4.15 t/s (−2.0%) on the candidate ⟨64,16⟩**.
+Off-leg spread: base 0.9 t/s (203.7, 202.8), cand 1.0 t/s (199.6, 198.6); widest 1.0. The delta is four
+times the widest off-leg spread, so this set **is** a result, in the direction §28–§30 predicted. Its
+magnitude is a quarter of §29's predicted −16 t/s, and its sign matches the clean prefix t16 left
+behind (−4.8). The contaminated +28.85 artifact is superseded: the clean set lands on the conclusion the
+artifact had hidden.
+
+Coherence: all four legs print the baseline sha1 `77f1779eb831`, 574 chars, 93 words, 59 distinct (63%),
+max 8-gram repeat 1 — byte-identical to every leg of both sets.
+
+**What this settles.** Gate B's census had the candidate *better* on every static column it prints: 0
+spills against 19/20, 221 VGPR against 256, 528 B private against 608, 49,152 B LDS against 65,536. It
+measured 4.15 t/s slower. That is the handoff's rule demonstrated on a second lever, after qfrag:
+removing all spills and a third of the registers **did not translate**, because §29's executed-work term
+is what moves the clock — ⟨64,16⟩ doubles the key-block steps per query tile, and the saved scratch
+traffic is not paid back. The tile-shape lever stays closed, and now it is closed by measurement, not
+prediction. Nothing here is committable as a perf change; `tile_io.cuh` and `tiled_mma.cuh` stay
+uncommitted.
+
+**Decode note, recorded as an anomaly, not a result.** cand1 decoded 2.4 / 7.0 / 12.8 / 6.6 tok/s and
+its total was 40.3 s against 30.6–31.0 s in the other three legs, with prefill and TTFT in line
+(199.6 t/s, 21.1 s) and no foreign opener in its window. One leg, cause unidentified, prefill
+unaffected: not admissible as evidence about the candidate's decode rate, and not a reason to touch the
+prefill verdict.
+
 ## §31 — The T2 GEMM prefill group, censused: 295 integer fragment-build ops per 16 WMMA, and the
 ### activation-scale stream is 16× redundant in issued bytes
 
@@ -5072,3 +5114,150 @@ per the table above, group census not taken separately). (2) The env overrides
 the serving process — this section describes the kernel the defaults select. (3) `NINFER_T2_I8_SMALL=off`
 in the served A/B environment keeps the small-T route out of scope. (4) A per-section byte hash of
 census vs linked objects is not established here (the §30 `objcopy` attempt was inconclusive).
+
+## §32 — The packed 16-bit WMMA accumulator does **not** halve the accumulator: same 128 VGPR at the
+### served tile count, so the native-PV wall of §26/§28 stands
+
+Static only — a handful of compile-only probes and one metadata read. **No GPU, no lock, no throughput
+claim in this section.** Artifacts: `/home/vermont/tmp/packedacc/probe13.cpp` (accepted call forms +
+disassembly), `probe14.cpp` (the folded-away version, kept as the trap record), `probe15.cpp` +
+`p15.dev.o` (the census), `p13.dev.o`.
+
+**Why this was owed.** §25 established that the served attention mixer's PV contractions are
+software-emulated (`mma_bf16` at `src/ops/common/mma.cuh:268` = 4 × `gather8` + 4 × `dot_bf8`; QK is
+native), and §26/§28 closed the occupancy lever with the finding that the accumulator is the register
+wall: 16 tiles × 8 fp32 accumulator values per lane = 128 VGPR/lane, the point at which the served
+shape goes 1 WG/CU. The hypothesis carried forward from earlier sessions was: *"a packed 16-bit
+accumulator cuts the PV accumulator to 64 VGPR/lane."* That hypothesis is **refuted**, and it is refuted
+by the definition of the fragment, not by a compiler quirk.
+
+**What the builtins actually look like on this target** (probe13, ROCm clang 20, `--offload-arch=gfx1102`):
+
+```
+__builtin_amdgcn_wmma_bf16_16x16x16_bf16_w32(short v32 A, short v32 B, short v32 C, const bool)
+__builtin_amdgcn_wmma_f16_16x16x16_f16_w32   (__fp16 v32 A, __fp16 v32 B, __fp16 v32 C, const bool)
+```
+
+Four arguments, the 4th a **compile-time constant bool** — a runtime `bool` is rejected ("must be a
+constant integer"). A, B and C are 32-byte vectors; C is the accumulator, in place. HIP's
+`__nv_bfloat16` cannot be a vector element type, so the packed form is reachable only through the
+builtin spelled with `short` (bf16) or `__fp16` (f16).
+
+**Emitted ISA** (`p13.dev.o`, `llvm-objdump -d --triple=amdgcn-amd-amdhsa`):
+
+```
+v_wmma_bf16_16x16x16_bf16 v[16:23], v[0:7],  v[8:15],  v[16:23] op_sel:[0,0,1]   // 4th arg = true
+v_wmma_bf16_16x16x16_bf16 v[16:23], v[0:7],  v[8:15],  v[16:23]                  // 4th arg = false
+v_wmma_f16_16x16x16_f16   v[16:23], v[0:7],  v[8:15],  v[16:23] op_sel:[0,0,1]
+v_wmma_f16_16x16x16_f16   v[16:23], v[0:7],  v[8:15],  v[16:23]
+```
+
+The accumulator is an **in-place 8-register block** (`v[16:23]` in both the source and destination
+slots), exactly as in the served integer form (§33's ISA line): 8 registers = 16 half-precision values
+per lane per tile.
+
+**The census that kills the hypothesis.** probe15 is a 16-tile chain with **per-tile distinct operands**
+(`a[i]`, `b[i]`), all 16 accumulators live across a `__syncthreads()`, all stored — so no folding is
+possible. probe14, the same shape with shared operands and a summed store, compiled down to nothing
+useful and is kept only as the trap record: identical-operand WMMA chains get folded away, so a register
+census taken on them measures nothing. Metadata from `llvm-readelf -n p15.dev.o`:
+
+| kernel | VGPR | vgpr_spill | SGPR | private |
+|---|---|---|---|---|
+| `packed16` (16 × packed-accumulator builtin) | **128** | **16** | 24 | **68 B** |
+| `fp32_16` (16 × served 3-arg fp32-accumulator builtin) | **128** | **32** | 32 | **132 B** |
+
+The register counts are **identical**, and the reason is arithmetic, not scheduling: a wave32 16×16×16
+D-fragment is 8 accumulator values per lane, and 8 fp32 values occupy exactly 8 registers; the packed
+D-fragment is also 8 registers, holding **16** half-precision values. Packed doubles the accumulator
+*values* per tile at the same register footprint — it does not halve the footprint. At the served tile
+count (16 tiles/lane) both spellings land on 128 VGPR/lane, which is the wall §28 found and §26 closed.
+The claim "a packed 16-bit accumulator cuts the PV accumulator to 64 VGPR/lane" is **retracted**.
+
+What packed does do here, measured, is cut the **spill traffic** — 68 B private / 16 spills against
+132 B / 32 spills for the fp32 chain at the same 128 VGPR — i.e. at equal register count the packed
+chain sits under less pressure, consistent with carrying 16 live 16-bit values where the fp32 chain
+carries 8 floats plus a conversion. That is a real margin and not a measured speed, and it is not a
+lever at the served shape: 128 VGPR/lane is the wall whoever produces it, and every shape that drops
+below 16 tiles/lane was measured (§28, §29) to cost more executed work than served. **Native PV stays
+walled.** Nothing here was run on the card and nothing here predicts a throughput number.
+
+## §33 — The §31 fragment-build stream is at its **ISA floor** on gfx1102: 4 perms per 16-byte fragment,
+### and the bit-scatter instructions that would have compressed the selector are not implemented on this GPU
+
+Static only — served-assembly reads and compile-only inline-asm probes. **No GPU, no lock, no throughput
+claim in this section.** Artifacts: served device assembly
+`/home/vermont/tmp/t2-census/base/t2_a8-hip-amdgcn-amd-amdhsa-gfx1102.s` (460 `v_perm_b32` in the TU),
+probes `/home/vermont/tmp/perm8/probe20.cpp` and `/home/vermont/tmp/perm8/probe22.cu` plus the
+single-instruction probe files generated from it.
+
+**Operand widths, read off the served ISA.** The served WMMA sites are:
+
+```
+v_wmma_i32_16x16x16_iu8 v[8:15], v[30:33], v[16:19], v[0:7] neg_lo:[1,1,0] clamp
+```
+
+so per instruction **D = 8 registers, A = 4 registers (16 B/lane), B = 4 registers (16 B/lane), C = the
+same 8 registers in place**. The builtin's sign arguments print as those modifiers: the served call
+`__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, av, true, bv, acc, true)`
+(`src/ops/linear/t2/t2_prefill_wmma.cuh:227-228`, inside the m/n loops at `:224-230`) is
+`neg_lo:[1,1,0] clamp` — the two `true` PSGN
+arguments negate A and B, the 6th argument is the clamp. This closes §31's fragment-layout question from
+the other side: the `int4v` (16 B/lane) activation load is exactly one A fragment and the `int8v`
+(32 B/lane) weight line is exactly two B fragment rows, so the loads are correctly sized and the build
+stream is pure byte-shuffling, not layout repair.
+
+**Where the 295 build ops go, and why the perm half is a floor.** Per steady group there are 8
+`wmma_detail::wmma_code_frag` calls (`t2_prefill_wmma.cuh:218-222`, the call on `:221`, run for
+`s = 0..7` with `MF = 1`) serving the 16 WMMA, and each call is 4 × `spread4` + 4 ×
+`__builtin_amdgcn_perm` (`:113-124`) = 32 `v_perm_b32` per group, matching §31's
+table exactly. The four code windows per call read bits (0..7), (2..9), (16..23) and (18..25) of the
+weight word — deliberately overlapping, because the ternary code stream packs 2 bits per weight.
+
+`v_perm_b32` takes a 32-bit selector and produces **4 output bytes = 1 output register**, and there is
+no b64 perm. A B-fragment is 4 registers = 16 output bytes, so a fragment costs **4 perms minimum**;
+8 calls × 4 = 32 perms per group is exactly that minimum. The perm half of the build stream cannot go
+below what served already spends.
+
+**The remaining half — the selector build — was the lever, and the ISA closes it, not LLVM.** `spread4`
+is `(w & 3) | ((w<<4) & 0x300) | ((w<<8) & 0x30000) | ((w<<12) & 0x3000000)`, which LLVM already fuses
+into the `v_bfe_u32` / `v_and_or_b32` / `v_lshl_or_b32` forms in §31's histogram (~7 ops each, ~224 of
+the 295). The plan was to replace it with the GCN bit-scatter pair — `v_bfmper_b32` to extract four
+contiguous 2-bit fields, `v_bfmper3_b32` to expand them to byte stride — 2 ops for the same spread. That
+plan is **dead**: probed by inline asm at `--offload-arch=gfx1102`:
+
+| spelling | result on gfx1102 |
+|---|---|
+| `v_bfmper_b32` | **invalid instruction** |
+| `v_bfmper3_b32` | **invalid instruction** |
+| `v_permbate_b32` | **invalid instruction** |
+| `v_pk_bf16_permbate_b32` | **invalid instruction** |
+| `v_permlane16_swap_b32` | **instruction not supported on this GPU** |
+| `v_bfe_u32`, register-only form | assembles |
+| `v_perm_b32` with immediate selector | assembles (the compiler emits `v_perm_b32 v5, v5, v6, 0x6050400`) |
+| immediate selector in **inline asm** | **invalid operand for instruction** |
+
+Those last two rows are separate facts and both matter to anyone repeating this: the *compiler* emits
+immediates freely (`v_bfe_u32 v1, v1, v4, 16`, `v_perm_b32 …, 0x6050400`), but AMDGPU inline asm parses
+bare digits as **numbered registers**, so an immediate written in an asm string does not assemble — the
+working spelling is all-register (`asm("v_perm_b32 $0, $1, $1" …)`). Separately, ROCm clang 20 exposes
+**no** `__builtin_amdgcn_bfe_u32`, `__builtin_amdgcn_bfmper` or `__builtin_amdgcn_bfmper3` at all
+(probe20's `spread4_bfe` / `spread4_bfmper` fail as undeclared identifiers); the `v_bfe_u32`
+instructions in served code come from InstCombine recognizing a shl+and pair, not from a builtin.
+
+**Consequence.** The served weight-side builder (`wmma_code_frag`, the register-table perm form shipped
+in `7042f064`) is at the hardware floor on this GPU in **both** halves: 4 perms per fragment set by
+instruction width, and ~7 ops per selector build because the 2-op bfmper-class forms do not exist on
+gfx1102. §31's 18.4 integer shuffles per WMMA is therefore **not** reducible by instruction selection,
+so a "fewer shuffles" candidate is not owed any GPU time. The bfmper selector-compression idea is
+retracted. This says nothing about time — it says the op-count lever §31 opened is closed at the static
+level.
+
+**What this does not close** — where §31's linear lead still lives: the **register** side of the same
+kernel, i.e. the diet that fits `(2,2)@8` into 64 VGPR with y-fastest panel geometry, which is the lever
+the cal57/cal58 record above leaves open (`(2,2,8)` measured −4 % bit-exact at gate_up standalone at
+44 B spill; every wider shape spill-bound at 432–1272 B scratch) — and §31's 16.0× `xs` activation-scale
+stream. Both are register/traffic levers, not shuffle-count levers, and both stay behind the same gate:
+qualify by compile census (spills 0, private ≈ 0, instruction count at or below served) before any GPU
+leg, because §15 and cal59/cal61 both measured register relief and instruction reduction predicting
+neither magnitude nor sign.
