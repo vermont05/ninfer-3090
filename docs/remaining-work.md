@@ -6287,3 +6287,220 @@ dominated, so it is the chunk most exposed, which is also why the wide chunks ma
 occupancy at the tail chunk, and the profiler's fences. W2's `0`/`0b` pair, and a repeat of the
 baseline across sessions, is the measurement that separates these. **No cause is claimed by this
 section.**
+
+## §47 - Three measured sets at the served point: the small-T tier (W2), the dirty-header delta (H1), the wide-chunk WMMA knobs (K1). **`(2,2)` is a measured loss.**
+
+Run 2026-10-24, 06:28-06:39 local, one card (RX 7600M XT, gfx1102, `ROCR_VISIBLE_DEVICES=1`). Same
+request in all three sets: prompt 1,024 words / `max_tokens 128` / `temperature 0` → prompt 4,215
+tokens, chunks `1024,1024,1024,1024,112,5,2` plus a 51-token warmup line. Env line common to all
+legs: `NINFER_PREFILL_PROFILE=1 NINFER_T2_DECODE=simt NINFER_T2_I8_SMALL=off`.
+
+Binaries: **W2** = `ninfer-serve.base2` sha `0ab1eec3ad` (the pre-v_perm baseline); **K1** and the
+HEAD side of **H1** = HEAD build `dd5bb1b389` (clean tree at `7269df2c`, carrying `02fb4d31` MF=2 and
+`7042f064` v_perm_b32); the dirty side of **H1** = working tree `1b645cc30b`.
+
+Sequencing and protocol: W2 → H1 in one driver (`queue.log`, `=== QUEUE DONE 06:33:26 (W2 rc 0, H1 rc
+0) ===`), then K1 in a second driver gated on **that driver's own DONE marker** and both legs' exit
+codes (`queue2.log`), never on a background notification. So no two of my own sets shared the card.
+Each set: 25 s quiet gate passed before taking `flock /tmp/ninfer-gpu.lock`, every leg of the set
+inside that one hold, released at the end; `gpuwatch.py` sampler with per-leg windows.
+**Every leg window in all three sets reports foreign openers NONE** (busy max 100%, mean 76.7-82.5% -
+that busy is the leg's own server, excluded by name). **All 16 legs emitted the same text**, sha
+`77f1779eb831`, 574 chars, 93 words, max 8-gram repeat 1: coherence held in every arm, including all
+the losing ones.
+
+Chunk-sum rates below include the warmup chunk lines, so they run below the reported `prefill tok/s`
+(the reported rate is request-only); use them for shape comparison, not as a headline rate.
+
+### 47.1 K1 - the wide-chunk WMMA knobs, on the served binary. Order `0 MF2 P0 0b MF2b P0b`.
+
+```
+leg    arm                            prefill  TTFT   t1024 avg   wide t/s  t112   t5     t2      chunksum
+0      served defaults               203.6    20.7   4660.8 x4   219.7     944.7  650.2  441.8   21486.1
+MF2    NINFER_T2_A8_MF=2             198.2    21.3   4802.1 x4   213.2     944.7  652.3  447.4   22052.1
+P0     NINFER_T2_A8_WMMAPANEL=0      191.3    22.0   4989.0 x4   205.3     960.5  652.0  447.9   22832.7
+0b     served defaults (repeat)      201.5    20.9   4712.0 x4   217.3     951.2  656.6  448.4   21721.8
+MF2b   MF=2 (repeat)                 197.9    21.3   4808.7 x4   212.9     945.8  653.3  449.9   22088.0
+P0b    PANEL=0 (repeat)              191.0    22.1   4996.4 x4   204.9     962.8  654.8  449.1   22874.7
+```
+
+`MF=2` is `t2_prefill_wmma1_kernel<2,2,Panel=32,SplitStoreEpilogue>`: a 32x32 one-warp tile, 32 WMMA
+`m16n16k16` calls, 64 `v_perm_b32` fragment builds, and - per §34's census at
+`__launch_bounds__(32,8)` - **120 VGPR / 0 private / 0 spills** and **−14.6% instructions per tile**
+against the served `(1,2)`. §34 said in terms: "Throughput is NOT claimed: the GPU ABBA leg is
+gated." **This is that leg, and it says loss.**
+
+Spreads first, per the §46 rule. Baseline within-arm spread: 203.6 / 201.5 → **2.1 t/s = 1.0%**.
+MF2 leg-to-leg: 198.2 / 197.9 → 0.3 t/s (0.15%). P0: 191.3 / 191.0 → 0.3 t/s.
+
+- **`MF=2`: mean 198.05 vs baseline mean 202.55 → −4.5 t/s = −2.2%**, and on the wide chunks
+  (91% of TTFT) 213.2 / 212.9 vs 219.7 / 217.3 → **−2.5%**. Reproduced in both legs, and outside the
+  2.1 t/s baseline spread. → **Not shipped. `NINFER_T2_A8_MF=2` stays a knob, off by default.**
+- **`WMMAPANEL=0`: mean 191.15 vs 202.55 → −11.4 t/s = −5.6%**, wide chunks 205.3 / 204.9 vs 218.5
+  → **−6.1%**. Reproduced, far outside every spread. → The shipped panel raster's benefit re-proves on
+  this binary at a magnitude matching cal41's +6-8% on an older binary. Default stays 32; the §46
+  worry that the panel attribution had drifted against the served point is closed.
+
+The `(2,2)` result is the direct, measured form of the standing lesson: a −14.6% cut in instructions
+per tile made the served request **2.2% slower**. Instruction-count census is not a throughput proxy
+at the served operating point; it narrowed the candidate set (the tile fits the occupancy class with
+zero spills, so the loss is not register pressure) and it did not predict the sign.
+
+### 47.2 W2 - the small-T tier, on base2, full arm set after §46 voided W1. Order `0 V16 V32 V64 V1K 0b`.
+
+```
+leg    arm                      prefill  TTFT   t1024 avg   wide t/s  t112    t5      t2      chunksum
+0      served (v2 tier)         177.6    23.7   5396.1 x4   189.8     1044.1  648.2   437.3   24566.7
+V16    NINFER_T2_V2=r16         177.3    23.8   5447.3 x4   187.9     1051.0  464.9   451.9   24679.1
+V32    NINFER_T2_V2=r32         175.3    24.1   5467.9 x4   187.0     1054.4  561.9   542.1   24989.3
+V64    NINFER_T2_V2=r64         168.8    25.0   5477.9 x4   186.9     1055.3  1004.6  981.1   26360.8
+V1K    NINFER_T2_SMALLT=v1      155.9    27.0   5480.2 x4   186.8     1056.2  2027.0  2000.3  29419.1
+0b     served (repeat)          175.5    24.0   5461.1 x4   187.5     1056.4  652.3   446.1   24868.1
+```
+
+Baseline within-arm spread: 177.6 / 175.5 → **2.1 t/s = 1.2%**. Quoting arms against that:
+`V16` 177.3 (inside spread), `V32` 175.3 (inside spread), `V64` **−4.4%**, `V1K` **−11.7%**.
+
+- The tier knobs move only the tail: the width-1024 chunks are flat across all six arms (186.8-189.8
+  t/s, within noise), exactly as the dispatch law predicts (`t ≤ 16` → small_t, so these knobs are
+  unreachable by the 91% of TTFT that is the wide chunks).
+- `V16` is the one arm with a real per-chunk win: the width-5 chunk 464.9 ms vs the baseline's
+  648.2 / 652.3 → **−28%**. Width 2 goes the other way, 451.9 vs 437.3 / 446.1 → +2%. Net request
+  effect 177.3, inside the 1.2% spread. → **Nothing shippable from W2**; the served v2 tier stays
+  default. Recorded as a measured per-chunk effect with no request-level effect - the tail's size
+  bounds what the tail can buy.
+- `V64` and `V1K` are clear losses (width 2 at 981.1 and 2000.3 ms against 437-446). `SMALLT=v1`'s
+  v1 kernel is roughly 4.5x the v2 tier's cost at widths 2 and 5 on HIP, consistent with §43's note
+  that the v1 path's mma is SIMT reference emulation. Unfavourable results, preserved.
+
+### 47.3 The width-5 anomaly: third non-reproduction, and a cross-binary corroboration.
+
+Width-5 baseline readings now: §46's W1-0 `647.2`, W2's `648.2 / 652.3`, K1's HEAD legs
+`650.2 / 656.6 / 652.3 / 653.3`, H1's `654.8 / 651.2`. P1's `9773.1` (`attn_mixer 9181.4`) has failed
+to reproduce across **three** re-measurements on the very binary that produced it. §43/§44's headline
+stays dead, and §46's "no cause claimed" stands - the question is still open, nothing here narrows it.
+
+Cross-binary, same session, same prompt: baseline means base2 `176.55` vs HEAD `202.55` → **+14.7%**
+headline, and on the wide chunks `188.65` vs `218.5` → **+15.8%**. Independent corroboration of the
+committed `7042f064` claim's magnitude (+15.1% served prefill); it is not that claim's ABBA and adds
+no new attribution.
+
+One measured cross-binary observation with **no cause claimed**: the 51-token warmup chunk runs
+352.0-373.6 ms on HEAD against 414.5-470.3 ms on base2 (−15%, reproducible across all six HEAD legs).
+Width 51 takes `launch_t2_mma_r64_c64`, not the WMMA prefill tile, so v_perm_b32 does not obviously
+reach it. Recorded as an observation.
+
+### 47.4 H1 - the dirty attention headers' delta at the served point: **0.25%, inside spread.**
+
+Order `H D D H` (HEAD build `dd5bb1b389` vs working tree `1b645cc30b`):
+
+```
+arm  prefill  TTFT   t1024 avg   t112   t5     t2     t51    chunksum
+H    202.1    20.9   4696.6 x4   949.4  654.8  448.1  368.5  21655.3
+D    202.6    20.8   4685.8 x4   947.3  651.2  446.9  365.7  21601.0
+```
+
+Per-chunk agreement within 1% on every width; identical output text (`77f1779eb831`). Delta **+0.25%
+(H vs D)**, i.e. inside the 1.2% within-arm spread W2 measured for this request on this card. The
+open test the handoff set for these headers - "does the dirty-file delta change prefill t/s at all,
+beyond within-arm spread?" - answers **no**.
+
+Source-side reason, checked verbatim: the new PV route is gated by the **compile-time macro**
+`NINFER_BF16_PV_NATIVE` (not a `getenv`), and that macro is defined in **no** build config - zero hits
+across `CMakeLists.txt`, `cmake/`, and both `CMakeCache.txt` files. So `kNativePV` is false, every
+`if constexpr (kNativePV)` collapses to the served path, and the `bf16_kv_stage_vt` transposed-V
+staging in `tile_io.cuh` is never instantiated. The machine-code version of that argument (compiling
+`bf16/launch.cu` from both trees with each tree's own real compile command and comparing the
+assembly) is recorded in **47.4a**.
+
+### 47.4a The census: the dirty headers emit **byte-identical served machine code** and **zero** code for the gated route.
+
+CPU-only (no GPU, no lock), run after the queue's `DONE` marker so host-side compile work could not
+pollute any measurement window: `06:39`–`06:44`, `=== PV-CENSUS DONE 06:44:14 ===`, compile rc **0 / 0**.
+Each tree compiled `src/ops/softmax_attention/dense/causal_cache/bf16/launch.cu` with **its own real
+compile command** pulled from its own `compile_commands.json` (include paths, `-D`s, gfx target), with
+only `-c -o <obj>` rewritten to `-S -o <dump>.s`, executed in that entry's `directory`.
+
+A raw sha1 of the two dumps is **not** a valid comparison across trees and this is worth recording as a
+trap: the trees differ in their `-ffile-prefix-map` / `-fdebug-prefix-map` roots
+(`/home/vermont/git/ninfer-3090` vs `/home/vermont/tmp/head-ab/src`), and the TU emits `.file` / `.loc`
+debug records, so raw sha1 differs (`b735ec861b46` dirty / `65813bd32d0e` head, raw diff **68 lines**)
+for reasons that have nothing to do with code. Normalizing - both roots to one token, dropping
+`.loc` / `.file` / `.cfi_*` / `.LFB` / `.LFE` / DWARF-section directives and comments - leaves:
+
+```
+normalized sha1   dirty 6341fe1f2021   head 16f6a9f2f782   diff 66 lines
+sizes, raw        67,121,094           67,121,072
+sizes, normalized 67,057,166           67,057,145
+.globl (kernel symbol) count            66                 66
+.amdhsa vgpr/sgpr/private/group metadata              IDENTICAL
+```
+
+Removing the two per-compilation identifier families (`__hip_cuid_*`, `__hip_gpubin_handle_*`) from that
+66-line normalized diff leaves **4 lines**, all `__hip_fatbin_*` - per-compilation id symbols, which
+legitimately differ between two compilations of the same code. Every remaining byte of the 21-byte
+normalized size difference is those identifier strings. **There is no instruction, symbol, size, or
+metadata difference.**
+
+Symbol greps for the gated route, in both dumps: `kv_stage_vt`, `vt_index`, `WmmaAB`, `WmmaC`,
+`perm_w32`, `NINFER_BF16_PV_NATIVE` - **0 hits in each**. The transposed-V staging is not instantiated
+into assembly at all, exactly as the `if constexpr (kNativePV)` reading predicts.
+
+Coverage was checked before trusting a one-file census. The include graph closes on one TU:
+`tile_io.cuh` (dirty) is included by `tiled_mma.cuh`, `epilogue.cuh`, `merge.cuh`; `tiled_mma.cuh`,
+`merge.cuh` and `grouped_mma.cuh` (which includes `epilogue.cuh`) are included by
+`template_launch.cuh`; **only `bf16/launch.cu` includes `template_launch.cuh`**. The only other TU in
+that directory is `plan.cpp`, and `causal_softmax_attention.cpp` includes just the host headers
+`bf16/plan.h` + `bf16/launch.h`. (The same-named `grouped_mma.cuh` hits in `fp8/`, `k8v4/`, `nvfp4/`,
+`int8/` are those directories' own files.) So `bf16/launch.cu` carries the entire dirty device surface
+and it is the file censused.
+
+Consequence, stated at its own strength: at the **served** configuration the two headers contribute
+zero machine code, which is the mechanism behind H1's 0.25%-inside-spread delta, and it is the route
+qualification the handoff asked for. It says nothing about a build that defines
+`NINFER_BF16_PV_NATIVE` - that route would compile fresh code and needs its own measurement.
+
+### 47.5 A parse artifact of mine, recorded so nobody chases it.
+
+While tabulating K1 I reported an apparent width-2 regression on HEAD (`884-900 ms` vs base2's
+`416-443`, "2.1x"). It was my own parse: the 884-900 figure is the **sum** over the request's two
+width-2 chunks, the 416-443 the average over two. Per-chunk averages are HEAD `441.8-449.9`, base2
+`437.3-446.1` - **no regression**, and the K1/W2 tables above use averages. Any per-chunk number
+quoted from a probe line must say whether it is the per-chunk value, a sum, or an average; the probe
+prints the same width more than once per request.
+
+### 47.6 Protocol defects found in my own drivers (fix before re-running these sets).
+
+1. **H1 log collision.** `run-head-abba.sh` names logs `$TAG-$leg-server.log` with legs `H D D H`, so
+   leg 3 (`D`) overwrites leg 2 (`D`) and leg 4 (`H`) overwrites leg 1. The report's per-leg sections
+   and contention windows are duplicated for the same reason (`H: 88 samples` twice, `D: 66` twice).
+   Consequence: H1 carries **one** surviving measurement per arm, not two, so its 0.25% delta is
+   quoted against W2's spread, not against a spread measured on H1 itself. Fix = leg index in the
+   filename, before any repeat of H1.
+2. **`run-smallt-sweep.sh` report block crashes** at its tokens5/tokens2 table:
+   `re.findall(pattern, open(path, errors="ignore"))` passes a file object (`TypeError: expected
+   string or bytes-like object, got '_io.TextIOWrapper'`). The tables above were regenerated from the
+   per-leg logs by hand. Fix the script before a re-run.
+3. **Raw-sha1 asm comparison is invalid across trees**: `-ffile-prefix-map` / `-fdebug-prefix-map`
+   roots differ, and the TU emits DWARF line tables, so two byte-identical kernels in two trees yield
+   non-identical `.s`. The valid comparison normalizes tree roots and debug records away first
+   (`/home/vermont/tmp/head-ab/cmp-pv.sh`).
+
+### 47.7 Consequences, and the arithmetic to 300.
+
+- **Not shipped:** `NINFER_T2_A8_MF=2` (measured −2.2% at the served point, reproduced, outside
+  spread); `NINFER_T2_V2=r16` (−28% on the width-5 chunk, request effect inside spread);
+  `NINFER_T2_V2=r32/r64` and `NINFER_T2_SMALLT=v1` (clear losses).
+- **Re-confirmed:** the panel raster (`WMMAPANEL=32` default) is worth +5.6% headline / +6.1% wide on
+  the served binary; the served small-T v2 tier is the best of the arms tested.
+- **The two dirty attention headers** do not move the served point (0.25%, inside spread) and cannot
+  move its machine code while `NINFER_BF16_PV_NATIVE` is undefined (47.4).
+- Arithmetic, stated plainly: the served point measured here is 202.55 t/s whole-request, of which the
+  four width-1024 chunks are 218.5 t/s and 91% of the time. Reaching 300 t/s needs ≈1.45x on the wide
+  chunks. Nothing in the tail can supply that (9% of TTFT, all arms inside spread), and the two knobs
+  that touch the wide chunks both went the wrong way (`MF=2` −2.5%, `PANEL=0` −6.1%). The remaining
+  lever in docs is the iu4 (4-bit activation) WMMA w32 route - 1.96x measured on the linear pipe,
+  −55% on the MLP bucket in probes - which **has no production route**: `wmma_i32_16x16x16_iu4_w32`
+  exists only in `.qual/wmma` probes, so shipping it is implementing a quantise-activations path in the
+  served T2 kernel, not flipping a knob. Docs also carry its ceiling note: iu4 alone does not reach
+  300 t/s; the quadratic attention term has to shrink too.
