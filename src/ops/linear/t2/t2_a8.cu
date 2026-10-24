@@ -114,6 +114,22 @@ int wmma_colsplit() {
     }();
     return panel;
 }
+
+// NINFER_T2_A8_MF=2 requests the 2x-warp-tile family t2_prefill_wmma1_kernel<2,2,...>: a
+// 32-row x 32-col one-warp block (32 WMMA m16n16k16 calls, 64 v_perm_b32 fragment builds per
+// block). Compile census (docs §34, cal72/cal73, real header + real SplitStoreEpilogue,
+// __launch_bounds__(32,8)): 120 VGPR / 0 private / 0 spills in the served TU context — inside
+// the served occupancy class, no diet needed — and 45.47 vs the served 53.25 instructions per
+// tile (-14.6%), 1.71x the served instructions per launch (half the launches per tile).
+// Throughput is NOT claimed: the GPU ABBA leg is gated. Default (unset) keeps the served (1,2)
+// tile and the served grid exactly. Shapes with w.n % 32 != 0 fall back to (1,2).
+int wmma_mf() {
+    static const int mf = [] {
+        const char* value = std::getenv("NINFER_T2_A8_MF");
+        return value != nullptr && std::string(value) == "2" ? 2 : 1;
+    }();
+    return mf;
+}
 #endif
 
 std::int32_t tile_columns(std::int32_t tokens) {
@@ -358,11 +374,9 @@ void tile_gemm(const T2A8Activations& x, const Weight& w, Epilogue epilogue, cud
     const dim3 grid = rows_fast ? dim3(row_blocks, column_blocks) : dim3(column_blocks, row_blocks);
 #if defined(__HIPCC__)
     if (prefill_wmma_native()) {
-        // One-warp tile (16 rows x 32 cols, cal23's fastest family): its own grid.
+        // One-warp tile, 16*MF rows x 32 cols (cal23's fastest family): its own grid.
         constexpr int kTileColumns = 32;
-        constexpr int kTileRows    = 16;
         const unsigned wcolumn_blocks = static_cast<unsigned>(columns) / kTileColumns;
-        const unsigned wrow_blocks    = static_cast<unsigned>(w.n) / kTileRows;
         const int cs = wmma_colsplit();
         if (cs > 0) {
             // Column-split tile (2,1): a 64-thread block covers 16*MF = 32 rows, so the grid
@@ -385,19 +399,32 @@ void tile_gemm(const T2A8Activations& x, const Weight& w, Epilogue epilogue, cud
                 return;
             }
         }
+        // NINFER_T2_A8_MF=2 switches to the (2,2) tile: 16*MF = 32 rows per block, so the tile
+        // stride and every grid below recompute from tile_rows. The panel coverage law
+        // rows % (16*MF*Panel) == 0 becomes w.n % (32*32) == 0 for MF=2; shapes that miss the
+        // 32-row law keep the served (1,2) geometry. rows_fast (NINFER_T2_A8_RASTER=rows) is the
+        // y-fastest raster and works in both shapes through the Panel = 0 kernel path.
+        const int mf = wmma_mf() == 2 && w.n % 32 == 0 ? 2 : 1;
+        const unsigned wrow_blocks = static_cast<unsigned>(w.n) / (16u * static_cast<unsigned>(mf));
         const bool panel = wmma_panel() == 32 && wrow_blocks % 32u == 0u;
         const dim3 wgrid = panel   ? dim3(32u, wcolumn_blocks, wrow_blocks / 32u)
                        : rows_fast ? dim3(wrow_blocks, wcolumn_blocks)
                                    : dim3(wcolumn_blocks, wrow_blocks);
-        const auto launch = [&]<int P>() {
-            t2_prefill_wmma1_kernel<1, 2, P, Epilogue><<<wgrid, 32, 0, stream>>>(
+        const auto launch = [&]<int MF, int P>() {
+            t2_prefill_wmma1_kernel<MF, 2, P, Epilogue><<<wgrid, 32, 0, stream>>>(
                 static_cast<const std::uint8_t*>(w.qdata), static_cast<const __half*>(w.scales),
                 x.codes, x.scales, kCols, columns, x.tokens, rows_fast, epilogue);
         };
-        if (panel) {
-            launch.template operator()<32>();
+        if (mf == 2) {
+            if (panel) {
+                launch.template operator()<2, 32>();
+            } else {
+                launch.template operator()<2, 0>();
+            }
+        } else if (panel) {
+            launch.template operator()<1, 32>();
         } else {
-            launch.template operator()<0>();
+            launch.template operator()<1, 0>();
         }
         CUDA_CHECK(cudaGetLastError());
         return;
