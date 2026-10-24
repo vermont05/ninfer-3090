@@ -5498,3 +5498,65 @@ measured while the control legs ran at *higher* card-busy samples than the candi
 before-request vs 18 %). The verdict in §36 is unchanged in substance — **no promotion, arm
 unfavourable** — but it now rests on one surviving candidate leg plus one self-inflicted gap, so the
 quiet-card four-leg re-run stays owed before the −51 % number is quoted as the arm's measurement.
+
+## §37 — The `(2,2)` **panel** arm is **decisively −52 %**: 97.5 / 97.6 t/s vs 204.0 / 204.1, reproduced to
+> ## 0.1 % on a quiet card while the control legs ran on a contended one. Arm **rejected** for the panel raster.
+
+Four complete legs, `abba-mf2.sh mf2panel2 128 30` with `CAND_ENV="NINFER_T2_A8_MF=2"`, one flock hold
+02:08–02:14, same binary both arms (`58efa02ba2`, served `7042f064` tree), temperature 0, 1024-word
+lighthouse prompt, 128 max tokens, 30 s settle per leg, busy% sampled at settle / before start / before request.
+
+| leg | arm | prefill | TTFT | decode | sha1 | busy before request |
+|-----|-----|---------|------|--------|------|---------------------|
+| base1 | served `<1,2,32>` | 204.0 t/s | 20.7 s | 12.9 | `77f1779eb831` | 97 % |
+| cand1 | `MF=2` panel `<2,2,32>` | **97.5 t/s** | 43.0 s | 13.0 | `77f1779eb831` | **0 %** |
+| cand2 | `MF=2` panel `<2,2,32>` | **97.6 t/s** | 43.0 s | 13.0 | `77f1779eb831` | **0 %** |
+| base2 | served `<1,2,32>` | 204.1 t/s | 20.7 s | 12.9 | `77f1779eb831` | 89 % |
+
+**Findings.**
+1. **−52.2 %** (candidate mean 97.55 vs control mean 204.05), and it is *reproducible*: the two
+   candidate legs sit 0.1 % apart, the two control legs 0.05 % apart, TTFT is 43.0 s twice against
+   20.7 s twice. The §36 preliminary leg (99.9 t/s) reproduced. §36's "one surviving leg plus one
+   self-inflicted gap" caveat is now discharged — this is a four-leg measurement, not a preliminary.
+2. **Contention is excluded as the cause, and it cuts against the candidate**: the candidate legs were
+   measured with the card at **0 % busy before the request**, the control legs at 89 % and 97 % busy,
+   and the controls still ran 2.09× faster. Contention inflates TTFT — it did so here, on the legs that
+   *won*. Nothing about these samples lets the candidate's loss be blamed on the neighbour's run.
+3. **Register pressure is excluded by measurement, not by argument.** Metadata for the served TU after
+   the edit (`/home/vermont/tmp/t2diet/cal74.meta.txt`, `readelf -n`):
+
+   | instantiation | VGPR | VGPR spills | private | LDS/block |
+   |---|---|---|---|---|
+   | `<2,2,32>` panel candidate | **120** | 0 | 0 B | 0 |
+   | `<2,2,0>` y-fastest candidate | 120 | 0 | 0 B | 0 |
+   | `<1,2,32>` **served** | 123 | 8 | 36 B | 0 |
+   | `<1,2,0>` served non-panel fallback | 123 | 8 | 36 B | **32 000 B** |
+
+   The `MF=2` forms are the leanest kernels in the served TU — zero spills, zero scratch, none of the
+   served 36 B private traffic — and the panel form is the slowest at 300-word-scale service. A kernel
+   with no spills, no private memory and 3 fewer VGPRs than served runs at half speed on the served
+   shape. Spill/occupancy stories are dead for this arm.
+4. **Mechanism (hypothesis, unmeasured):** panel coverage is `16·MF·Panel` rows per block, so `MF=2` at
+   `Panel=32` covers 1024 rows per block against served 512, halving blocks per launch (served gate_up:
+   2176 → 1088 blocks; 32 CUs, so 68 → 34 blocks per CU). Total tiles and total bytes are unchanged, so
+   this is a *distribution* effect, not a traffic effect. §35 already measured launch halving as inert
+   for the y-fastest raster; the panel form's loss is ~2× at the same tile, which the halving alone does
+   not obviously account for. The panel loop's per-block row stream (32 tiles of 32 rows, sequential in
+   `y`) is the suspect. Not asserted as an explanation.
+5. **Both `MF=2` arms are now measured**, closing the tile family: `(2,2)` under y-fastest = parity
+   (§35, −0.35 %), `(2,2)` under the served panel raster = **−52 %** (§37). A 32×32 one-warp tile with
+   14.6 % fewer instructions per tile (§34) does not convert to served speed in either raster: once
+   inert, once sharply negative. The knob stays in code (`02fb4d31`) **default off**, served geometry
+   byte-identical, and the panel `MF=2` route is **not** promoted — it is rejected for the served
+   operating point.
+6. **Side measurement worth its own leg:** the served non-panel fallback `<1,2,0>` carries **32 KB LDS
+   per block** at 123 VGPR, against 0 LDS for the panel forms. That is an occupancy cap (RDNA3 LDS per
+   SIMD) on shapes the panel law cannot take — `w.n/32 % 32 != 0`, e.g. n = 7168 (`224 % 32 = 7`). Cost
+   unmeasured; queued as a leg, not claimed here.
+
+**Next legs (queued, gated):** drop the panel `MF=2` arm from the GPU queue (measured, rejected).
+Run the `ninfer_linear_t2_a8_test` qualification battery (`qual-mf2.sh`, three env legs, relinked
+runner) to confirm correctness of the committed knob on the served shapes — running as this section
+is written. Then the 32 KB LDS fallback question (leg 6). 300 t/s still needs a lever that moves
+fewer bytes, i.e. 4-bit activations (`iu4`) and the gate_up integer-activation route — both
+**user-gated**, nothing claimed.
