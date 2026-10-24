@@ -7,6 +7,36 @@
 
 namespace ninfer::ops::detail {
 
+#if defined(__HIPCC__)
+// w32 wmma fragments, spelled the way __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32 takes them
+// (16 x bf16 = 32 B per lane for A and B, 8 x f32 = 32 B per lane for C). The layouts, proven by
+// the QK site below, which runs served on gfx1102 and produces coherent text:
+//   A: 1 M row (lane&15) x 16 contiguous contraction values
+//   B: 1 N row (lane<16 ? lane/2 : 8+(lane-17)/2) x 16 contiguous contraction values
+//   C: 8 contiguous N at row (lane&7) + 8*(lane>>4), column chunk 8*((lane>>3)&1)
+using Bf16WmmaAB = short __attribute__((vector_size(32)));
+using Bf16WmmaC  = float __attribute__((vector_size(32)));
+#endif
+
+// NINFER_BF16_PV_NATIVE=1 swaps the prefill PV region to native w32 wmma: scores stay in the
+// C-fragment layout (no QK epilogue shuffle), P reaches the A fragment through 8 source-lane
+// gathers per contraction group, and V is staged transposed so a B fragment is two LDS128 reads.
+// Off by default -- the served build keeps the PTX ldmatrix/mma.sync route and stays identical.
+// Qualification is compile-only first (register/permute census); the prototype is written for the
+// served schedule geometry only and is guarded by kNativePV.
+//
+// Value 2 is the register-disciplined schedule of the same route: contraction group outer, output
+// tile inner, inner loop not unrolled. Measured reason (compile-only census, 2026-10-23): value 1
+// (output tile outer, fully unrolled) put 1,060-1,080 VGPR spills and 2,472-2,520 B private into a
+// kernel that runs 19-20 spills / 608 B today -- the 128-float accumulator plus both A fragments
+// plus 64 independent hoisted LDS128 reads do not fit the 256-VGPR / 4-warp budget.
+// Value 2 is a census hypothesis, not a validated schedule.
+#if defined(NINFER_BF16_PV_NATIVE) && defined(__HIPCC__)
+#define NINFER_BF16_PV_NATIVE_ON NINFER_BF16_PV_NATIVE
+#else
+#define NINFER_BF16_PV_NATIVE_ON 0
+#endif
+
 // Online attention, one CTA per (query tile, query head), with
 // bottom-right causal alignment (query row i sees keys [0, base_pos + i]).
 template <typename Geometry, class Schedule, typename Metadata>
@@ -25,6 +55,14 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     constexpr int PVNt          = D / 8;                // 32 PV output n-tiles
     constexpr int PVKs          = Bc / 16;              // 4  PV contraction steps over keys
     constexpr unsigned FullMask = 0xffffffffu;
+    // Native-wmma PV geometry: D/16 16x16 output tiles, Bc/16 key contraction groups.
+    constexpr int CTiles   = D / 16;
+    constexpr int NT16     = Bc / 16;
+    constexpr bool kNativePV = (NINFER_BF16_PV_NATIVE_ON != 0) && (Schedule::kQueryRows == 64) &&
+                               (Schedule::kKeyRows == 32) && (D == 256);
+    // Native PV schedule selector: false = value 1 (output tile outer, fully unrolled),
+    // true = value 2 (contraction group outer, inner loop not unrolled). See the census note above.
+    constexpr bool kNativeSerial = (NINFER_BF16_PV_NATIVE_ON >= 2);
 
     static_assert(Br == Schedule::kWarps * 16);
     static_assert(bf16_kv_tiled_shared_bytes<Geometry, Schedule> <= 99 * 1024);
@@ -117,6 +155,13 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
 #pragma unroll
         for (int i = 0; i < 4; ++i) { acc[n][i] = 0.0f; }
     }
+#if defined(__HIPCC__)
+    // Native path: the same O tile in wmma C layout (CTiles x 8 floats per lane -- the same
+    // 128-float per-lane footprint acc[PVNt][4] already occupies).
+    Bf16WmmaC acc16[CTiles];
+#pragma unroll
+    for (int n = 0; n < CTiles; ++n) { acc16[n] = Bf16WmmaC{}; }
+#endif
     Bf16KvSoftmaxRow state0, state1;
 
     const int tile_rows     = min(Br, tokens - q0);
@@ -145,8 +190,16 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
 
         // Overlap V(kb) load against the QK MMA below. V is pure BF16 in the cache
         // (this fork's KV-plane typing), not the mixed-precision FP16 V upstream ships.
-        bf16_kv_stage_tile<Geometry, Schedule>(v_s, cache_v, kv_head, k0, max_query_abs,
-                                               physical_page, tid);
+        // Native PV needs V transposed ([D][Bc]: one row per head dim, keys contiguous) so a
+        // B fragment is two LDS128 reads with no transpose; cp.async cannot write that layout,
+        // so the layout swap moves work from the ldmatrix.trans side to the staging stores.
+        if constexpr (kNativePV) {
+            bf16_kv_stage_vt<Geometry, Schedule>(v_s, cache_v, kv_head, k0, max_query_abs,
+                                                 physical_page, tid);
+        } else {
+            bf16_kv_stage_tile<Geometry, Schedule>(v_s, cache_v, kv_head, k0, max_query_abs,
+                                                   physical_page, tid);
+        }
         ninfer::ops::cp_commit();
 
         // S = Q Kᵀ for this warp's 16 rows over all Bc keys, in registers.
@@ -159,12 +212,25 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
             score[nt][0] = score[nt][1] = score[nt][2] = score[nt][3] = 0.0f;
         }
 #if defined(__HIPCC__)
+        // Native path keeps S in the wmma C-fragment layout (NT16 tiles x 8 floats per lane) at
+        // tile scope, so the causal mask, the row max, the row sum and the P repack below all
+        // read scores where the tensor core left them instead of bouncing every fragment through
+        // the score registers. Declared unconditionally (a constexpr-conditional declaration
+        // would not outlive this scope); with the macro off it is never written and dies dead.
+        Bf16WmmaC cd[NT16];
+        if constexpr (kNativePV) {
+#pragma unroll
+            for (int t = 0; t < NT16; ++t) { cd[t] = Bf16WmmaC{}; }
+        }
+#endif
+#if defined(__HIPCC__)
         if constexpr (Schedule::kQueryRows == 64) {
         using Bf16Fragment = short __attribute__((vector_size(32)));
         using FloatFragment = float __attribute__((vector_size(32)));
 #pragma unroll
         for (int nt16 = 0; nt16 < Bc / 16; ++nt16) {
             FloatFragment dots{};
+            if constexpr (kNativePV) { dots = cd[nt16]; }
             const int key_row = nt16 * 16 + (lane < 16 ? lane / 2 : 8 + (lane - 17) / 2);
             const int query_row = warp_row0 + (lane & 15);
 #pragma unroll
@@ -178,6 +244,9 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
                 qp[1] = *reinterpret_cast<const int4*>(&q_s[query_row * D + causal_swizzle(query_row, kk * 16 + 8)]);
                 dots = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(keys, query, dots);
             }
+            if constexpr (kNativePV) {
+                cd[nt16] = dots; // scores stay in the C-fragment layout; no redistribution
+            } else {
             float rows0[8], rows1[8], rows2[8], rows3[8];
 #pragma unroll
             for (int e = 0; e < 8; ++e) {
@@ -191,6 +260,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
             score[2 * nt16][2] = rows1[j]; score[2 * nt16][3] = rows1[j + 1];
             score[2 * nt16 + 1][0] = rows2[j]; score[2 * nt16 + 1][1] = rows2[j + 1];
             score[2 * nt16 + 1][2] = rows3[j]; score[2 * nt16 + 1][3] = rows3[j + 1];
+            }
         }
 } else
 #endif
@@ -244,6 +314,132 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
             ninfer::ops::cp_commit();
         }
 
+#if defined(__HIPCC__)
+        if constexpr (kNativePV) {
+            // ---- native w32 wmma route: mask, softmax, P repack and PV in fragment layouts ----
+            // C layout: lane owns row crow = warp_row0 + (lane&7) + 8*(lane>>4) and keys
+            // t*16 + 8*((lane>>3)&1) + 0..7. A row's 16 keys live in exactly two lanes (chunk 0
+            // and its chunk-1 partner at lane^8), so the causal mask, the tile max and the tile
+            // row-sum all reduce over that single bit. Rows 0..7 of the warp's 16 live in lanes
+            // 0..15 and rows 8..15 in lanes 16..31 -- the split state0/state1 already carry.
+            const int crow  = warp_row0 + (lane & 7) + 8 * (lane >> 4);
+            const int qrowc = q0 + crow;
+            const int qabsc = (qrowc < tokens) ? (base_pos + qrowc) : -1;
+            const int ckey0 = 8 * ((lane >> 3) & 1);
+            Bf16KvSoftmaxRow& st = (lane < 16) ? state0 : state1;
+
+            // block row-max on raw (unscaled) scores; scale stays folded into exp2 below
+            float bmh = -CUDART_INF_F;
+#pragma unroll
+            for (int t = 0; t < NT16; ++t) {
+#pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    if constexpr (!FullTile) {
+                        const int key = k0 + t * 16 + ckey0 + e;
+                        cd[t][e]      = (key <= qabsc) ? cd[t][e] : -CUDART_INF_F;
+                    }
+                    bmh = fmaxf(bmh, cd[t][e]);
+                }
+            }
+            bmh = fmaxf(bmh, __shfl_xor_sync(FullMask, bmh, 8));
+            const float alpha     = st.update<!FullTile>(bmh, scale_l2);
+            const float nmscaled  = st.scaled_maximum;
+
+            // P = exp2(S - m), packed pairwise. pw[t][i] = (key ckey0+2i, key ckey0+2i+1) of this
+            // lane's row. The per-lane tile sum covers 8 keys, reduced with the chunk partner.
+            unsigned pw[NT16][4];
+            float bl = 0.0f;
+#pragma unroll
+            for (int t = 0; t < NT16; ++t) {
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const float s0 = cd[t][2 * i];
+                    const float s1 = cd[t][2 * i + 1];
+                    const float p0 = FullTile ? exp2_approx(__fmaf_rn(s0, scale_l2, -nmscaled))
+                                              : ((s0 > -CUDART_INF_F)
+                                                     ? exp2_approx(__fmaf_rn(s0, scale_l2, -nmscaled))
+                                                     : 0.0f);
+                    const float p1 = FullTile ? exp2_approx(__fmaf_rn(s1, scale_l2, -nmscaled))
+                                              : ((s1 > -CUDART_INF_F)
+                                                     ? exp2_approx(__fmaf_rn(s1, scale_l2, -nmscaled))
+                                                     : 0.0f);
+                    pw[t][i] = pack_bf16x2(p0, p1);
+                    bl += p0 + p1;
+                }
+            }
+            bl += __shfl_xor_sync(FullMask, bl, 8);
+            // The 2-lane row sum is the full block row sum, so the native epilogue skips the
+            // deferred 4-lane finish() the score-register route needs.
+            st.accumulate(alpha, bl);
+
+            // A-fragment of P: lane l needs row (l&15) x 16 contiguous keys. That row's keys
+            // 0..7 sit in lane (l&7) + 16*((l>>3)&1) and its keys 8..15 in that lane's chunk
+            // partner at +8 -- 8 source-lane gathers per contraction group, no LDS round trip.
+            const unsigned srcA0 = static_cast<unsigned>((lane & 7) + 16 * ((lane >> 3) & 1));
+            const unsigned srcA1 = srcA0 + 8;
+            Bf16WmmaAB afrag[NT16];
+#pragma unroll
+            for (int t = 0; t < NT16; ++t) {
+                unsigned* aw = reinterpret_cast<unsigned*>(&afrag[t]);
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    aw[i]     = __shfl_sync(FullMask, pw[t][i], srcA0);
+                    aw[i + 4] = __shfl_sync(FullMask, pw[t][i], srcA1);
+                }
+            }
+
+#pragma unroll
+            for (int n = 0; n < CTiles; ++n) {
+#pragma unroll
+                for (int e = 0; e < 8; ++e) { acc16[n][e] *= alpha; }
+            }
+
+            // O += P V, contracting over the Bc keys. B-fragment: N row = dim, 16 contiguous
+            // keys, read straight out of the transposed tile as two LDS128 loads -- the
+            // ldmatrix.x4.trans translation chain (and its LDS write-back) is gone.
+            const int vrow = (lane < 16) ? (lane / 2) : (8 + (lane - 17) / 2);
+            if constexpr (kNativeSerial) {
+                // Value-2 schedule: contraction group outer, so only afrag[t] (16 floats) is live
+                // across the 16 output tiles, and no unroll on the inner loop, so the 32 LDS128
+                // reads of this group enter through a dependency chain with the WMMA that consumes
+                // them instead of 64 loads queued for the scheduler to hoist.
+#pragma unroll
+                for (int t = 0; t < NT16; ++t) {
+#pragma unroll (1)
+                    for (int n = 0; n < CTiles; ++n) {
+                        const int dim = n * 16 + vrow;
+                        Bf16WmmaAB bfrag;
+                        int4* bp   = reinterpret_cast<int4*>(&bfrag);
+                        bp[0]      = *reinterpret_cast<const int4*>(&v_s[bf16_vt_index<Bc>(dim,
+                                                                                          t * 16)]);
+                        bp[1]      = *reinterpret_cast<const int4*>(&v_s[bf16_vt_index<Bc>(dim,
+                                                                                            t * 16 + 8)]);
+                        acc16[n]   = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(bfrag, afrag[t],
+                                                                                acc16[n]);
+                    }
+                }
+            }
+            else {
+#pragma unroll
+                for (int n = 0; n < CTiles; ++n) {
+                    const int dim = n * 16 + vrow;
+#pragma unroll
+                    for (int t = 0; t < NT16; ++t) {
+                        Bf16WmmaAB bfrag;
+                        int4* bp   = reinterpret_cast<int4*>(&bfrag);
+                        bp[0]      = *reinterpret_cast<const int4*>(&v_s[bf16_vt_index<Bc>(dim,
+                                                                                           t * 16)]);
+                        bp[1]      = *reinterpret_cast<const int4*>(&v_s[bf16_vt_index<Bc>(dim,
+                                                                                           t * 16 + 8)]);
+                        acc16[n]   = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(bfrag, afrag[t],
+                                                                                acc16[n]);
+                    }
+                }
+            }
+        }
+        else
+#endif
+        {
         const int row0  = warp_row0 + gid;
         const int row1  = warp_row0 + gid + 8;
         const int qrow0 = q0 + row0;
@@ -373,26 +569,56 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
             mma_bf16(acc[n2 + 1][0], acc[n2 + 1][1], acc[n2 + 1][2], acc[n2 + 1][3], p_frag[k][0],
                      p_frag[k][1], p_frag[k][2], p_frag[k][3], vf[cur][2], vf[cur][3]);
         }
+        }
     };
     const int full_blocks = q0 + Br <= tokens ? min(n_block_max, (base_pos + q0 + 1) / Bc) : 0;
     for (int kb = 0; kb < full_blocks; ++kb) step.template operator()<true>(kb);
     for (int kb = full_blocks; kb < n_block_max; ++kb) step.template operator()<false>(kb);
 
-    state0.finish();
-    state1.finish();
+    // The native route keeps the full block row sum in the owning lane pair, so the deferred
+    // allreduce the score-register layout needs is not performed (see the tile body).
+    if constexpr (!kNativePV) {
+        state0.finish();
+        state1.finish();
+    }
 
+#if defined(__HIPCC__)
+    if constexpr (kNativePV) {
+        // C-layout epilogue: lane owns output row crow and columns 16n + 8*((lane>>3)&1) + 0..7,
+        // i.e. 4 4B pairs per 16x16 output tile -- 64 stores per lane, the same store width the
+        // score-register epilogue uses.
+        const int crow  = warp_row0 + (lane & 7) + 8 * (lane >> 4);
+        const int qrowc = q0 + crow;
+        const int ccol  = 8 * ((lane >> 3) & 1);
+        const Bf16KvSoftmaxRow& st = (lane < 16) ? state0 : state1;
+        if (qrowc < tokens) {
 #pragma unroll
-    for (int n = 0; n < PVNt; ++n) {
-        const int d0    = n * 8 + 2 * lid;
-        const int qrow0 = q0 + warp_row0 + gid;
-        const int qrow1 = q0 + warp_row0 + gid + 8;
-        if (qrow0 < tokens) {
-            bf16_kv_store_pair<Geometry, false>({}, out, q_head, qrow0, d0, width, 0, acc[n][0],
-                                                acc[n][1], state0.scaled_maximum, state0.sum);
+            for (int n = 0; n < CTiles; ++n) {
+#pragma unroll
+                for (int p = 0; p < 4; ++p) {
+                    bf16_kv_store_pair<Geometry, false>(
+                        {}, out, q_head, qrowc, n * 16 + ccol + 2 * p, width, 0, acc16[n][2 * p],
+                        acc16[n][2 * p + 1], st.scaled_maximum, st.sum);
+                }
+            }
         }
-        if (qrow1 < tokens) {
-            bf16_kv_store_pair<Geometry, false>({}, out, q_head, qrow1, d0, width, 0, acc[n][2],
-                                                acc[n][3], state1.scaled_maximum, state1.sum);
+    }
+    else
+#endif
+    {
+#pragma unroll
+        for (int n = 0; n < PVNt; ++n) {
+            const int d0    = n * 8 + 2 * lid;
+            const int qrow0 = q0 + warp_row0 + gid;
+            const int qrow1 = q0 + warp_row0 + gid + 8;
+            if (qrow0 < tokens) {
+                bf16_kv_store_pair<Geometry, false>({}, out, q_head, qrow0, d0, width, 0, acc[n][0],
+                                                    acc[n][1], state0.scaled_maximum, state0.sum);
+            }
+            if (qrow1 < tokens) {
+                bf16_kv_store_pair<Geometry, false>({}, out, q_head, qrow1, d0, width, 0, acc[n][2],
+                                                    acc[n][3], state1.scaled_maximum, state1.sum);
+            }
         }
     }
     causal_zero_rows<Geometry>(out, q_head, tokens, min(q0 + Br, width), tid, Threads);
