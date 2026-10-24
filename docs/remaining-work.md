@@ -5969,3 +5969,30 @@ context rather than query width); the attention route qualification already queu
 `tile_io.cuh` / `tiled_mma.cuh` headers. Priority ordering follows the measurement: the full-attention
 mixer is now the largest measured bucket at 46.8 %, above the linear mixer (16.8 %) and the MLPs
 (36.4 % combined).
+
+### §43 addendum: the tail split, and the precedent this shape already has
+
+§43's 5-token chunk is not a new species. "The sub-64-token dead band" (lines 163-186 above, measured
+2026-10-22) recorded chunks of `T in [17,63]` hitting `Route::None` and paying ~5 s each: boot 51 tok
+5122 ms, tail 34 tok 5012 ms, against 5947 ms for a 1024-token chunk, and it shipped `kT2A8MinTokens`
+64 -> 17 with the note "the request tail recurs on every prompt whose length mod 1024 < 64 - and one
+5 s tail was ~41% of the W=1024 request's old 12 s TTFT". Two things follow for the P1 request.
+
+**(a) The tail's shape is the dead band's shape.** This request's tail is `4215 mod 1024 = 119` tokens,
+and the chunker emits it as `112 + 5 + 2` - two chunks (5 and 2) below the 17-token tile minimum, i.e.
+exactly the band that the 2026-10-22 change fixed at its lower edge. In P1 the tail costs 10241.4 ms
+(112 chunk 1050.8 + 5 chunk 9773.1 + 2 chunk 468.3) against a 112-chunk cost of 1050.8 ms. Merging the
+tail into one call would give roughly `1050.8 x 119/112 = 1115 ms` for it, so the tail's 10.24 s becomes
+~1.1 s: TTFT 33.0 s -> ~23.9 s = **~176 tok/s** from 127.8. That is **arithmetic, not a measurement** -
+it assumes a 119-token chunk behaves like the 112-token one - and it is the cheapest candidate in this
+record: it changes chunk boundaries, not kernels.
+
+**(b) The linear-side band is closed, the attention side is not.** P1's warmup 51-token chunk costs
+409.9 ms total (`gdn_mixer 205.5`, `attn_mixer 27.7`), not the 5122 ms the 2026-10-22 table recorded,
+so the shipped `T >= 17` tile route did close the linear dead band. What P1 measures is the same *shape*
+on the attention side at a width the tile route never sees: at `width = 5` the grid in
+`bf16/template_launch.cuh` (documented at line 3120 above, `KVHeads * ceil(width * GroupSize /
+kQueryRows)`, `KVHeads = 4`, `kQueryRows = 64`) collapses to `4 x ceil(30/64) = 4` CTAs for the whole
+layer-call - four blocks on a 16-CU device, each looping the entire visible cache. A 4-CTA grid cannot
+fill the card and cannot hide the per-tile latency of ~66 context tiles, which is the direction the
+573.8 ms per layer points.
