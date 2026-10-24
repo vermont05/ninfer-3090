@@ -55,14 +55,71 @@ using int8v = int __attribute__((__vector_size__(32)));
 // One code word (sixteen 2-bit two's-complement codes, lowest k lowest) widened to the
 // 16-byte fragment register byte j = table byte for code j (table bytes 0, +1, -2, -1;
 // nibble < 4 selects a table byte, nibble >= 4 a zero byte).
+// Written as the hardware permute (V_PERM_B32) directly, not as __byte_perm. RDNA3's PRMT selector
+// is immediate-encoded, so __byte_perm with a data-derived selector cannot become PRMT; what LLVM
+// does instead is decided **per kernel**, and that is measured, not assumed: this kernel's byte_perm
+// form paid 32 ds_store_b32 + 128 ds_load_u8, the address adds feeding them and 111 s_waitcnt in a
+// body of 1365 instructions (census below), while the *same idiom* in t2_prefill_i8.cuh's
+// t2_prefill_decode - same kTable, same 0x33333333 masks, same translation unit - lowers to 16
+// v_perm_b32 with only 19 ds_load / 9 ds_store in t2_prefill_i8_kernel. So LDS staging is LLVM's
+// choice for this kernel, not what the idiom forces; asking for the permute explicitly is what
+// removes it. V_PERM_B32 takes its selector from a register, so the lookup is one VALU op per
+// fragment register.
+// The table is passed as both source operands: for selectors 0..3 the selected byte is a table byte
+// whichever operand the ISA treats as the low half, so the result does not depend on operand order.
+// Selector layout: V_PERM_B32 consumes ONE SELECTOR BYTE per output byte (PRMT consumes one nibble),
+// so each code has to sit alone in its byte lane before the permute, and the selector byte must stay
+// in 0..3. The nibble-mask form (`word & 0x0F0F0F0F`) puts nibble j - code 2j plus 4 * code 2j+1 -
+// into byte j, which packs values 8..15; measured exhaustively over all 2^32 code words, 4253024256
+// of them mismatch the shipped widening under the ISA's strictest reading (index = selector_byte &
+// 0x07, force 0 when selector_byte & 0xF8). The splay below masks each code pair to its own byte
+// lane's low two bits, so every selector byte is a code value: bits 2..7 clear, index = code under
+// both the 0x07 and 0x0F index readings, no forced zero under either the 0xF0 or the 0xF8 reading,
+// and with the table in both source operands the result cannot depend on which operand the ISA
+// treats as the low half. Proven exhaustively (proof-splay2.c, TOTAL mismatches = 0 over
+// 4294967296 words x 4 fragment registers x 4 readings) under all four readings at once.
+//
+// What LLVM actually emits for spread4 (gfx1102, -O3): each shl+and term lowers to a shift plus a
+// mask, and the last term folds the mask into the merge as v_and_or_b32 - v_bfm is NOT used, contrary
+// to the first guess when this was written.
+//
+// Census of the served kernel body (t2_prefill_wmma1_kernel<1,2,Panel=32,SplitStoreEpilogue>), shipped
+// form -> this form, counted by ONE parser over the body terminated at its .Lfunc_end label
+// (/home/vermont/tmp/t2-ab/census-splay.py -> census-base.txt / census-cand.txt):
+//   instructions        1365 -> 1034   (-331, -24.3%)
+//   ds_load              128 -> 0      ds_store   32 -> 0     (all 160 DS ops gone)
+//   s_waitcnt            111 -> 16     v_add      209 -> 81   (the LDS address math goes with them)
+//   v_bfe                130 -> 40     v_perm       0 -> 32
+//   v_and                  9 -> 104    v_lshl 123 -> 75   v_lshr 32 -> 72
+//   v_wmma 16, global_load 24, global_store 16 - unchanged; VGPR 128 -> 123, sgpr 43,
+//   private segment 36 B, scratch load/store 2+2 - no new spills.
+// v_perm is 32, not the 64 a site count predicts (16 v_wmma sites x 4 B-fragment registers): LLVM
+// common-subexpressions repeated permutes across the K-steps. That is the measured count; the
+// mechanism is inferred. The five sibling instantiations in this TU move the same way (1301 -> 970,
+// 1301 -> 969, 1385 -> 1051, 1385 -> 1052, 1365 -> 1035; DS -> 0 in every one).
+// An earlier version of this comment quoted 2056 -> 1325 body lines with 256/64 DS ops and 64 perms.
+// That came from an ad-hoc diff script whose region started outside the kernel (its DS counts were
+// exactly 2x the verified ones); it is recorded here only as a warning: a census parser must
+// terminate at .Lfunc_end and must not anchor on a bare label match, because GCN labels carry a
+// trailing " ; @mangled-name", and must let instruction suffixes match (a \bv_perm\b regex matches
+// nothing at all - the instruction is v_perm_b32).
+//
+// Served-route qualification (measured, 4-leg ABBA B,C,C,B in one flock hold, 1024-token lighthouse
+// prompt, temperature 0, 128 max tokens, tag perm2, 21:43-21:47): prefill 178.1 / 175.2 tok/s shipped
+// vs 203.4 / 202.5 tok/s with this widening - mean 176.65 -> 202.95, +14.9%, with base-leg spread
+// 2.9 tok/s. Generated text is identical on all four legs (sha1 77f1779eb831, 574 chars, 93 words /
+// 59 distinct, max 8-gram repeat 1), decode 13.0 tok/s both arms. Details: docs/remaining-work.md
+// section 15b.
+__device__ __forceinline__ unsigned spread4(unsigned w) {
+    return (w & 0x00000003u) | ((w << 4) & 0x00000300u) | ((w << 8) & 0x00030000u) | ((w << 12) & 0x03000000u);
+}
+
 __device__ __forceinline__ int4v wmma_code_frag(unsigned word) {
-    constexpr unsigned kTable = 0xFFFE0100u;
-    const unsigned even       = word & 0x33333333u;
-    const unsigned odd        = (word >> 2) & 0x33333333u;
-    const int a                 = static_cast<int>(__byte_perm(kTable, 0u, even));
-    const int b                 = static_cast<int>(__byte_perm(kTable, 0u, odd));
-    const int c                 = static_cast<int>(__byte_perm(kTable, 0u, even >> 16));
-    const int d                 = static_cast<int>(__byte_perm(kTable, 0u, odd >> 16));
+    constexpr unsigned kTable = 0xFFFE0100u; // 0, +1, -2, -1
+    const int a                 = static_cast<int>(__builtin_amdgcn_perm(kTable, kTable, spread4(word)));
+    const int b                 = static_cast<int>(__builtin_amdgcn_perm(kTable, kTable, spread4(word >> 2)));
+    const int c                 = static_cast<int>(__builtin_amdgcn_perm(kTable, kTable, spread4(word >> 16)));
+    const int d                 = static_cast<int>(__builtin_amdgcn_perm(kTable, kTable, spread4(word >> 18)));
     return {a, b, c, d};
 }
 
