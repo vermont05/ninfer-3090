@@ -6551,3 +6551,74 @@ What this buys, stated as the rules it sets for the legs that follow:
    uncertainty. That is a *third* independent reason the small-chunk anomaly lines failed to reproduce.
 4. Nothing here is a throughput claim about a route: it is the noise floor, and it is the bar the iu4
    leg has to clear in the model.
+
+## §48 - The iu4 perm-builder's selector-semantics gate is CLOSED: the hardware reads the source pair with **src1 as the low half**, and the builder is proved exhaustively under that measured reading. (one gated GPU probe, 8 words + 16 selectors; the exhaustive part is CPU)
+
+Why it was worth a card slot: 47.7 names iu4 as the only remaining lever toward 300 t/s, and
+`.qual/wmma/proof-iu4.c` - the exhaustive 2^32-word CPU proof of the iu4 weight-fragment builder
+(`lo | (hi<<4)` with `lo/hi = PERM(Tlo,Thi, spread3(w >> {16j, 16j+2})) & 0x0F0F0F0F`) - ended with an
+explicit ship gate: *"the ONLY reading that breaks this builder is M4 (src0-only 4-byte table); cal76
+must show M1/M3, not M4, before shipping."* The builder indexes the table's **high half** (selector
+bytes 4..7), which the served i8 kernel never touches (it uses `perm(kTable, kTable, spread4(...))`:
+src0 = src1, selectors <= 3 - `src/ops/linear/t2/t2_prefill_wmma.cuh:119-122`), so no served evidence
+bore on it.
+
+**Probe.** `.qual/wmma/cal76.cu`, run by `.qual/wmma/run-cal76.sh`: 25 s sustained quiet (busy <= 3%,
+zero non-excluded openers of `/dev/dri/renderD129`) **before** taking `flock /tmp/ninfer-gpu.lock`; the
+whole probe (one 32-lane + two 16-lane kernels) inside **one** hold, acquired and released 08:57:51;
+completion proof = the run's DONE marker. `=== CAL76 DONE rc=0 log=/home/vermont/tmp/head-ab/
+cal76-085751.log 08:57:51 ===`, card QUIET in the same second, zero foreign openers. Copy on record:
+`.qual/wmma/cal76_run1.log`.
+
+`PERM(Tlo = 0x0F0E0100 = kF[0..3], Thi = 0x1F1E1110 = kF[4..7], sel byte = v)`, byte0 of the result:
+
+| sel v | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
+|-------|---|---|---|---|---|---|---|---|
+| measured byte0 | `10` | `11` | `1E` | `1F` | `00` | `01` | `0E` | `0F` |
+| source | Thi[0..3] | | | | Tlo[0..3] | | | |
+
+- **The pair is read with src1 as the LOW half**: index 0..3 -> src1's bytes, 4..7 -> src0's, i.e. the
+  8-byte window is `{src1, src0}`. This is model **M5**, added to `proof-iu4.c` as mode 5.
+- **M4 is excluded by direct observation**: M4 (src0-only 4-byte table) predicts **zero** at sel 4..7;
+  the hardware returned Tlo's real bytes `{00,01,0E,0F}`. M4 was the only reading that broke the
+  builder, and it is off the table.
+- The reading is M1/M3-shaped with the halves **swapped**. The swap is harmless *to this builder*: it
+  masks `& 0x0F0F0F0F` and `kF[0..3] & 0xF == kF[4..7] & 0xF == {0,1,E,F}` - both table halves carry
+  identical low nibbles, and the builder only ever needs low nibbles.
+- sel 8..15 returned `10101000` (8..12) and `101010FF` (13..15): out-of-pair byte reads, consistent
+  with what B4 already proved (selectors 8..15 index bytes the pair does not have). **No bearing**:
+  `spread3` emits 3-bit selector bytes, so every selector the builder can produce is in 0..7.
+
+**Exhaustive close (CPU, no card, no lock).** `proof-iu4.c` re-run with M5 over all 4,294,967,296
+words (`/home/vermont/git/ninfer-3090/.qual/wmma/proof-iu4-m5.log`, 16 threads, PASS): builder-vs-
+nibble-layout under M5 = **0** mismatches; builder(M5)-vs-INDEPENDENT-16-code-reference = **0**;
+M1/M2/M3 and the control remain 0; M4 stays 8,122,269,696 (recorded, excluded by measurement);
+refuted B4 stays 8,556,380,160 (expected nonzero). 43,046,721 = 3^16 legal ternary words, `10`
+covered too. So the builder is proved **on the semantics the hardware actually takes**, on every
+word, not on cal76's 8.
+
+**Two defects in my own probe, on record (fixed in `cal76.cu`, rebuilt as `cal76-new`; the device
+build/ref code is unchanged, so the verdict above does not depend on the fixes).**
+1. The expectation table assumed the src0-low pair, so the first run's headline line read
+   *"window-pair(M1/M3) 0/8 ; misses(M4-side) 8/8"* - an artifact of *my* expectation column, not a
+   builder failure. The probe now prints both columns (M1 src0-low, M5 src1-low) plus M4, and states
+   the decision rule: a reading is M4 iff sel 4..7 give zero.
+2. The 8 test words lived in a `__constant__` (device) array that the host `printf` read directly, so
+   every printed `w=` label was garbage (`w=00000000` on all eight rows). The build/ref *values* are
+   computed on the device and are valid - the block that answers the question, **builder vs
+   device-computed independent reference, `diffs = 0/8`, checksum gate nonzero (`00000002`)**, is
+   unaffected. The word list is now a host array copied in with `hipMemcpyToSymbol`, so host labels
+   and device inputs cannot drift.
+
+**Consequences.**
+- The iu4 fragment builder as written needs **no** compensation for the half-swap and no fragment
+  re-routing: the byte semantics it depends on are the measured ones. Nothing here changes the served
+  i8 route (src0 = src1 makes the pair halves identical; selectors <= 3).
+- The gate that 47.7 left open on the *arithmetic* is closed. What still does not exist is the
+  **production route**: `wmma_i32_16x16x16_iu4_w32` lives only in `.qual/wmma`, so shipping iu4 means
+  implementing a quantise-activations path in the served T2 kernel behind a knob, then an ABBA set at
+  the served point against the 1.32% bar (47.8), coherence included. That is the next unit of work,
+  and per the standing rule it ships only if the model measures it faster.
+- No GPU legs were queued by this section and nothing is shipped by it. The `(2,2)` tile is closed as
+  a measured loss (47.1) and the dirty `NINFER_T2_A8_SWIGLU` branch stays unmeasured - §44 forbids a
+  leg for it on this artifact, and a leg cannot exercise it.

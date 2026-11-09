@@ -140,6 +140,26 @@ __device__ __forceinline__ int4v wmma_code_frag(unsigned word) {
 // at Panel=32/MF=1 the in-flight set is one 1024-row weight panel (1.31 MB at K=5120)
 // plus the hot 32-token activation block, ~1.47 MB inside the 2 MB L2. rows_fast is
 // unused in panel mode; geometry must satisfy rows % (16 * MF * Panel) == 0.
+//
+// Token-fast panel mode (Panel < 0, let BC = -Panel) is the same panelisation with the two
+// axes swapped, which is what the DRAM traffic model says the served raster is missing.
+// grid = (BC, RC, panels_y * column_blocks / BC) with panels_y = row_blocks / RC, and
+//   col0 = (x + (z / panels_y) * BC) * 16 * NF,   row0 = (y + (z % panels_y) * RC) * 16 * MF
+// so the fast axis walks BC *token* blocks inside one panel while y sweeps RC row tiles:
+// every block dispatched at the same z shares one RC-tile weight panel and streams it over
+// BC token blocks. Weight bytes are re-streamed column_blocks/BC times (not column_blocks
+// times) and the activation plane row_blocks/RC times, i.e. traffic
+//   w.n*K/4 * (column_blocks/BC) + T*K * (row_blocks/RC)
+// against the served raster's w.n*K/4 * column_blocks. At gate_up's 2176x5120x1024 (32
+// column blocks, 2176 row tiles) the served 1.43 GB -> BC=8/RC=34: 178 + 166 = 344 MB.
+// The in-flight set is BC*160 KB of activations + RC*20.5 KB of weight, so the pair must
+// fit the 2 MB L2 (BC=8,RC=34 -> 1.98 MB; BC=8,RC=17 -> 1.63 MB; BC=6,RC=32 -> 1.62 MB).
+// Coverage laws: BC | column_blocks and RC | row_blocks; z indexes
+// (col panel, row panel) = (z / panels_y, z % panels_y), so each tile is visited exactly
+// once. panels_y is recovered from gridDim.z * BC / column_blocks -- exact under the
+// coverage law, and it needs no new kernel argument. Zero register cost (two scalar
+// divisions per block, none per group); warp parallelism is untouched, which is the
+// failure mode the LDS-staged loader family (w1c/wlds/wcoop) hit.
 template <int MF, int NF, int Panel, class Epilogue>
 __global__ __launch_bounds__(32, 8) void t2_prefill_wmma1_kernel(
     const std::uint8_t* __restrict__ w_codes, const __half* __restrict__ w_scales,
@@ -150,12 +170,24 @@ __global__ __launch_bounds__(32, 8) void t2_prefill_wmma1_kernel(
     constexpr float kMagic = 12582912.0F; // 1.5 * 2^23
 
     const int lane   = static_cast<int>(threadIdx.x) & 31;
-    const int col0 = Panel > 0
-                         ? static_cast<int>(blockIdx.y) * (16 * NF)
-                         : static_cast<int>(rows_fast ? blockIdx.y : blockIdx.x) * (16 * NF);
-    const int row0 = Panel > 0
-                         ? (static_cast<int>(blockIdx.z) * Panel + static_cast<int>(blockIdx.x)) * (16 * MF)
-                         : static_cast<int>(rows_fast ? blockIdx.x : blockIdx.y) * (16 * MF);
+    // if constexpr (not a ternary) so the token-fast decode is discarded — not merely dead — in
+    // every other mode: a ternary leaves a % panels_y with panels_y = 0 in the discarded arm, which
+    // the backend warns about (-Wdivision-by-zero) in every served Panel >= 0 instantiation.
+    int col0;
+    int row0;
+    if constexpr (Panel > 0) {
+        col0 = static_cast<int>(blockIdx.y) * (16 * NF);
+        row0 = (static_cast<int>(blockIdx.z) * Panel + static_cast<int>(blockIdx.x)) * (16 * MF);
+    } else if constexpr (Panel < 0) {
+        // panels_y = gridDim.z / (column_blocks / BC), exact under the coverage law BC | column_blocks.
+        const int panels_y = static_cast<int>(gridDim.z) * (-Panel) * (16 * NF) / t_pad;
+        col0 = (static_cast<int>(blockIdx.x) + (static_cast<int>(blockIdx.z) / panels_y) * (-Panel)) * (16 * NF);
+        row0 = (static_cast<int>(blockIdx.y) + (static_cast<int>(blockIdx.z) % panels_y) *
+                                                static_cast<int>(gridDim.y)) * (16 * MF);
+    } else {
+        col0 = static_cast<int>(rows_fast ? blockIdx.y : blockIdx.x) * (16 * NF);
+        row0 = static_cast<int>(rows_fast ? blockIdx.x : blockIdx.y) * (16 * MF);
+    }
 
     const int colWin = lane >> 1; // Awin window column within the warp tile
     const int rowWin = lane & 15; // Bwin slot row within the warp tile

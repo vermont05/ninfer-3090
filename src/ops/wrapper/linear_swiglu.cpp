@@ -5,6 +5,7 @@
 #include "ninfer/ops/silu_mul.h"
 
 #include "ops/linear/fp8/fp8_format.h"
+#include "ops/linear/t2/t2_a8.h"
 #include "ops/linear/nvfp4/nvfp4_format.h"
 #include "ops/linear_swiglu/fp8/fp8_linear_swiglu_plan.h"
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.h"
@@ -16,10 +17,29 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
+#include <string>
 
 namespace ninfer::ops {
 namespace {
+
+// NINFER_T2_A8_SWIGLU=1 lets a T2 gate_up whose policy already admits the integer route take
+// t2_a8_project_split - quantise the activations once, one pass over the 34816-row parent writing
+// gate and up as two BF16 planes, then the same silu_mul - instead of the A16 rowsplit-MMA schedule
+// (docs/remaining-work.md §41: policy, shape and panel law are all already admissible; only this
+// call site closed the route). DEFAULT OFF: unset keeps the served route and numerics exactly.
+// Enabling it quantises activations to int8, so outputs are NOT bit-identical to A16 - it is a
+// measurement knob, and shipping the route is the user's decision (the model-level switch is
+// LoadOptions::prefill_a8).
+bool t2_swiglu_a8_split() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("NINFER_T2_A8_SWIGLU");
+        return value != nullptr && std::string(value) == "1";
+    }();
+    return enabled;
+}
 
 bool aligned_to(const void* pointer, std::uintptr_t alignment) {
     return pointer != nullptr && (reinterpret_cast<std::uintptr_t>(pointer) & (alignment - 1)) == 0;
@@ -55,7 +75,14 @@ std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gat
         (void)linear_workspace_capacity_bytes(qtype, gate_up_rows, input_rows,
                                               LinearPolicy::A16Only, min_tokens, max_tokens);
         WorkspaceLayoutBuilder layout;
+        // The A16 route's (gate_up_rows, T) plane and the split route's gate + up planes are the same
+        // byte total (34816 = 2 x 17408), so the plane is reserved once for both.
         (void)layout.alloc(DType::BF16, {gate_up_rows, max_tokens});
+        // The split route additionally stages one quantised activation pair per call; sized at
+        // max_tokens, the same convention as the plane above.
+        if (detail::t2_a8_admits(policy) && detail::t2_a8_shape_supported(gate_up_rows, input_rows)) {
+            (void)detail::t2_a8_layout_activations(layout, input_rows, max_tokens);
+        }
         return layout.peak_bytes(1);
     }
     if (qtype == QType::Q8_G32_FP16) {
@@ -166,9 +193,33 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
     }
 
     if (t2_weight) {
+        auto scope = ws.scope();
+        // Opt-in integer route (NINFER_T2_A8_SWIGLU=1, and only where the call's own policy admits
+        // it): quantise x once, then t2_a8_project_split streams the 34816-row parent in a single
+        // pass, writing rows [0, 17408) into `gate` and the rest into `up` -- so the (gate, up)
+        // split costs no extra bytes over the A16 plane and SwiGLU stays the same elementwise pass.
+        // At prefill widths this is the tile route, i.e. the WMMA panel kernel the served point
+        // already runs on the projections and mlp_down. Falls through to A16 below for every other
+        // width, policy, and for the default (knob unset).
+        if (t2_swiglu_a8_split() && detail::t2_a8_admits(policy) &&
+            detail::t2_a8_supported(gate_up_weight, t) && out.ne[0] * 2 == gate_up_weight.n) {
+            // Once per process: the leg's own proof that the route was taken (a leg that silently
+            // fell through to A16 measures nothing).
+            static const bool logged = [t, policy] {
+                std::fprintf(stderr, "[swiglu-a8] split route taken: T=%d policy=%d\n", t,
+                             static_cast<int>(policy));
+                return true;
+            }();
+            (void)logged;
+            Tensor gate = ws.alloc(DType::BF16, {out.ne[0], t});
+            Tensor up   = ws.alloc(DType::BF16, {out.ne[0], t});
+            const detail::T2A8Activations act = detail::t2_a8_quantize(x, ws, stream);
+            detail::t2_a8_project_split(act, gate_up_weight, gate, 0, out.ne[0], up, 0, stream);
+            silu_mul(gate, up, out, stream);
+            return;
+        }
         // Ternary rows project gate and up into one plane; SwiGLU is a separate elementwise pass
         // over its two halves. A16 by construction.
-        auto scope     = ws.scope();
         Tensor gate_up = ws.alloc(DType::BF16, {gate_up_weight.n, t});
         linear(x, gate_up_weight, gate_up, stream);
         const Tensor gate = gate_up.slice(0, 0, out.ne[0]);

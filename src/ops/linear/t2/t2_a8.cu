@@ -14,6 +14,7 @@
 #include "ops/linear/t2/t2_prefill_i8.cuh"
 #if defined(__HIPCC__)
 #include "ops/linear/t2/t2_prefill_wmma.cuh" // gfx1102 WMMA tile; the whole body is __HIPCC__-gated
+#include "ops/linear/t2/t2_prefill_wmma_iu4.cuh" // 4-bit-activation twin of that tile, knob-gated
 #endif
 #include "ops/linear/t2/t2_small_t_i8.cuh"
 
@@ -65,6 +66,19 @@ bool prefill_tile() {
     return enabled;
 }
 
+// NINFER_T2_A8_I8FLOOR=on floors the prefill producer's group scale at the binary16 minimum
+// subnormal when amax/127 rounds to zero, so a collapsing group keeps its shape instead of being
+// zeroed whole (see the FloorScale note on t2_prefill_i8_quantize_kernel). CPU-proven, costs one
+// compare per group, and it changes the shipped code plane on collapse-regime rows only — so it
+// ships on a served coherence A/B, not on the CPU proof. Both backends take the same producer.
+bool prefill_i8_floor() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("NINFER_T2_A8_I8FLOOR");
+        return value != nullptr && std::string(value) == "on";
+    }();
+    return enabled;
+}
+
 #if defined(__HIPCC__)
 // The hardware-WMMA prefill tile (t2_prefill_wmma.cuh) is the default: bit-identical
 // outputs to the mma.cuh emulation (cal19/cal23 batteries) at ~9x its standalone time
@@ -95,6 +109,50 @@ int wmma_panel() {
         return value != nullptr && std::string(value) == "0" ? 0 : 32;
     }();
     return panel;
+}
+
+// NINFER_T2_A8_WMMAPANEL_FAST=BC,RC requests the token-fast panel raster (Panel = -BC in
+// t2_prefill_wmma1_kernel and its iu4 twin; see the raster note in t2_prefill_wmma.cuh): the
+// panelisation with the axes swapped, so the fast axis walks BC token blocks while y sweeps RC
+// row tiles. cal41's G32 panel raster keeps the *token block* hot and streams the whole weight
+// once per token block -- 32 full weight passes (1.43 GB) on gate_up at T=1024, which is exactly
+// the 47 GB/s x 30.6 ms the probe measures, so the served panel only trims the token-block tail
+// of each pass (+6-8%). Swapping the axes re-streams the weight column_blocks/BC times and the
+// activation plane row_blocks/RC times: at BC=8, RC=34 that is 178 + 166 = 344 MB, 4.1x less
+// DRAM traffic than the served raster, with an in-flight set of 8*160 KB + 34*20.5 KB = 1.98 MB
+// of the 2 MB L2. It costs zero registers (two scalar divisions per block) and keeps full warp
+// parallelism, so it avoids the failure mode the LDS-staged loader family hit (w1c/wlds/wcoop:
+// +74% with a 320 B spill, +283-343%, +3.5-8.2% -- all lost parallelism, not reuse).
+//
+// BC is compile-time (the grid's x extent indexes a panel; the kernel decodes it from the Panel
+// template argument), RC is runtime (the grid's y extent), so RC is swept by the ABBA legs at no
+// code cost. BC must divide column_blocks and RC must divide row_blocks (w.n / 16*MF); shapes
+// that miss either law, a missing comma, a non-power-of-two BC, or BC > column_blocks keep the
+// served raster. Default off: the served G32 panel raster stays shipped until a served ABBA set
+// (bit-exact battery + t/s + coherence) says otherwise, per [[ab-measure-in-the-model]].
+struct PanelFast {
+    int bc;
+    int rc;
+};
+
+PanelFast wmma_panel_fast() {
+    static const PanelFast cfg = [] {
+        PanelFast out{0, 0};
+        const char* value = std::getenv("NINFER_T2_A8_WMMAPANEL_FAST");
+        if (value == nullptr) { return out; }
+        const std::string text(value);
+        const std::size_t comma = text.find(',');
+        if (comma == std::string::npos) { return out; }
+        try {
+            out.bc = std::stoi(text.substr(0, comma), nullptr, 10);
+            out.rc = std::stoi(text.substr(comma + 1), nullptr, 10);
+        } catch (...) {
+            return PanelFast{0, 0};
+        }
+        const bool bc_ok = out.bc == 2 || out.bc == 4 || out.bc == 8 || out.bc == 16 || out.bc == 32;
+        return bc_ok && out.rc > 0 ? out : PanelFast{0, 0};
+    }();
+    return cfg;
 }
 
 // NINFER_T2_A8_COLSPLIT=8|16|32 routes the WMMA prefill to the column-split tile
@@ -130,7 +188,52 @@ int wmma_mf() {
     }();
     return mf;
 }
+
+// NINFER_T2_A8_IU4=on routes the WMMA prefill to the 4-bit-activation twin of the served tile
+// (t2_prefill_wmma1_iu4_kernel in t2_prefill_wmma_iu4.cuh): the identical tile geometry, panel
+// raster, magic-number fold and epilogue, fed by a nibble plane and
+// __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32. What is measured about the bet:
+//   - issue rate (cal42): iu4 25.32/27.62/28.07 TMAC/s at NACC 2/8/16 vs iu8 14.18/14.49/14.91 --
+//     1.75x, from the instruction's issue rate, not from less work (an iu4 call consumes a 16-code
+//     k-window per lane exactly like iu8, so the tile keeps 8 s-steps per group and its instruction
+//     count is unchanged);
+//   - operand bytes: the codes plane halves (K/2 bytes per token, 8 B/lane per s-step against 16);
+//   - register census, scratch TU with a real epilogue store, gfx1102 -O3: (1,1) 64 VGPR against
+//     the served 82, (1,2) 103 against 123, (2,2) 138 against 120 -- the (2,2) twin sits above the
+//     128-VGPR granularity, so NINFER_T2_A8_MF=2 is expected to LOSE on this route;
+//   - quality cost (proof-iu4-act.log): rms-rel 0.0710 vs the i8 plane's 0.0040 at sigma=1
+//     (cos 0.997486 vs 0.999992), 0.283 vs 0.021 with one x30 outlier channel. 4-bit activations
+//     are lossy by construction.
+// So this is a PURE throughput bet, default off, and per A/B-measured-in-the-model it ships only on
+// a served ABBA set (with the output-sha/coherence check), never on the census above.
+// Needs the native WMMA route, k_cols % 128 == 0 and columns % 32 == 0 (every registered width and
+// tile_columns() satisfies both). NINFER_T2_A8_COLSPLIT wins over it: the twin has no column-split
+// variant, so with both set the i8 column-split route is taken.
+bool wmma_iu4() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("NINFER_T2_A8_IU4");
+        return value != nullptr && std::string(value) == "on";
+    }();
+    return enabled;
+}
+
+// The route is a process-wide contract: the producer, the plane sizing and the GEMM must all agree
+// on 4-bit codes, so every site asks the same question. prefill_tile() is part of it — with
+// NINFER_T2_A8_TILE=off the prefill never reaches a WMMA tile at all, so the codes plane stays i8.
+bool iu4_route() {
+    return wmma_iu4() && prefill_tile() && prefill_wmma_native() && wmma_colsplit() == 0;
+}
 #endif
+
+// Bytes of activation code plane a tile prefill needs: the full i8 plane, half of it on the iu4
+// route. Non-HIP backends have no iu4 kernel and always take the full plane.
+std::size_t tile_code_bytes(std::size_t columns, std::size_t input_rows) {
+#if defined(__HIPCC__)
+    return iu4_route() ? columns * input_rows / 2 : columns * input_rows;
+#else
+    return columns * input_rows;
+#endif
+}
 
 std::int32_t tile_columns(std::int32_t tokens) {
     constexpr std::int32_t kColumns = T2PrefillI8::kColumns;
@@ -407,15 +510,52 @@ void tile_gemm(const T2A8Activations& x, const Weight& w, Epilogue epilogue, cud
         const int mf = wmma_mf() == 2 && w.n % 32 == 0 ? 2 : 1;
         const unsigned wrow_blocks = static_cast<unsigned>(w.n) / (16u * static_cast<unsigned>(mf));
         const bool panel = wmma_panel() == 32 && wrow_blocks % 32u == 0u;
-        const dim3 wgrid = panel   ? dim3(32u, wcolumn_blocks, wrow_blocks / 32u)
-                       : rows_fast ? dim3(wrow_blocks, wcolumn_blocks)
-                                   : dim3(wcolumn_blocks, wrow_blocks);
+        // Token-fast panel raster (NINFER_T2_A8_WMMAPANEL_FAST=BC,RC) wins over the served panel
+        // when both apply; the tile count is unchanged (BC*RC*panels_y*column_blocks/BC =
+        // row_blocks*column_blocks), only the index decode differs.
+        const PanelFast fast = wmma_panel_fast();
+        const bool fast_ok = fast.bc > 0 && fast.rc > 0 &&
+                             wcolumn_blocks % static_cast<unsigned>(fast.bc) == 0u &&
+                             wrow_blocks % static_cast<unsigned>(fast.rc) == 0u;
+        const dim3 wgrid = fast_ok  ? dim3(static_cast<unsigned>(fast.bc), static_cast<unsigned>(fast.rc),
+                                           (wrow_blocks / static_cast<unsigned>(fast.rc)) *
+                                               (wcolumn_blocks / static_cast<unsigned>(fast.bc)))
+                       : panel      ? dim3(32u, wcolumn_blocks, wrow_blocks / 32u)
+                       : rows_fast  ? dim3(wrow_blocks, wcolumn_blocks)
+                                    : dim3(wcolumn_blocks, wrow_blocks);
+        // The iu4 twin takes the identical grid, tile and epilogue as the served tile: only the
+        // codes plane it reads (half the bytes) and the WMMA instruction differ, which is exactly
+        // the A/B the knob measures. NINFER_T2_A8_MF is honoured on both routes even though the
+        // (2,2) iu4 census (138 VGPR) says MF=2 should lose there — the census decides what to
+        // build, not the verdict, so the knobs stay independent and the served pair decides.
+        const bool iu4 = iu4_route();  // native && !colsplit already hold in this branch
         const auto launch = [&]<int MF, int P>() {
+            if (iu4) {
+                t2_prefill_wmma1_iu4_kernel<MF, 2, P, Epilogue><<<wgrid, 32, 0, stream>>>(
+                    static_cast<const std::uint8_t*>(w.qdata),
+                    static_cast<const __half*>(w.scales), x.codes, x.scales, kCols, columns,
+                    x.tokens, rows_fast, epilogue);
+                return;
+            }
             t2_prefill_wmma1_kernel<MF, 2, P, Epilogue><<<wgrid, 32, 0, stream>>>(
                 static_cast<const std::uint8_t*>(w.qdata), static_cast<const __half*>(w.scales),
                 x.codes, x.scales, kCols, columns, x.tokens, rows_fast, epilogue);
         };
-        if (mf == 2) {
+        // BC is a template argument (the kernel decodes the token panel from it), so each accepted
+        // value needs its own instantiation; RC is runtime (grid.y).
+        const auto fastlaunch = [&]<int MFV>() {
+            switch (fast.bc) {
+                case 2: launch.template operator()<MFV, -2>(); break;
+                case 4: launch.template operator()<MFV, -4>(); break;
+                case 8: launch.template operator()<MFV, -8>(); break;
+                case 16: launch.template operator()<MFV, -16>(); break;
+                default: launch.template operator()<MFV, -32>(); break;
+            }
+        };
+        if (fast_ok) {
+            if (mf == 2) { fastlaunch.template operator()<2>(); }
+            else { fastlaunch.template operator()<1>(); }
+        } else if (mf == 2) {
             if (panel) {
                 launch.template operator()<2, 32>();
             } else {
@@ -517,7 +657,8 @@ std::size_t t2_a8_activation_bytes(std::int32_t input_rows, std::int32_t max_tok
     std::size_t bytes = 0;
     if (max_tokens >= t2_a8_min_tokens() && prefill_tile()) {
         const std::size_t columns = static_cast<std::size_t>(tile_columns(max_tokens));
-        bytes = round(columns * static_cast<std::size_t>(input_rows)) +
+        // tile_code_bytes: the iu4 route's codes plane is half the size (nibbles, K/2 bytes/token).
+        bytes = round(tile_code_bytes(columns, static_cast<std::size_t>(input_rows))) +
                 round(columns * static_cast<std::size_t>(input_rows / T2PrefillI8::kGroupK) *
                       sizeof(__half));
     } else if (max_tokens >= t2_a8_min_tokens()) {
@@ -552,7 +693,10 @@ bool t2_a8_layout_activations(WorkspaceLayoutBuilder& layout, std::int32_t input
         taken == Route::SmallT ? tokens : tile ? tile_columns(tokens) : padded_tokens(tokens));
     const std::size_t scale_columns =
         taken == Route::SmallT ? static_cast<std::size_t>(kT2I8MaxColumns) : columns;
-    (void)layout.alloc_bytes(columns * static_cast<std::size_t>(input_rows));
+    // Must match t2_a8_quantize's allocation exactly, including the halved codes plane the iu4
+    // route takes on the tile path (tile_code_bytes covers both cases).
+    (void)layout.alloc_bytes(tile ? tile_code_bytes(columns, static_cast<std::size_t>(input_rows))
+                                  : columns * static_cast<std::size_t>(input_rows));
     (void)layout.alloc_bytes(scale_columns * groups * sizeof(__half));
     return true;
 }
@@ -586,17 +730,38 @@ T2A8Activations t2_a8_quantize(const Tensor& x, WorkspaceArena& workspace, cudaS
         using C                    = T2PrefillI8;
         const std::int32_t columns = tile_columns(tokens);
         const std::size_t count    = static_cast<std::size_t>(columns);
-        const DeviceSpan codes = workspace.alloc_bytes(count * static_cast<std::size_t>(input_rows));
+        const DeviceSpan codes =
+            workspace.alloc_bytes(tile_code_bytes(count, static_cast<std::size_t>(input_rows)));
         const DeviceSpan scales = workspace.alloc_bytes(
             count * static_cast<std::size_t>(input_rows / C::kGroupK) * sizeof(__half));
         auto* code_data  = reinterpret_cast<std::int8_t*>(codes.data);
         auto* scale_data = reinterpret_cast<__half*>(scales.data);
+        // The iu4 producer quantises the same per-(token, 128-k-group) amax scale as the served one
+        // and writes it to the same scales plane; only the code plane changes, to the nibble layout
+        // the iu4 tile reads (K/2 bytes per token). Grid, thread count and call shape are identical.
+        const bool iu4         = iu4_route();
+        const bool floor_scale = prefill_i8_floor();
         by_width(input_rows, [&]<std::int32_t kCols>() {
-            t2_prefill_i8_quantize_kernel<kCols>
-                <<<static_cast<unsigned>(columns), C::kQuantThreads, 0, stream>>>(
-                    reinterpret_cast<const __nv_bfloat16*>(x.data), tokens, columns, code_data,
-                    scale_data);
-            CUDA_CHECK(cudaGetLastError());
+            if (iu4) {
+                t2_prefill_iu4_quantize_kernel<kCols>
+                    <<<static_cast<unsigned>(columns), C::kQuantThreads, 0, stream>>>(
+                        reinterpret_cast<const __nv_bfloat16*>(x.data), tokens, columns, code_data,
+                        scale_data);
+                CUDA_CHECK(cudaGetLastError());
+                return;
+            }
+            const auto i8launch = [&]<bool Floor>() {
+                t2_prefill_i8_quantize_kernel<kCols, Floor>
+                    <<<static_cast<unsigned>(columns), C::kQuantThreads, 0, stream>>>(
+                        reinterpret_cast<const __nv_bfloat16*>(x.data), tokens, columns, code_data,
+                        scale_data);
+                CUDA_CHECK(cudaGetLastError());
+            };
+            if (floor_scale) {
+                i8launch.template operator()<true>();
+            } else {
+                i8launch.template operator()<false>();
+            }
         });
         return {code_data, scale_data, tokens, input_rows};
     }

@@ -235,7 +235,18 @@ __global__ __launch_bounds__(T2PrefillI8::kThreads, T2PrefillI8::kMinBlocks) voi
 
 // One block per padded column, a warp per 128-k group, a lane per four k. Padded columns get zero
 // codes and scales. A zero group keeps a zero scale and zero codes.
-template <std::int32_t kCols>
+//
+// FloorScale = true (host knob NINFER_T2_A8_I8FLOOR=on) floors a positive group scale at the
+// binary16 minimum subnormal, 2^-24 = 5.9604644775390625e-8. Without it, a group whose
+// amax/127 rounds to zero gets scale == 0, and the producer's `inv = s > 0 ? 1/s : 0` then zeroes
+// EVERY code in that group: the group is dropped outright, not rounded. Measured CPU-side
+// (proof-iu4-act.log, section E): the shipped producer writes a zero scale for all 128 positive-
+// amax groups at amax ~ 1e-3 and 48 of 48 at amax ~ 3e-7..1e-5. With the floor, rms-rel on those
+// rows is 0.02977 vs 1.00000 (x0.03) and 0.04903 vs 0.38558 (x0.13); on healthy rows it changes
+// nothing (x0.96-1.00), because the branch never fires once the scale is a normal binary16. The
+// cost is one compare per group on the producer, and one more kernel instantiation. Default off
+// keeps the shipped producer bit-for-bit; a served A/B (output sha + coherence) decides it.
+template <std::int32_t kCols, bool FloorScale = false>
 __global__ __launch_bounds__(T2PrefillI8::kQuantThreads) void t2_prefill_i8_quantize_kernel(
     const __nv_bfloat16* __restrict__ x, std::int32_t tokens, std::int32_t t_pad,
     std::int8_t* __restrict__ codes, __half* __restrict__ scales) {
@@ -274,7 +285,10 @@ __global__ __launch_bounds__(T2PrefillI8::kQuantThreads) void t2_prefill_i8_quan
         for (int off = 16; off > 0; off >>= 1) {
             amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off));
         }
-        const __half scale = __float2half(amax / 127.0F);
+        __half scale = __float2half(amax / 127.0F);
+        if (FloorScale && amax > 0.0F && __half2float(scale) == 0.0F) {
+            scale = __float2half(5.9604644775390625e-8F);  // binary16 min subnormal, 2^-24
+        }
         if (lane == 0) { scales[static_cast<std::size_t>(g) * t_pad + t] = scale; }
         const float s   = __half2float(scale);
         const float inv = s > 0.0F ? 1.0F / s : 0.0F;
