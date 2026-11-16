@@ -100,7 +100,7 @@ void candidate_selector_path(const Tensor& candidate_ids, const Tensor& unary_sc
     const std::int32_t kSteps     = candidate_ids.ne[1];
     if (kSteps < 1 || kSteps > 15)
         throw std::invalid_argument("candidate_selector_path: K must be in [1,15]");
-    if (batch_size < 1 || batch_size > 8) {
+    if (batch_size < 1 || batch_size > 16) {
         throw std::invalid_argument("candidate_selector_path: B must be in [1,8]");
     }
     require_tensor(candidate_ids, DType::I32, kCandidates, kSteps, batch_size, 1, "candidate_ids");

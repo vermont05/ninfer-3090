@@ -14,7 +14,7 @@ namespace {
 constexpr std::int32_t kHeadDim       = 128;
 constexpr std::int32_t kQueryHeads    = 32;
 constexpr std::int32_t kKeyHeads      = 8;
-constexpr std::int32_t kMaximumBatch  = 8;
+constexpr std::int32_t kMaximumBatch  = 16;
 constexpr std::int32_t kMaximumSingle = 2048;
 
 bool aligned_to(const void* pointer, std::uintptr_t alignment) {

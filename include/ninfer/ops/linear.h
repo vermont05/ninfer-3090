@@ -114,7 +114,7 @@ enum class LinearPolicy : std::uint8_t {
 /// 129 is also the floor this gate may not go below: a decode or verify round runs up to
 /// kMaximumConcurrency lanes of draft window + 1 tokens, 8 x 16 = 128 columns, through these same
 /// Ops and policies, and those widths must stay off the route (startup.cpp asserts it).
-inline constexpr std::int32_t kCublasPrefillMinTokens = 129;
+inline constexpr std::int32_t kCublasPrefillMinTokens = 257;  // ninfer16: 16 lanes x (15 drafts + 1) = 256-wide rounds must stay below it
 
 /**
  * Returns the caller-owned transient capacity required by Linear for every T in the inclusive
