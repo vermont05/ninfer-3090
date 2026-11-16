@@ -1034,7 +1034,7 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
             "progress_anchor_tokens needs the context cache: enable it or set 0");
     }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
-        throw std::invalid_argument("max_concurrency must be in [1,8]");
+        throw std::invalid_argument("max_concurrency must be in [1,16]");
     }
     // Decode and verify rounds run the target's projections with the same Linear policies as
     // prefill, one call over every lane's verify columns. The cuBLAS prefill route has to stay out

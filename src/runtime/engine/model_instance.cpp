@@ -125,7 +125,7 @@ void validate_engine_options(const EngineOptions& options) {
         throw std::invalid_argument("model suspend applies to Generation only");
     }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
-        throw std::invalid_argument("Engine max_concurrency must be in [1,8]");
+        throw std::invalid_argument("Engine max_concurrency must be in [1,16]");
     }
     validate_relaxed_drafting(options);
     validate_draft_context_rows(options);
@@ -298,7 +298,7 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         }
     }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
-        throw std::invalid_argument("Engine max_concurrency must be in [1,8]");
+        throw std::invalid_argument("Engine max_concurrency must be in [1,16]");
     }
     validate_relaxed_drafting(options);
     validate_draft_context_rows(options);

@@ -178,7 +178,7 @@ void rmsnorm_dynamic_grouped_conv_prepare(const Tensor& residual, const Tensor& 
         throw std::invalid_argument(
             "dynamic grouped conv prepare: eps must be positive and finite");
     }
-    if (batch_size < 1 || batch_size > 8) {
+    if (batch_size < 1 || batch_size > 16) {
         throw std::invalid_argument("dynamic grouped conv prepare: B must be in [1,8]");
     }
     require_tensor(residual, DType::BF16, kHidden, width, batch_size, 1, kPrepareOp, "residual");
@@ -217,7 +217,7 @@ void linear_dynamic_grouped_conv_add(const Tensor& x, const Weight& projection_w
     if (input_rows != 4096 && input_rows != 17408) {
         throw std::invalid_argument("linear dynamic grouped conv add: C must be 4096 or 17408");
     }
-    if (batch_size < 1 || batch_size > 8) {
+    if (batch_size < 1 || batch_size > 16) {
         throw std::invalid_argument("linear dynamic grouped conv add: B must be in [1,8]");
     }
     require_tensor(x, DType::BF16, input_rows, width, batch_size, 1, kAddOp, "x");

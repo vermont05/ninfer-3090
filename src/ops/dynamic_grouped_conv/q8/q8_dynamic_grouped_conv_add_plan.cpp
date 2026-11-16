@@ -14,7 +14,7 @@ struct Plan {
 Plan resolve_plan(int input_rows, int width, int batch) {
     if (input_rows != 4096 && input_rows != 17408)
         throw std::invalid_argument("linear dynamic grouped conv add: C must be 4096 or 17408");
-    if (width < 2 || width > 16 || batch < 1 || batch > 8)
+    if (width < 2 || width > 16 || batch < 1 || batch > 16)
         throw std::invalid_argument("linear dynamic grouped conv add: invalid W/B profile");
     const int columns = width * batch;
     using S           = Q8DynamicConvAddSchedule;
